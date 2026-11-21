@@ -245,12 +245,12 @@ def make_multi_handler(manager: MultiGateway, token: str):
                     return self.respond(400, b"Invalid host", "text/plain", head)
                 return self.respond(200, manager.playlist(token, host),
                                     "audio/x-mpegurl", head)
-            if len(route) != 3 or route[0] != "channel":
+            if len(route) < 3 or route[0] != "channel":
                 return self.respond(404, b"Not found", "text/plain", head)
             cid, resource = route[1], route[2]
             if cid not in manager.channels:
                 return self.respond(404, b"Unknown channel", "text/plain", head)
-            if resource == "index.m3u8":
+            if len(route) == 3 and resource == "index.m3u8":
                 stream = manager.start(cid)
                 if stream is None:
                     return self.respond(503, b"Too many active streams",
@@ -267,8 +267,42 @@ def make_multi_handler(manager: MultiGateway, token: str):
                 stream.gateway.record_client("manifest", 200)
                 return self.respond(200, raw.replace(before, after),
                                     "application/vnd.apple.mpegurl", head)
-            if len(route) == 3 and resource.startswith("segment"):
-                return self.respond(404, b"Not found", "text/plain", head)
+            if len(route) == 4 and resource == "segment" and route[3].endswith(".ts"):
+                try:
+                    seq = int(route[3][:-3])
+                except ValueError:
+                    return self.respond(404, b"Invalid segment", "text/plain", head)
+                # An expired stream is not restarted on a stale segment URL.
+                stream = manager.active_stream(cid)
+                if stream is None:
+                    return self.respond(404, b"Stream expired", "text/plain", head)
+                data = stream.gateway.segment(seq)
+                if data is None:
+                    stream.gateway.record_client("segment", 404)
+                    return self.respond(404, b"Segment not in cache", "text/plain", head)
+                extra = {"Accept-Ranges": "bytes"}
+                requested_range = self.headers.get("Range")
+                if requested_range:
+                    match = re.fullmatch(r"bytes=(\d*)-(\d*)", requested_range)
+                    if not match or not any(match.groups()):
+                        return self.respond(416, b"", "video/mp2t", head,
+                                            {"Content-Range": f"bytes */{len(data)}"})
+                    if match.group(1):
+                        first = int(match.group(1))
+                        last = int(match.group(2)) if match.group(2) else len(data) - 1
+                    else:
+                        suffix = int(match.group(2))
+                        first, last = max(0, len(data) - suffix), len(data) - 1
+                    if first >= len(data) or last < first:
+                        return self.respond(416, b"", "video/mp2t", head,
+                                            {"Content-Range": f"bytes */{len(data)}"})
+                    last = min(last, len(data) - 1)
+                    extra["Content-Range"] = f"bytes {first}-{last}/{len(data)}"
+                    stream.gateway.record_client("segment", 206)
+                    return self.respond(206, data[first:last + 1], "video/mp2t",
+                                        head, extra)
+                stream.gateway.record_client("segment", 200)
+                return self.respond(200, data, "video/mp2t", head, extra)
             return self.respond(404, b"Not found", "text/plain", head)
 
     return Handler
