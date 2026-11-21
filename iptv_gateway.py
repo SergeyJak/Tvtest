@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import OrderedDict
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -146,6 +146,12 @@ class Gateway:
         self.last_error = None
         self.slow_segments = 0
         self.errors = 0
+        # Keep sanitized failure history even after a successful manifest
+        # resets last_error. Never store source URLs, keys or exception text.
+        self.error_breakdown = Counter()
+        self.recent_upstream_failures = deque(maxlen=8)
+        self.last_upstream_failure_at = None
+        self.last_upstream_failure = None
         self.last_update = None
         self.last_progress = None
         self.last_segment_download = None
@@ -203,6 +209,23 @@ class Gateway:
             # cycle() handles large upstream sequence resets before caching.
             return True
 
+    def record_upstream_failure(self, kind: str, exc: Exception,
+                                sequence: int | None = None) -> None:
+        """Count a sanitized upstream HTTP/segment failure, without URL leakage."""
+        label = kind + '_' + safe_error(exc)
+        now = time.time()
+        with self.lock:
+            self.errors += 1
+            self.last_error = label
+            self.error_breakdown[label] += 1
+            self.last_upstream_failure_at = now
+            self.last_upstream_failure = label
+            self.recent_upstream_failures.append({
+                'utc_unix': round(now, 1),
+                'type': label,
+                'sequence': sequence,
+            })
+
     def cycle(self):
         try:
             body, base = media_manifest(self._url, self.timeout)
@@ -235,9 +258,7 @@ class Gateway:
                 try:
                     data = fetch_segment(segment.url, self.timeout, self.max_segment)
                 except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.IncompleteRead) as exc:
-                    with self.lock:
-                        self.errors += 1
-                        self.last_error = 'SEGMENT_' + safe_error(exc)
+                    self.record_upstream_failure('SEGMENT', exc, segment.sequence)
                     continue
                 duration = time.monotonic() - start
                 with self.lock:
@@ -250,9 +271,8 @@ class Gateway:
                         self.total_bytes += len(data)
                     self._evict()
         except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.IncompleteRead) as exc:
+            self.record_upstream_failure('MANIFEST', exc)
             with self.lock:
-                self.errors += 1
-                self.last_error = 'MANIFEST_' + safe_error(exc)
                 if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
                     self.consecutive_manifest_404 += 1
                 else:
@@ -429,6 +449,10 @@ class Gateway:
                         contiguous_tail_seconds=tail_seconds,
                         effective_buffer_delay_seconds=behind_seconds,
                         last_published_sequence=self.last_published_seq,
+                        seconds_since_published_advance=round(
+                            max(0.0, time.monotonic() - self._last_published_at), 1
+                        ) if self._last_published_at is not None else None,
+                        recovery_mode=self._recovery_mode,
                         last_downloaded_sequence=next(reversed(self.cache), None) if self.cache else None,
                         latest_upstream_sequence=self.latest,
                         client_manifest_503=self.client_manifest_503,
@@ -446,6 +470,12 @@ class Gateway:
                         cached_segments=len(self.cache), cached_mib=round(self.total_bytes / 1048576, 2),
                         errors=self.errors, slow_segments=self.slow_segments,
                         last_error=self.last_error,
+                        last_upstream_failure=self.last_upstream_failure,
+                        seconds_since_last_upstream_failure=round(
+                            time.time() - self.last_upstream_failure_at, 1
+                        ) if self.last_upstream_failure_at is not None else None,
+                        error_breakdown=dict(self.error_breakdown),
+                        recent_upstream_failures=list(self.recent_upstream_failures),
                         consecutive_manifest_404=self.consecutive_manifest_404,
                         source_refresh_attempts=self.source_refresh_attempts,
                         source_refresh_errors=self.source_refresh_errors,

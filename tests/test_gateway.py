@@ -107,6 +107,44 @@ class GatewayTests(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_upstream_failures_survive_next_successful_manifest_without_secrets(self):
+        secret = 'PRIVATE_TOKEN_SHOULD_NOT_LEAK'
+        gw = g.Gateway(f'http://example.test/{secret}', delay=30)
+        manifest = ('#EXTM3U\n#EXT-X-TARGETDURATION:10\n'
+                    '#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:10,\n5.ts\n')
+        # Simulate a failed video fetch, then successful retry. Merely
+        # downloading a manifest must not erase the failure history.
+        failure = urllib.error.HTTPError(f'http://example.test/{secret}',
+                                         404, secret, None, None)
+        with patch.object(g, 'media_manifest',
+                          return_value=(manifest, 'http://example.test/')), \
+             patch.object(g, 'fetch_segment',
+                          side_effect=[failure, b'\x47complete']):
+            gw.cycle()
+            self.assertEqual(gw.errors, 1)
+            self.assertEqual(gw.last_error, 'SEGMENT_HTTP_404')
+            gw.cycle()
+        status = json.loads(gw.status())
+        self.assertIsNone(status['last_error'])
+        self.assertEqual(status['last_upstream_failure'], 'SEGMENT_HTTP_404')
+        self.assertEqual(status['error_breakdown']['SEGMENT_HTTP_404'], 1)
+        self.assertEqual(status['recent_upstream_failures'][-1]['sequence'], 5)
+        self.assertIsNotNone(status['seconds_since_last_upstream_failure'])
+        self.assertNotIn(secret, json.dumps(status))
+
+    def test_upstream_failure_history_is_bounded_and_counts_types(self):
+        gw = g.Gateway('http://upstream.test')
+        for _ in range(15):
+            gw.record_upstream_failure('SEGMENT', TimeoutError('secret'))
+        gw.record_upstream_failure('MANIFEST', ValueError('secret_url'))
+        status = json.loads(gw.status())
+        self.assertEqual(status['errors'], 16)
+        self.assertEqual(status['error_breakdown']['SEGMENT_TIMEOUT'], 15)
+        self.assertEqual(status['error_breakdown']['MANIFEST_INVALID_HLS'], 1)
+        self.assertEqual(len(status['recent_upstream_failures']), 8)
+        self.assertNotIn('secret', json.dumps(status))
+        self.assertEqual(status['last_upstream_failure'], 'MANIFEST_INVALID_HLS')
+
     def test_safe_errors_do_not_expose_access_key(self):
         error = urllib.error.URLError('http://secret.example/key/ABCDEF')
         self.assertEqual(g.safe_error(error), 'NETWORK_ERROR')
