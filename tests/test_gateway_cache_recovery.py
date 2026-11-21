@@ -84,6 +84,20 @@ class GatewayRecoveryTests(unittest.TestCase):
             self.assertGreaterEqual(len(set(ends)), 11,
                                     'published edge must not freeze until full delay fills')
 
+    def test_status_reports_age_of_published_window_without_moving_cursor(self):
+        gw = self.gateway(range(100, 120), delay=90)
+        clock = [100.0]
+        with patch.object(g.time, 'monotonic', side_effect=lambda: clock[0]):
+            self.assertIsNone(json.loads(gw.status())['seconds_since_published_advance'])
+            start = gw.published()[-1][0]
+            clock[0] += 25
+            info = json.loads(gw.status())
+            self.assertEqual(info['last_published_sequence'], start)
+            self.assertEqual(info['seconds_since_published_advance'], 25.0)
+            self.assertFalse(info['recovery_mode'])
+            # Polling /status cannot advance HLS cursor.
+            self.assertEqual(gw.last_published_seq, start)
+
     def test_status_is_read_only_for_tv_cursor(self):
         gw = self.gateway(range(100, 120))
         self.assertIsNone(gw.last_published_seq)
