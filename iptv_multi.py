@@ -265,8 +265,10 @@ class MultiGateway:
                 "streams": summaries,
             }, ensure_ascii=False).encode("utf-8")
 
-    def playlist(self, token: str, host: str, *, filter_names: list[str] | None = None) -> bytes:
+    def playlist(self, token: str, host: str, *, filter_names: list[str] | None = None,
+                 public_base_url: str | None = None) -> bytes:
         lines = ["#EXTM3U"]
+        base_url = public_base_url or f"http://{host}"
         allowed = set(filter_names) if filter_names is not None else None
         for cid in self.order:
             c = self.channels[cid]
@@ -276,11 +278,12 @@ class MultiGateway:
             group = c.group.replace("\r", " ").replace("\n", " ").replace('"', "")
             meta = f' group-title="{group}"' if group else ""
             lines.append(f'#EXTINF:-1{meta},{name}')
-            lines.append(f'http://{host}/{token}/channel/{cid}/index.m3u8')
+            lines.append(f'{base_url}/{token}/channel/{cid}/index.m3u8')
         return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def make_multi_handler(manager: MultiGateway, token: str):
+def make_multi_handler(manager: MultiGateway, token: str,
+                       public_base_url: str | None = None):
     prefix = "/" + token
 
     class Handler(BaseHTTPRequestHandler):
@@ -321,7 +324,8 @@ def make_multi_handler(manager: MultiGateway, token: str):
                     return self.respond(400, b"Invalid host", "text/plain", head)
                 with manager.lock:
                     manager.catalog_requests += 1
-                return self.respond(200, manager.playlist(token, host),
+                return self.respond(200, manager.playlist(token, host,
+                                                          public_base_url=public_base_url),
                                     "audio/x-mpegurl", head)
             # Saved TV favorites may retain the old single-channel URLs
             # even after the catalog URL has been reloaded. Alias only to
@@ -432,6 +436,8 @@ def main(argv=None):
     p.add_argument("--delay", type=int, default=30)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--advertise-host", default=None)
+    p.add_argument("--public-base-url", default=None,
+                   help="HTTPS origin advertised in M3U links when served behind a TLS reverse proxy")
     p.add_argument("--port", type=int, default=8787)
     p.add_argument("--timeout", type=float, default=12)
     p.add_argument("--poll", type=float, default=2)
@@ -459,6 +465,9 @@ def main(argv=None):
             and 10 <= args.switch_grace <= args.idle_seconds
             and 1 <= args.port <= 65535):
         p.error("Invalid delay, poll, timeout, cache-mib, max-streams, idle-seconds, startup-wait, startup-reserve, switch-grace, or port")
+    if args.public_base_url and not re.fullmatch(r"https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/?", args.public_base_url):
+        p.error("--public-base-url must be an HTTPS origin without a path, e.g. https://tv.example.com")
+    public_base_url = args.public_base_url.rstrip("/") if args.public_base_url else None
     private_url = os.environ.get(args.playlist_url_env) if args.playlist_url_env else None
     if args.playlist_url_env and not private_url:
         p.error("Playlist URL environment variable was not set")
@@ -508,14 +517,16 @@ def main(argv=None):
         manager.legacy_channel_id = prewarm[0]
     for cid in dict.fromkeys(prewarm):
         manager.start(cid, pinned=True)
-    server = ThreadingHTTPServer((args.host, args.port), make_multi_handler(manager, token))
+    server = ThreadingHTTPServer((args.host, args.port),
+                                 make_multi_handler(manager, token, public_base_url))
     server.daemon_threads = True
     sweep_thread = threading.Thread(target=manager.cleanup_loop, daemon=True)
     sweep_thread.start()
     shown = args.advertise_host or ("<PC_LAN_IP>" if args.host == "0.0.0.0" else args.host)
     print(f"Loaded {len(channels)} channels; prewarming {len(prewarm)}. Source URLs hidden.")
-    print(f"TV playlist URL: http://{shown}:{args.port}/{token}/channels.m3u")
-    print(f"Status: http://{shown}:{args.port}/{token}/status")
+    shown_base = public_base_url or f"http://{shown}:{args.port}"
+    print(f"TV playlist URL: {shown_base}/{token}/channels.m3u")
+    print(f"Status: {shown_base}/{token}/status")
     print("Cold channels take time to buffer; prewarm favorites. Ctrl+C to stop.")
     try:
         server.serve_forever(poll_interval=0.5)
