@@ -130,7 +130,7 @@ def run(entry, timeout, probe_bytes):
         ms, mbps, mib = segment_probe(segment, timeout, probe_bytes)
         rec.update(segment_ttfb_ms=ms, download_mbps=mbps, download_mib=mib, status="OK")
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        rec["status"] = f"ERROR: {type(exc).__name__}"
+        rec["status"] = f"HTTP_{exc.code}" if isinstance(exc, urllib.error.HTTPError) else ("TIMEOUT" if isinstance(exc, TimeoutError) else f"ERROR: {type(exc).__name__}")
     return rec
 
 
