@@ -403,9 +403,13 @@ class Gateway:
                     remaining += tail[i][1]
                 if balanced and last is None and sum(s for _, s in tail[3:]) >= self.startup_reserve:
                     cutoff = max(cutoff, 2)
-                if balanced and last is not None and self._last_published_at is not None:
-                    # The source can refill in bursts. Keep serving at playback
-                    # speed even while the reserve is below the preferred delay.
+                if last is not None and self._last_published_at is not None:
+                    # After the FIRST successful publication, keep advancing
+                    # at the rate of the already-published EXTINF durations,
+                    # even when startup_reserve == delay. A source resuming at
+                    # real-time speed cannot immediately rebuild the entire
+                    # reserve after an outage. Requiring that reserve again
+                    # would freeze the playlist despite downloaded segments.
                     paced, due = self._paced_edge(tail, last, now)
                     if paced >= cutoff:
                         cutoff = max(2, paced)
