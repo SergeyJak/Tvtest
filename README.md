@@ -107,6 +107,42 @@ segments, the relay cannot invent missing video. One channel per running
 gateway instance. Do not run a public streaming service or violate the
 subscription's simultaneous-connection rules.
 
+## Recovery after MANIFEST_HTTP_404
+
+If a TV freezes and status shows `MANIFEST_HTTP_404`, the provider returned
+**404 for the upstream HLS manifest**. Increasing `--delay` alone cannot fix
+that. On the reported incident, 21 errors occurred and no new segments arrived
+for 46 seconds. The stream was genuinely unavailable to the gateway at that time.
+
+1. In Edem/iLook, keep Germany selected, then **download a fresh M3U** and
+   replace your local `forgpt.m3u8` file. On another CDN, allow time for
+   provider-side settings to take effect.
+2. By default, the gateway now re-reads this local file after a manifest 404.
+   If it contains a different URL for the same channel, it switches automatically
+   without restarting the Python process.
+3. For **fully automatic** refresh from your own authorized Edem playlist link,
+   optionally supply its URL via an environment variable; the URL will not
+   appear in process arguments, output, or GitHub files:
+
+```powershell
+$env:EDEM_PLAYLIST_URL = Read-Host "Your private Edem playlist URL"
+python iptv_gateway.py --playlist forgpt.m3u8 --channel "VF Теория большого взрыва" --delay 45 --host 0.0.0.0 --advertise-host 192.168.94.109 --playlist-url-env EDEM_PLAYLIST_URL
+```
+
+The dynamic link must return a full M3U channel list and include **exactly one**
+matching channel. A provider login page, a single HLS media manifest, or an
+unchanged/expired playlist will not restore the missing video. The remote
+playlist is fetched at most once per 20 seconds during 404s and is not stored.
+The `--playlist-url-env` option is optional; without it, only the local
+`forgpt.m3u8` is re-read on 404.
+
+Monitor `consecutive_manifest_404`, `source_refresh_attempts`,
+`source_changes` and `source_refresh_error` at the private status URL.
+If the source stays unchanged and keeps returning 404, the provider/CDN must
+restore the channel or provide another working stream; our gateway cannot
+synthesize live segments. Never paste private URL or token into chat or a
+public issue.
+
 ## Security
 
 Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions or channel source links. The experimental gateway serves only on localhost by default; LAN exposure requires explicit --host 0.0.0.0 and a random access token.

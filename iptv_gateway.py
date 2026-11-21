@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import secrets
 import threading
 import time
@@ -19,6 +20,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 
 from iptv_healthcheck import UA, entries_from_m3u
 
@@ -112,8 +114,19 @@ def safe_error(exc: Exception) -> str:
 class Gateway:
     def __init__(self, url: str, delay: float = 45, timeout: float = 12,
                  poll: float = 2, max_bytes: int = 128 * 1024 * 1024,
-                 max_segment: int = 32 * 1024 * 1024):
+                 max_segment: int = 32 * 1024 * 1024,
+                 source_refresher: Callable[[], str] | None = None,
+                 refresh_cooldown: float = 20):
         self._url = url
+        self.source_refresher = source_refresher
+        self.refresh_cooldown = refresh_cooldown
+        self.last_refresh_monotonic = None
+        self.source_refresh_attempts = 0
+        self.source_refresh_errors = 0
+        self.source_changes = 0
+        self.last_source_change = None
+        self.source_refresh_error = None
+        self.consecutive_manifest_404 = 0
         self.delay, self.timeout, self.poll = delay, timeout, poll
         self.max_bytes, self.max_segment = max_bytes, max_segment
         self.lock = threading.RLock()
@@ -129,6 +142,41 @@ class Gateway:
         self.last_advance_at = None
         self.last_published_seq = None
         self.stop = threading.Event()
+
+    def refresh_source(self) -> bool:
+        """Try to resolve a fresh stream URL; never expose the subscription URL.
+
+        When a private playlist URL is configured, fetch it again. Otherwise
+        re-read the local playlist if the user has saved an updated copy.
+        """
+        if self.source_refresher is None:
+            return False
+        now = time.monotonic()
+        with self.lock:
+            if (self.last_refresh_monotonic is not None
+                    and now - self.last_refresh_monotonic < self.refresh_cooldown):
+                return False
+            self.last_refresh_monotonic = now
+            self.source_refresh_attempts += 1
+        try:
+            candidate = self.source_refresher()
+            if not candidate or urllib.parse.urlsplit(candidate).scheme not in ('http', 'https'):
+                raise ValueError('invalid_refreshed_url')
+        except (OSError, UnicodeError, urllib.error.URLError, TimeoutError, ValueError) as exc:
+            with self.lock:
+                self.source_refresh_errors += 1
+                self.source_refresh_error = safe_error(exc)
+            return False
+        with self.lock:
+            self.source_refresh_error = None
+            if candidate == self._url:
+                return False  # Same upstream: a 404 still requires provider recovery.
+            self._url = candidate
+            self.source_changes += 1
+            self.last_source_change = time.time()
+            # Retain existing buffered segments for playback while reconnecting.
+            # cycle() handles large upstream sequence resets before caching.
+            return True
 
     def cycle(self):
         try:
@@ -148,6 +196,7 @@ class Gateway:
                 self.target = target
                 self.last_update = time.time()
                 self.last_error = None
+                self.consecutive_manifest_404 = 0
             for segment in listed:
                 if self.stop.is_set():
                     return
@@ -176,6 +225,14 @@ class Gateway:
             with self.lock:
                 self.errors += 1
                 self.last_error = 'MANIFEST_' + safe_error(exc)
+                if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+                    self.consecutive_manifest_404 += 1
+                else:
+                    self.consecutive_manifest_404 = 0
+            # 404 may indicate a rotated/expired stream URL. Re-resolve it from
+            # the user's authorized playlist, but never manufacture new URLs.
+            if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+                self.refresh_source()
 
     def _evict(self):
         duration = sum(item[0] for item in self.cache.values())
@@ -242,6 +299,12 @@ class Gateway:
                         cached_segments=len(self.cache), cached_mib=round(self.total_bytes / 1048576, 2),
                         errors=self.errors, slow_segments=self.slow_segments,
                         last_error=self.last_error,
+                        consecutive_manifest_404=self.consecutive_manifest_404,
+                        source_refresh_attempts=self.source_refresh_attempts,
+                        source_refresh_errors=self.source_refresh_errors,
+                        source_refresh_error=self.source_refresh_error,
+                        source_changes=self.source_changes,
+                        seconds_since_source_change=round(time.time() - self.last_source_change, 1) if self.last_source_change else None,
                         seconds_since_playlist_update=round(time.time() - self.last_update, 1) if self.last_update else None,
                         seconds_since_new_segment=round(time.time() - self.last_progress, 1) if self.last_progress else None,
                         upstream_stalled=bool(self.last_progress and time.time() - self.last_progress > max(15, 3 * self.target)))
@@ -330,6 +393,36 @@ def make_handler(gateway: Gateway, token: str, channel_name: str):
     return Handler
 
 
+def playlist_entry_from_text(text: str, channel_name: str) -> str:
+    """Find one exact channel without writing credentials to disk or logs."""
+    current = None
+    matches = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith('#EXTINF:'):
+            current = line.rsplit(',', 1)[-1].strip()
+        elif line and not line.startswith('#') and current is not None:
+            if current.casefold() == channel_name.casefold():
+                matches.append(line)
+            current = None
+    if len(matches) != 1:
+        raise ValueError('channel_match_count_invalid')
+    return matches[0]
+
+
+def private_playlist_text(path: Path, source_url: str | None, timeout: float) -> str:
+    if source_url is None:
+        return path.read_text(encoding='utf-8-sig')
+    if urllib.parse.urlsplit(source_url).scheme not in ('http', 'https'):
+        raise ValueError('invalid_playlist_scheme')
+    request = urllib.request.Request(source_url, headers={'User-Agent': UA, 'Accept': '*/*'})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        contents = response.read(2 * 1024 * 1024 + 1)
+    if len(contents) > 2 * 1024 * 1024:
+        raise ValueError('private_playlist_too_large')
+    return contents.decode('utf-8-sig')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Local HLS buffering gateway: single channel')
     parser.add_argument('--playlist', required=True, type=Path)
@@ -340,6 +433,8 @@ def main(argv=None):
     parser.add_argument('--port', type=int, default=8787)
     parser.add_argument('--timeout', type=float, default=12)
     parser.add_argument('--poll', type=float, default=2)
+    parser.add_argument('--playlist-url-env', default=None,
+                        help='Optional name of environment variable containing private Edem playlist URL; never pass the URL itself')
     args = parser.parse_args(argv)
     if args.delay < 15 or args.delay > 120 or args.timeout <= 0 or args.poll <= 0 or not 1 <= args.port <= 65535:
         parser.error('delay must be 15..120, timeout/poll > 0, and port 1..65535')
@@ -350,7 +445,16 @@ def main(argv=None):
     matches = [entry for entry in entries if entry[0].casefold() == args.channel.casefold()]
     if len(matches) != 1:
         parser.error(f'Expected exactly one exact channel match; got {len(matches)}')
-    gateway = Gateway(matches[0][2], delay=args.delay, timeout=args.timeout, poll=args.poll)
+    private_url = None
+    if args.playlist_url_env:
+        private_url = os.environ.get(args.playlist_url_env)
+        if not private_url:
+            parser.error('Playlist URL environment variable was not set')
+    def source_refresher():
+        text = private_playlist_text(args.playlist, private_url, args.timeout)
+        return playlist_entry_from_text(text, args.channel)
+    gateway = Gateway(matches[0][2], delay=args.delay, timeout=args.timeout, poll=args.poll,
+                      source_refresher=source_refresher)
     token = secrets.token_urlsafe(16)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(gateway, token, matches[0][0]))
     httpd.daemon_threads = True
