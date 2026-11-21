@@ -119,6 +119,29 @@ class GatewayRecoveryTests(unittest.TestCase):
         gw.latest = 110
         self.assertEqual([s for s, _ in gw.published()], [106, 107, 108, 109])
 
+    def test_paced_publication_uses_current_segment_extinf(self):
+        gw = g.Gateway('http://upstream.test/live', delay=90, startup_reserve=30)
+        # A segment with 2s EXTINF followed by a segment with 10s EXTINF.
+        # Using the NEXT duration would stall publication for an extra 8s.
+        for seq in range(100, 112):
+            gw.cache[seq] = (2.0 if seq == 102 else 10.0, b'x')
+            gw.total_bytes += 1
+        gw.latest = 111
+        with patch.object(g.time, 'monotonic', return_value=100.0) as clock:
+            first = gw.published()
+            self.assertEqual(first[-1][0], 102)
+            self.assertEqual(gw._last_published_at, 100.0)
+
+            clock.return_value = 101.9
+            self.assertEqual(gw.published()[-1][0], 102)
+            clock.return_value = 102.0
+            self.assertEqual(gw.published()[-1][0], 103)
+            self.assertEqual(gw._last_published_at, 102.0)
+            clock.return_value = 111.9
+            self.assertEqual(gw.published()[-1][0], 103)
+            clock.return_value = 112.0
+            self.assertEqual(gw.published()[-1][0], 104)
+
     def test_status_is_read_only_for_tv_cursor(self):
         gw = self.gateway(range(100, 120))
         self.assertIsNone(gw.last_published_seq)
