@@ -191,7 +191,9 @@ class MultiChannelTests(unittest.TestCase):
         self.assertEqual(metrics["streams"][0]["client_manifest_503"], 1)
 
     def test_cold_channel_starts_with_reserve_and_keeps_playing_through_refill(self):
+        # 10s is now explicit fast mode; the safe default is 30s.
         self.manager.delay = 90
+        self.manager.startup_reserve = 10
         cid = self.channels[0].id
         gw = self.manager.start(cid).gateway
         path = f"/channel/{cid}/index.m3u8"
@@ -221,6 +223,32 @@ class MultiChannelTests(unittest.TestCase):
                 self.assertEqual(self.request(path)[0], 200)
                 self.assertEqual(gw.last_published_seq, seq)
                 self.assertEqual(json.loads(gw.status())["effective_buffer_delay_seconds"], 60)
+
+    def test_default_reserve_reduces_freeze_risk_and_can_be_capped(self):
+        self.manager.delay = 90
+        self.assertEqual(self.manager.startup_reserve, 30)
+        cid = self.channels[0].id
+        gw = self.manager.start(cid).gateway
+        self.assertEqual(gw.startup_reserve, 30)
+        with patch.object(time, "monotonic", return_value=100.0):
+            with gw.lock:
+                for seq in range(100, 105):
+                    gw.cache[seq] = (10.0, b"data")
+                gw.latest = 104
+                gw.last_advance_at = 1.0  # Upstream idle must not count as buffer.
+            self.assertFalse(json.loads(gw.status())["ready"])
+            with gw.lock:
+                gw.cache[105] = (10.0, b"data")
+                gw.latest = 105
+            status = json.loads(gw.status())
+            self.assertTrue(status["ready"])
+            self.assertEqual(status["startup_reserve_seconds"], 30)
+            self.assertEqual(status["effective_buffer_delay_seconds"], 30)
+            self.assertEqual(gw.published()[-1][0], 102)
+        self.manager.delay = 15
+        self.manager.startup_reserve = 30
+        other = self.manager.start(self.channels[1].id).gateway
+        self.assertEqual(other.startup_reserve, 15)
 
     def test_client_segment_misses_show_cache_bounds_at_request_time(self):
         cid = self.channels[0].id
