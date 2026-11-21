@@ -110,16 +110,16 @@ class GatewayTests(unittest.TestCase):
     def test_upstream_failures_survive_next_successful_manifest_without_secrets(self):
         secret = 'PRIVATE_TOKEN_SHOULD_NOT_LEAK'
         gw = g.Gateway(f'http://example.test/{secret}', delay=30)
-        manifest = ('#EXTM3U\\n#EXT-X-TARGETDURATION:10\\n'
-                    '#EXT-X-MEDIA-SEQUENCE:5\\n#EXTINF:10,\\n5.ts\\n')
+        manifest = ('#EXTM3U\n#EXT-X-TARGETDURATION:10\n'
+                    '#EXT-X-MEDIA-SEQUENCE:5\n#EXTINF:10,\n5.ts\n')
         # Simulate a failed video fetch, then successful retry. Merely
         # downloading a manifest must not erase the failure history.
         failure = urllib.error.HTTPError(f'http://example.test/{secret}',
                                          404, secret, None, None)
         with patch.object(g, 'media_manifest',
-                          return_value=(manifest, 'http://example.test/')), \\
+                          return_value=(manifest, 'http://example.test/')), \
              patch.object(g, 'fetch_segment',
-                          side_effect=[failure, b'\\x47complete']):
+                          side_effect=[failure, b'\x47complete']):
             gw.cycle()
             self.assertEqual(gw.errors, 1)
             self.assertEqual(gw.last_error, 'SEGMENT_HTTP_404')
