@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import http.client
 import re
 import sys
 import time
@@ -63,14 +64,16 @@ def choose(entries, patterns, limit):
     return result or entries[:limit]
 
 
-def get_text(url, timeout, maxbytes=1024 * 1024):
+def get_text(url, timeout, maxbytes=1024 * 1024, *, return_final_url=False):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
     start = time.perf_counter()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         first = resp.read(1)
         first_byte_ms = int((time.perf_counter() - start) * 1000)
         body = first + resp.read(maxbytes)
-    return body.decode("utf-8-sig", "replace"), first_byte_ms
+        final_url = resp.geturl()
+    result = (body.decode("utf-8-sig", "replace"), first_byte_ms)
+    return (*result, final_url) if return_final_url else result
 
 
 def hls_next_url(manifest, base, master=False):
@@ -99,6 +102,8 @@ def segment_probe(url, timeout, maxbytes):
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         first = resp.read(1)
         ttfb = time.perf_counter() - begin
+        if not first:
+            raise ValueError("empty_segment")
         n += len(first)
         while n < maxbytes:
             chunk = resp.read(min(65536, maxbytes - n))
@@ -113,24 +118,32 @@ def run(entry, timeout, probe_bytes):
     name, group, url = entry
     rec = {"channel": name, "group": group, "manifest_ttfb_ms": "", "segment_ttfb_ms": "", "download_mbps": "", "download_mib": "", "status": ""}
     try:
-        manifest, ttfb = get_text(url, timeout)
+        manifest, ttfb, base = get_text(url, timeout, return_final_url=True)
         rec["manifest_ttfb_ms"] = ttfb
         if "#EXTM3U" not in manifest:
             rec["status"] = "Not an HLS manifest (server response?)"
             return rec
         if "#EXT-X-STREAM-INF" in manifest:
-            variant = hls_next_url(manifest, url, master=True)
+            variant = hls_next_url(manifest, base, master=True)
             if not variant:
                 raise ValueError("Master playlist without variant")
-            manifest, _ = get_text(variant, timeout)
-            url = variant
-        segment = hls_next_url(manifest, url)
+            manifest, _, base = get_text(variant, timeout, return_final_url=True)
+        segment = hls_next_url(manifest, base)
         if not segment:
             raise ValueError("No media segment in playlist")
         ms, mbps, mib = segment_probe(segment, timeout, probe_bytes)
         rec.update(segment_ttfb_ms=ms, download_mbps=mbps, download_mib=mib, status="OK")
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
-        rec["status"] = f"HTTP_{exc.code}" if isinstance(exc, urllib.error.HTTPError) else ("TIMEOUT" if isinstance(exc, TimeoutError) else f"ERROR: {type(exc).__name__}")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.IncompleteRead) as exc:
+        if isinstance(exc, urllib.error.HTTPError):
+            rec["status"] = f"HTTP_{exc.code}"
+        elif isinstance(exc, http.client.IncompleteRead):
+            rec["status"] = "INCOMPLETE_READ"
+        elif isinstance(exc, TimeoutError):
+            rec["status"] = "TIMEOUT"
+        elif isinstance(exc, ValueError) and str(exc) == "empty_segment":
+            rec["status"] = "EMPTY_SEGMENT"
+        else:
+            rec["status"] = f"ERROR: {type(exc).__name__}"
     return rec
 
 
