@@ -119,6 +119,62 @@ class GatewayRecoveryTests(unittest.TestCase):
         gw.latest = 110
         self.assertEqual([s for s, _ in gw.published()], [106, 107, 108, 109])
 
+    def test_equal_delay_and_reserve_resume_without_freezing_playlist(self):
+        # Regression for --delay 30 --startup-reserve 30: after a 20s gap,
+        # a resumed live source adds one 10s fragment every 10s. Previously
+        # its fresh upstream last_advance_at reset the reserve calculation,
+        # freezing the published edge even though cached fragments existed.
+        gw = g.Gateway('http://upstream.test/live', delay=30, startup_reserve=30)
+        with patch.object(g.time, 'monotonic', return_value=100.0) as clock:
+            for seq in range(100, 108):
+                gw.cache[seq] = (10.0, b'x')
+                gw.total_bytes += 1
+            gw.latest = 107
+            gw.last_advance_at = 100.0
+            self.assertEqual(gw.published()[-1][0], 104)
+            self.assertEqual(gw._last_published_at, 100.0)
+
+            # No new fragments for 20 seconds, but the TV keeps requesting
+            # media playlists and can consume its existing buffered history.
+            clock.return_value = 120.0
+            self.assertEqual(gw.published()[-1][0], 106)
+            self.assertEqual(gw._last_published_at, 120.0)
+
+            # Source recovers, but can only produce video at real-time pace.
+            gw.cache[108] = (10.0, b'x')
+            gw.latest = 108
+            gw.last_advance_at = 120.0
+            self.assertEqual(gw.published()[-1][0], 106)
+
+            clock.return_value = 129.9
+            self.assertEqual(gw.published()[-1][0], 106)
+            clock.return_value = 130.0
+            gw.cache[109] = (10.0, b'x')
+            gw.latest = 109
+            gw.last_advance_at = 130.0
+            self.assertEqual(gw.published()[-1][0], 107)
+            self.assertEqual(gw._last_published_at, 130.0)
+
+            clock.return_value = 140.0
+            gw.cache[110] = (10.0, b'x')
+            gw.latest = 110
+            gw.last_advance_at = 140.0
+            self.assertEqual(gw.published()[-1][0], 108)
+            self.assertFalse(gw._recovery_mode)
+
+    def test_equal_delay_still_requires_real_reserve_on_first_manifest(self):
+        gw = g.Gateway('http://upstream.test/live', delay=30, startup_reserve=30)
+        for seq in range(100, 105):
+            gw.cache[seq] = (10.0, b'x')
+            gw.total_bytes += 1
+        gw.latest = 104
+        # Three visible fragments with another 30 seconds behind them need
+        # at least six 10-second fragments, not just five.
+        self.assertEqual(gw.published(), [])
+        gw.cache[105] = (10.0, b'x')
+        gw.latest = 105
+        self.assertEqual(gw.published()[-1][0], 102)
+
     def test_paced_publication_uses_current_segment_extinf(self):
         gw = g.Gateway('http://upstream.test/live', delay=90, startup_reserve=30)
         # A segment with 2s EXTINF followed by a segment with 10s EXTINF.
