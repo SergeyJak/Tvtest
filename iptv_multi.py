@@ -101,6 +101,13 @@ class MultiGateway:
         self.lock = threading.RLock()
         self.active: dict[str, ActiveStream] = {}
         self.stop = threading.Event()
+        # The previous single-channel TV playlist pointed at /index.m3u8
+        # and /segment/<seq>.ts. Keep those URLs working for one explicitly
+        # prewarmed channel while the TV app refreshes its saved catalog.
+        self.legacy_channel_id: str | None = None
+        self.catalog_requests = 0
+        self.legacy_manifest_requests = 0
+        self.legacy_segment_requests = 0
 
     def _new_stream(self, channel: Channel, pinned: bool) -> ActiveStream:
         def refresh() -> str:
@@ -186,6 +193,11 @@ class MultiGateway:
                 "active_streams": len(self.active),
                 "max_streams": self.max_streams,
                 "delay_seconds": self.delay,
+                "legacy_channel": (self.channels[self.legacy_channel_id].name
+                                   if self.legacy_channel_id in self.channels else None),
+                "catalog_requests": self.catalog_requests,
+                "legacy_manifest_requests": self.legacy_manifest_requests,
+                "legacy_segment_requests": self.legacy_segment_requests,
                 "streams": summaries,
             }, ensure_ascii=False).encode("utf-8")
 
@@ -243,8 +255,24 @@ def make_multi_handler(manager: MultiGateway, token: str):
                 host = self.headers.get("Host", "")
                 if not re.fullmatch(r"[A-Za-z0-9.:\-\[\]]{1,255}", host):
                     return self.respond(400, b"Invalid host", "text/plain", head)
+                with manager.lock:
+                    manager.catalog_requests += 1
                 return self.respond(200, manager.playlist(token, host),
                                     "audio/x-mpegurl", head)
+            # Saved TV favorites may retain the old single-channel URLs
+            # even after the catalog URL has been reloaded. Alias only to
+            # the explicit first --prewarm channel, not any guessed source.
+            with manager.lock:
+                legacy_id = manager.legacy_channel_id
+            if legacy_id is not None and route == ["index.m3u8"]:
+                with manager.lock:
+                    manager.legacy_manifest_requests += 1
+                route = ["channel", legacy_id, "index.m3u8"]
+            elif (legacy_id is not None and len(route) == 2
+                  and route[0] == "segment" and route[1].endswith(".ts")):
+                with manager.lock:
+                    manager.legacy_segment_requests += 1
+                route = ["channel", legacy_id, "segment", route[1]]
             if len(route) < 3 or route[0] != "channel":
                 return self.respond(404, b"Not found", "text/plain", head)
             cid, resource = route[1], route[2]
@@ -371,7 +399,11 @@ def main(argv=None):
         prewarm.append(found[0].id)
     if len(set(prewarm)) > args.max_streams:
         p.error("More prewarm channels than max-streams")
-    for cid in set(prewarm):
+    # Preserve old /TOKEN/index.m3u8 and /TOKEN/segment/NN.ts links
+    # only when the operator explicitly selects a known legacy channel.
+    if prewarm:
+        manager.legacy_channel_id = prewarm[0]
+    for cid in dict.fromkeys(prewarm):
         manager.start(cid, pinned=True)
     server = ThreadingHTTPServer((args.host, args.port), make_multi_handler(manager, token))
     server.daemon_threads = True
