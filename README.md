@@ -311,10 +311,30 @@ token is needed when the same token file/IP/port are reused.
 - The prewarmed channel starts buffering immediately. Add another
   `--prewarm "Exact channel name"` for quick channel switching, but
   only if your subscription allows the resulting simultaneous sources.
-- **Cold channels take time to prepare.** A TV app might give up on the
-  temporary HTTP 503 from `/index.m3u8` until buffering has finished.
-  Try reselecting the channel after 30–60 seconds. Fast cold-channel
-  startup and per-client warmup are the next product improvements.
+- **Cold channels take time to prepare.** The first `/index.m3u8`
+  request now waits up to **18 seconds** by default (`--startup-wait 18`)
+  for enough fully downloaded segments. This avoids an immediate 503 that
+  some TV apps never retry. The initial buffer could take longer,
+  especially for UHD; after a 503, wait for the requested channel's
+  `ready: true` in `/status` and **reselect that channel**. Some TV apps
+  may give up before 18 seconds; adjust the timeout or prewarm favorites.
+  Prewarming *all* 2774 channels is not practical.
+- **Fast switching:** at the `--max-streams` cap, the gateway may reclaim
+  the least recently used **non-pinned** channel if it has been idle for
+  at least 20 seconds (`--switch-grace 20`). It never intentionally
+  interrupts a recent viewer or a channel still handling a pending
+  manifest request. Rapidly switching among four channels can still
+  produce a temporary 503; allow old viewers to go idle.
+- **Diagnostics:** `/status` now shows `warmup_successes`,
+  `warmup_timeouts`, `stream_limit_denials`, and
+  `recycled_idle_streams`; each channel also reports
+  `client_manifest_503`, `client_segment_404`,
+  `buffer_state`, `contiguous_tail_seconds` and
+  `pending_requests`. A channel with `ready: true` but **zero
+  successful segment requests** has not delivered any video to the TV.
+  A channel with successful segment requests but a black picture can
+  be a player/codec compatibility problem: try ordinary HD/SD instead
+  of UHD to compare.
 - A non-pinned channel stops pulling upstream after 90 seconds without
   segment/manifest requests. Pinned prewarmed channels run until shutdown.
 - With more than three recently active channels, new requests may receive
