@@ -76,6 +76,7 @@ class ActiveStream:
         self.gateway = gateway
         self.pinned = pinned
         self.accessed = time.monotonic()
+        self.pending_requests = 0
         self.worker = threading.Thread(target=gateway.run, daemon=True)
         self.worker.start()
 
@@ -87,7 +88,8 @@ class MultiGateway:
     def __init__(self, channels: list[Channel], playlist_path: Path,
                  private_url: str | None = None, delay: int = 30,
                  timeout: float = 12, poll: float = 2, cache_mib: int = 128,
-                 max_streams: int = 3, idle_seconds: float = 90):
+                 max_streams: int = 3, idle_seconds: float = 90,
+                 startup_wait: float = 18, switch_grace: float = 20):
         self.channels = {c.id: c for c in channels}
         self.order = [c.id for c in channels]
         self.path = playlist_path
@@ -98,6 +100,12 @@ class MultiGateway:
         self.cache_mib = cache_mib
         self.max_streams = max_streams
         self.idle_seconds = idle_seconds
+        self.startup_wait = startup_wait
+        self.switch_grace = switch_grace
+        self.warmup_successes = 0
+        self.warmup_timeouts = 0
+        self.stream_limit_denials = 0
+        self.recycled_idle_streams = 0
         self.lock = threading.RLock()
         self.active: dict[str, ActiveStream] = {}
         self.stop = threading.Event()
@@ -136,6 +144,20 @@ class MultiGateway:
                 return stream
             self.sweep_locked()
             if len(self.active) >= self.max_streams:
+                # A channel-switching TV may keep two stopped channels in
+                # cache; reclaim only genuinely idle, unpinned sessions.
+                # Never steal from active viewers or pending warmups.
+                now = time.monotonic()
+                stale = [(sid, item) for sid, item in self.active.items()
+                         if not item.pinned and item.pending_requests == 0
+                         and now - item.accessed >= self.switch_grace]
+                if stale:
+                    oldest_id, oldest = min(stale, key=lambda row: row[1].accessed)
+                    oldest.close()
+                    del self.active[oldest_id]
+                    self.recycled_idle_streams += 1
+            if len(self.active) >= self.max_streams:
+                self.stream_limit_denials += 1
                 return None
             stream = self._new_stream(self.channels[cid], pinned)
             self.active[cid] = stream
@@ -151,7 +173,7 @@ class MultiGateway:
     def sweep_locked(self):
         now = time.monotonic()
         for cid, stream in list(self.active.items()):
-            if not stream.pinned and now - stream.accessed >= self.idle_seconds:
+            if not stream.pinned and stream.pending_requests == 0 and now - stream.accessed >= self.idle_seconds:
                 stream.close()
                 del self.active[cid]
 
@@ -180,6 +202,11 @@ class MultiGateway:
                     "channel": stream.channel.name,
                     "pinned": stream.pinned,
                     "ready": details["ready"],
+                    "buffer_state": details["buffer_state"],
+                    "contiguous_tail_seconds": details["contiguous_tail_seconds"],
+                    "client_manifest_503": details["client_manifest_503"],
+                    "client_segment_404": details["client_segment_404"],
+                    "pending_requests": stream.pending_requests,
                     "upstream_stalled": details["upstream_stalled"],
                     "errors": details["errors"],
                     "last_error": details["last_error"],
@@ -193,6 +220,11 @@ class MultiGateway:
                 "active_streams": len(self.active),
                 "max_streams": self.max_streams,
                 "delay_seconds": self.delay,
+                "startup_wait_seconds": self.startup_wait,
+                "warmup_successes": self.warmup_successes,
+                "warmup_timeouts": self.warmup_timeouts,
+                "stream_limit_denials": self.stream_limit_denials,
+                "recycled_idle_streams": self.recycled_idle_streams,
                 "legacy_channel": (self.channels[self.legacy_channel_id].name
                                    if self.legacy_channel_id in self.channels else None),
                 "catalog_requests": self.catalog_requests,
@@ -283,11 +315,38 @@ def make_multi_handler(manager: MultiGateway, token: str):
                 if stream is None:
                     return self.respond(503, b"Too many active streams",
                                         "text/plain", head, {"Retry-After": "10"})
-                raw = stream.gateway.playlist(token)
+                # The old implementation immediately returned 503 when
+                # selecting a cold channel. Many TV players never retry it.
+                # Keep this *one* manifest request open briefly while the
+                # worker fills its first delayed HLS window.
+                with manager.lock:
+                    stream.pending_requests += 1
+                try:
+                    raw = stream.gateway.playlist(token)
+                    waited = False
+                    deadline = time.monotonic() + manager.startup_wait
+                    while raw is None and not manager.stop.is_set():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        waited = True
+                        if stream.gateway.stop.wait(min(0.25, remaining)):
+                            break
+                        raw = stream.gateway.playlist(token)
+                    with manager.lock:
+                        if waited:
+                            if raw is not None:
+                                manager.warmup_successes += 1
+                            else:
+                                manager.warmup_timeouts += 1
+                finally:
+                    with manager.lock:
+                        stream.pending_requests -= 1
+                        stream.accessed = time.monotonic()
                 if raw is None:
                     stream.gateway.record_client("manifest", 503)
-                    return self.respond(503, b"Buffer warming up",
-                                        "text/plain", head, {"Retry-After": "5"})
+                    return self.respond(503, b"Buffer warming up; reselect channel",
+                                        "text/plain", head, {"Retry-After": "2"})
                 # The legacy single-channel gateway outputs /TOKEN/segment/...
                 # Inject this channel's stable ID without touching source URLs.
                 before = f"/{token}/segment/".encode()
@@ -349,6 +408,10 @@ def main(argv=None):
                    help="Per-active-channel cache limit in MiB")
     p.add_argument("--max-streams", type=int, default=3)
     p.add_argument("--idle-seconds", type=float, default=90)
+    p.add_argument("--startup-wait", type=float, default=18,
+                   help="Hold a cold channel's first manifest request up to N seconds")
+    p.add_argument("--switch-grace", type=float, default=20,
+                   help="At stream limit, reclaim non-pinned channels idle for N seconds")
     p.add_argument("--prewarm", action="append", default=[],
                    help="Exact channel name to keep buffered; repeatable")
     p.add_argument("--filter", action="append", default=[],
@@ -358,8 +421,10 @@ def main(argv=None):
     args = p.parse_args(argv)
     if not (15 <= args.delay <= 120 and args.poll > 0 and args.timeout > 0
             and 32 <= args.cache_mib <= 2048 and 1 <= args.max_streams <= 8
-            and args.idle_seconds >= 15 and 1 <= args.port <= 65535):
-        p.error("Invalid delay, poll, timeout, cache-mib, max-streams, idle-seconds, or port")
+            and args.idle_seconds >= 15 and 0 <= args.startup_wait <= 60
+            and 10 <= args.switch_grace <= args.idle_seconds
+            and 1 <= args.port <= 65535):
+        p.error("Invalid delay, poll, timeout, cache-mib, max-streams, idle-seconds, startup-wait, switch-grace, or port")
     private_url = os.environ.get(args.playlist_url_env) if args.playlist_url_env else None
     if args.playlist_url_env and not private_url:
         p.error("Playlist URL environment variable was not set")
@@ -386,7 +451,8 @@ def main(argv=None):
         p.error("Channel ID collision")
     manager = MultiGateway(channels, args.playlist, private_url, args.delay,
                            args.timeout, args.poll, args.cache_mib,
-                           args.max_streams, args.idle_seconds)
+                           args.max_streams, args.idle_seconds,
+                           args.startup_wait, args.switch_grace)
     try:
         token = load_or_create_token(args.token_file)
     except (OSError, UnicodeError, ValueError):
