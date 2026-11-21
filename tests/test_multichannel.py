@@ -190,6 +190,43 @@ class MultiChannelTests(unittest.TestCase):
         self.assertEqual(metrics["warmup_timeouts"], 1)
         self.assertEqual(metrics["streams"][0]["client_manifest_503"], 1)
 
+    def test_cold_channel_opens_at_three_seconds_and_refills_during_playback(self):
+        cid = self.channels[0].id
+        path = f"/channel/{cid}/index.m3u8"
+        with patch.object(time, "monotonic", return_value=100.0) as clock:
+            gw = self.manager.start(cid).gateway
+            for seq in range(100, 103):
+                gw.cache[seq] = (10.0, b"video")
+            gw.latest = 102
+            clock.return_value = 102.99
+            self.assertFalse(json.loads(gw.status())["ready"])
+            clock.return_value = 103.0
+            self.assertTrue(json.loads(gw.status())["ready"])
+            self.assertIsNone(gw.last_published_seq)
+            self.assertEqual(self.request(path)[1].count(b"#EXTINF:"), 3)
+            self.assertEqual(json.loads(gw.status())["effective_buffer_delay_seconds"], 0)
+            for seq in range(103, 106):
+                gw.cache[seq] = (10.0, b"video")
+            gw.latest = 105
+            clock.return_value += 10
+            self.assertEqual(self.request(path)[0], 200)
+            self.assertEqual(gw.last_published_seq, 103)
+            self.assertEqual(json.loads(gw.status())["effective_buffer_delay_seconds"], 20)
+
+    def test_after_deadline_waits_only_for_a_third_consecutive_segment(self):
+        cid = self.channels[0].id
+        with patch.object(time, "monotonic", return_value=100.0) as clock:
+            gw = self.manager.start(cid).gateway
+            for seq in (100, 101, 104):
+                gw.cache[seq] = (10.0, b"video")
+            gw.latest = 104
+            clock.return_value = 105.0
+            self.assertFalse(json.loads(gw.status())["ready"])
+            gw.cache[102] = (10.0, b"video")
+            gw.cache.move_to_end(104)
+            self.assertEqual([seq for seq, _ in gw.published()], [100, 101, 102])
+            self.assertEqual(json.loads(gw.status())["effective_buffer_delay_seconds"], 0)
+
     def test_cold_channel_starts_with_reserve_and_keeps_playing_through_refill(self):
         # 10s is now explicit fast mode; the safe default is 30s.
         self.manager.delay = 90

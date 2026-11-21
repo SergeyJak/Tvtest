@@ -288,11 +288,8 @@ For a local playlist only, omit `--playlist-url-env EDEM_PLAYLIST_URL`.
 **Recommended HD trial:** leave off `--prewarm` so the original test channel
 does not keep an idle upstream connection and occupy a slot. The
 `--delay 90` value is the **target** when enough video has been cached.
-The explicit `--startup-reserve 30` starts with at least 30 seconds
-of already downloaded reserve, not 90 seconds; the reserve cannot grow
-to 90 seconds at normal live speed without extra upstream history.
-Use `--startup-reserve 60` for a more resilient but slower first start
-if the CDN continues returning 404 for around a minute.
+On a cold channel the gateway gives the downloader up to three seconds
+to build the preferred reserve. Downloads continue during playback.
 The URL and token for the multi-channel TV catalog stay unchanged.
 
 **Existing TV favorite compatibility:** Some Samsung/LG apps remember the
@@ -326,23 +323,21 @@ token is needed when the same token file/IP/port are reused.
 - The prewarmed channel starts buffering immediately. Add another
   `--prewarm "Exact channel name"` for quick channel switching, but
   only if your subscription allows the resulting simultaneous sources.
-- **Cold channel startup.** The default reserve is now **30 seconds**
-  (`--startup-reserve 30`), in addition to the first three consecutive
-  segments published to the TV. With 10-second segments this needs six
-  downloads. A shorter source playlist may take longer to fill. The first
-  HTTP request waits up to `--startup-wait 18` seconds and may still return
-  a 503 if the minimum reserve has not arrived; reselect the channel after
-  its `ready` status becomes true. `--startup-reserve 10` is supported
-  as an explicit **fast but fragile** option. This reserve is capped at
-  `--delay` if the configured delay is less than 30 seconds.
+- **Cold channel startup.** During the first three seconds after activation,
+  the gateway can serve three consecutive complete segments as soon as the
+  preferred additional reserve is cached (`--startup-reserve 30` by default,
+  capped at `--delay`). From the three-second mark it can serve those three
+  segments with any available reserve, including zero. If the third segment
+  arrives later, playback can start as soon as it arrives. A retry shares
+  the original activation time. Each HTTP request can wait up to
+  `--startup-wait 18` seconds before returning 503.
 - **Buffer during viewing.** The gateway uses available history up to
   `--delay` at startup and continues publishing at playback speed during
   a short interruption or refill. Extra segments downloaded in a burst can
   increase the reserve. A source producing video at playback speed cannot
   build additional reserve while the TV keeps playing. Check each channel's
   `effective_buffer_delay_seconds`. Prewarmed channels require the full
-  configured delay. Set `--startup-reserve` equal to `--delay` to require
-  the same startup reserve on every channel.
+  configured delay.
 - **Fast switching:** at the `--max-streams` cap, the gateway may reclaim
   the least recently used **non-pinned** channel if it has been idle for
   at least 20 seconds (`--switch-grace 20`). It never intentionally
@@ -411,11 +406,9 @@ succeed, the TV decoder or local network remains a possibility.
 Avoid treating cumulative errors as evidence of *when* a freeze occurred.
 
 The single-channel trial used a 90-second delay. For multi-channel tests
-choose `--delay 90 --startup-reserve 30` for a balance of startup speed
-and outage protection, or `--startup-reserve 60` to tolerate longer CDN
-interruptions at the cost of more initial waiting. Always use the **measured**
-`effective_buffer_delay_seconds` in `/status` to estimate how long cached
-video might last; a delay target is not proof of that much downloaded video.
+use `--delay 90 --startup-reserve 30`. During playback,
+`effective_buffer_delay_seconds` in `/status` shows the duration of
+uninterrupted cached video available beyond the playable window.
 
 ## Security
 

@@ -125,7 +125,8 @@ class Gateway:
                  poll: float = 2, max_bytes: int = 128 * 1024 * 1024,
                  max_segment: int = 32 * 1024 * 1024,
                  source_refresher: Callable[[], str] | None = None,
-                 refresh_cooldown: float = 20, startup_reserve: float | None = None):
+                 refresh_cooldown: float = 20, startup_reserve: float | None = None,
+                 fast_start: bool = False):
         self._url = url
         self.source_refresher = source_refresher
         self.refresh_cooldown = refresh_cooldown
@@ -138,6 +139,7 @@ class Gateway:
         self.consecutive_manifest_404 = 0
         self.delay, self.timeout, self.poll = delay, timeout, poll
         self.startup_reserve = delay if startup_reserve is None else min(startup_reserve, delay)
+        self._fast_start_at = time.monotonic() + 3.0 if fast_start else None
         self.max_bytes, self.max_segment = max_bytes, max_segment
         self.lock = threading.RLock()
         self.cache: OrderedDict[int, tuple[float, bytes]] = OrderedDict()
@@ -336,7 +338,7 @@ class Gateway:
         Preserve the preceding cached run until the new run can supply at
         least three segments. Then follow the new run at a temporarily
         reduced delay instead of freezing on the first three fragments.
-        Startup requires the configured reserve in fully downloaded segments.
+        On-demand channels may start with three cached segments after three seconds.
         """
         with self.lock:
             if not self.cache or self.latest is None:
@@ -350,6 +352,15 @@ class Gateway:
             tail = runs[-1]
             last = self.last_published_seq
             now = time.monotonic()
+            if last is None:
+                reserve = self.startup_reserve
+                if self._fast_start_at is not None and now >= self._fast_start_at:
+                    reserve = 0
+                candidates = reversed(runs) if self._fast_start_at is not None else (tail,)
+                tail = next((run for run in candidates if len(run) >= 3
+                             and (not reserve or sum(s for _, s in run[3:]) >= reserve)), [])
+                if not tail:
+                    return []
             if last is not None and tail[-1][0] < last:
                 return []  # Never rewind the HLS sequence.
 
@@ -393,7 +404,7 @@ class Gateway:
                         cutoff = i
                         break
                     remaining += tail[i][1]
-                if last is None and cutoff < 2 and sum(s for _, s in tail[3:]) >= self.startup_reserve:
+                if last is None:
                     cutoff = max(cutoff, 2)
                 if last is not None and self._last_published_at is not None:
                     # The source can refill in bursts. Keep serving at playback
@@ -469,8 +480,14 @@ class Gateway:
             playable = self.published(commit=False)
             tail = self._contiguous_tail()
             tail_seconds = round(sum(duration for _, duration in tail), 1)
-            behind_seconds = round(sum(duration for seq, duration in tail
-                                       if playable and seq > playable[-1][0]), 1) if playable else None
+            behind_seconds = None
+            if playable:
+                seq = playable[-1][0] + 1
+                seconds = 0.0
+                while seq in self.cache:
+                    seconds += self.cache[seq][0]
+                    seq += 1
+                behind_seconds = round(seconds, 1)
             state = ('READY' if playable else 'WAITING_FOR_VIDEO' if not self.cache
                      else 'WARMING_OR_REBUILDING_BUFFER')
             info = dict(ready=bool(playable), delay_seconds=self.delay,

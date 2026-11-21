@@ -143,7 +143,8 @@ class MultiGateway:
         gateway = Gateway(channel.url, delay=self.delay, timeout=self.timeout,
                           poll=self.poll, max_bytes=self.cache_mib * 1048576,
                           source_refresher=refresh,
-                          startup_reserve=None if pinned else self.startup_reserve)
+                          startup_reserve=None if pinned else self.startup_reserve,
+                          fast_start=not pinned)
         return ActiveStream(channel, gateway, self.upstream_slots, pinned)
 
     def start(self, cid: str, *, pinned: bool = False) -> ActiveStream | None:
@@ -441,7 +442,7 @@ def main(argv=None):
     p.add_argument("--startup-wait", type=float, default=18,
                    help="Hold a cold channel's first manifest request up to N seconds")
     p.add_argument("--startup-reserve", type=float, default=30,
-                   help="Minimum cached-video reserve at cold start (default 30s, capped at --delay; 10s is an explicit fast/fragile mode)")
+                   help="Preferred extra cached video during the first 3 seconds of a cold start (default 30s, capped at --delay)")
     p.add_argument("--switch-grace", type=float, default=20,
                    help="At stream limit, reclaim non-pinned channels idle for N seconds")
     p.add_argument("--prewarm", action="append", default=[],
