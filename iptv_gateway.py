@@ -125,6 +125,7 @@ class Gateway:
         self.slow_segments = 0
         self.errors = 0
         self.last_update = None
+        self.last_progress = None
         self.stop = threading.Event()
 
     def cycle(self):
@@ -137,6 +138,8 @@ class Gateway:
                 if self.latest is not None and listed[-1].sequence < self.latest - 10:
                     self.cache.clear()
                     self.total_bytes = 0
+                if self.latest is None or self.latest != listed[-1].sequence:
+                    self.last_progress = time.time()
                 self.latest = listed[-1].sequence
                 self.target = target
                 self.last_update = time.time()
@@ -162,6 +165,7 @@ class Gateway:
                         self.slow_segments += 1
                     if segment.sequence not in self.cache:
                         self.cache[segment.sequence] = (segment.duration, data)
+                        self.cache = OrderedDict(sorted(self.cache.items()))
                         self.total_bytes += len(data)
                     self._evict()
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
@@ -228,7 +232,9 @@ class Gateway:
                         cached_segments=len(self.cache), cached_mib=round(self.total_bytes / 1048576, 2),
                         errors=self.errors, slow_segments=self.slow_segments,
                         last_error=self.last_error,
-                        seconds_since_playlist_update=round(time.time() - self.last_update, 1) if self.last_update else None)
+                        seconds_since_playlist_update=round(time.time() - self.last_update, 1) if self.last_update else None,
+                        seconds_since_new_segment=round(time.time() - self.last_progress, 1) if self.last_progress else None,
+                        upstream_stalled=bool(self.last_progress and time.time() - self.last_progress > max(15, 3 * self.target)))
         return json.dumps(info, ensure_ascii=False).encode('utf-8')
 
 
