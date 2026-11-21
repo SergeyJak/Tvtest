@@ -143,6 +143,41 @@ restore the channel or provide another working stream; our gateway cannot
 synthesize live segments. Never paste private URL or token into chat or a
 public issue.
 
+## Keep the same TV playlist URL across restarts
+
+By default, the gateway now saves its LAN access token in
+`.iptv_gateway_token` in the directory where it is launched. Restarting
+with the same IP and port keeps **exactly the same** `/TOKEN/channels.m3u`
+address. The token file is ignored by Git. Never publish the token or
+forward port 8787 to the public internet.
+
+**To preserve a link already entered into the TV before this change**,
+copy just the token (the text between `:8787/` and `/channels.m3u`)
+from the *existing* TV playlist URL into the local file **before**
+restarting the upgraded gateway:
+
+```powershell
+# Run once in C:\Users\angular\IdeaProjects\Tvtest
+$oldToken = Read-Host "Token from the EXISTING TV playlist URL"
+Set-Content -Path .iptv_gateway_token -Value $oldToken -NoNewline
+```
+
+This is a local operation; do not paste your token into GitHub issues or chat.
+After merging and `git pull`, stop the old gateway with Ctrl+C and restart
+using the same `--host`, `--advertise-host`, and `--port`:
+
+```powershell
+python iptv_gateway.py --playlist forgpt.m3u8 --channel "VF Теория большого взрыва" --delay 90 --host 0.0.0.0 --advertise-host 192.168.94.109
+```
+
+The old TV URL continues to work. If you skip the one-time migration, the
+first upgraded run creates a **new** token and you will need to update the
+TV once; future restarts preserve that new link. If your PC's LAN IP
+changes, reserve `192.168.94.109` for it in your router's DHCP settings.
+
+To deliberately rotate access, stop the gateway, delete the local
+`.iptv_gateway_token` file and restart. This invalidates older TV URLs.
+
 ## Security
 
 Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions or channel source links. The experimental gateway serves only on localhost by default; LAN exposure requires explicit --host 0.0.0.0 and a random access token.

@@ -423,6 +423,33 @@ def private_playlist_text(path: Path, source_url: str | None, timeout: float) ->
     return contents.decode('utf-8-sig')
 
 
+def load_or_create_token(path: Path) -> str:
+    """Keep LAN playlist URLs stable without storing credentials in Git.
+
+    Existing tokens may be migrated manually from a previous TV URL to avoid
+    reconfiguring clients when upgrading from the ephemeral-token version.
+    """
+    import re
+
+    def valid(value: str) -> str:
+        if not re.fullmatch(r'[A-Za-z0-9_-]{16,128}', value):
+            raise ValueError('invalid_token_file')
+        return value
+
+    try:
+        # Exclusive creation prevents accidentally replacing an existing key.
+        with path.open('x', encoding='ascii') as file:
+            token = secrets.token_urlsafe(24)
+            file.write(token + '\n')
+        if os.name != 'nt':
+            path.chmod(0o600)
+        return token
+    except FileExistsError:
+        with path.open('r', encoding='ascii') as file:
+            token = file.read(256).strip()
+        return valid(token)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Local HLS buffering gateway: single channel')
     parser.add_argument('--playlist', required=True, type=Path)
@@ -433,6 +460,8 @@ def main(argv=None):
     parser.add_argument('--port', type=int, default=8787)
     parser.add_argument('--timeout', type=float, default=12)
     parser.add_argument('--poll', type=float, default=2)
+    parser.add_argument('--token-file', type=Path, default=Path('.iptv_gateway_token'),
+                        help='Local private token file; stable playlist link across restarts')
     parser.add_argument('--playlist-url-env', default=None,
                         help='Optional name of environment variable containing private Edem playlist URL; never pass the URL itself')
     args = parser.parse_args(argv)
@@ -455,7 +484,10 @@ def main(argv=None):
         return playlist_entry_from_text(text, args.channel)
     gateway = Gateway(matches[0][2], delay=args.delay, timeout=args.timeout, poll=args.poll,
                       source_refresher=source_refresher)
-    token = secrets.token_urlsafe(16)
+    try:
+        token = load_or_create_token(args.token_file)
+    except (OSError, UnicodeError, ValueError):
+        parser.error('Could not load or create a valid private gateway token file')
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(gateway, token, matches[0][0]))
     httpd.daemon_threads = True
     thread = threading.Thread(target=gateway.run, daemon=True)

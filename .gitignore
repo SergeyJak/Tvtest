@@ -7,3 +7,6 @@
 __pycache__/
 .pytest_cache/
 .venv/
+
+# Keep the LAN gateway's persistent URL access token local.
+.iptv_gateway_token
