@@ -211,6 +211,34 @@ the existing channel again may be necessary after recovery. `ready:true`
 means the gateway can publish its current media window; it is **not** a
 guarantee that the TV is playing.
 
+## TV stops while status says ready: true
+
+`ready: true` means the gateway *could* serve some cached HLS. It does **not**
+prove that the TV actually requested the gateway's media playlist.
+
+If a TV stops and `last_published_sequence: null` with
+`client_manifest_200: 0`, the current gateway process hasn't served
+a successful `/index.m3u8` request. Verify the full **TV playlist URL**
+printed by the currently running gateway is exactly what the TV has saved,
+including the private token. An older token causes a local 404 without
+incrementing `client_manifest_503` or `client_segment_404`.
+An outdated PC IP or port causes connection failures, not 404.
+
+The gateway now tracks private, aggregated HTTP response counters:
+`client_playlist_200`, `client_manifest_200`,
+`client_segment_200`, `client_segment_206`,
+`client_auth_404`, and seconds since the last client HLS
+request. It does **not** record client IP addresses, tokens or paths.
+Poll `/status` from your browser and then start the TV channel:
+`client_manifest_200` and `client_segment_200` should increase
+when playback uses the gateway. Merely requesting `/status` doesn't increase them.
+
+Separately, when `MANIFEST_HTTP_404` repeats, the upstream provider isn't
+serving its live HLS manifest. Re-fetching the authorized Edem M3U can switch
+to a newly returned channel URL, **but cannot restore** a feed when the
+refreshed M3U still returns the same unusable URL (`source_changes: 0`).
+Do not increase delay as a substitute for fixing repeated upstream 404s.
+
 ## Security
 
 Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions or channel source links. The experimental gateway serves only on localhost by default; LAN exposure requires explicit --host 0.0.0.0 and a random access token.
