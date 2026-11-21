@@ -101,6 +101,49 @@ class MultiChannelTests(unittest.TestCase):
         self.assertEqual(stream["client_manifest_200"], 1)
         self.assertEqual(stream["client_segment_200"], 1)
 
+    def test_existing_single_channel_tv_urls_still_play_after_upgrade(self):
+        # This simulates the TV app caching its old /TOKEN/index.m3u8 URL
+        # instead of fetching the new multi-channel catalog on restart.
+        first = self.channels[0]
+        self.manager.legacy_channel_id = first.id
+        stream = self.manager.start(first.id, pinned=True)
+        gw = stream.gateway
+        with gw.lock:
+            for seq in range(10, 24):
+                gw.cache[seq] = (10.0, b"0123456789")
+                gw.total_bytes += 10
+            gw.latest = 23
+        code, manifest = self.request("/index.m3u8")
+        self.assertEqual(code, 200)
+        self.assertIn(f"/channel/{first.id}/segment/", manifest.decode())
+        seq = gw.last_published_seq
+        code, content = self.request(f"/segment/{seq}.ts")
+        self.assertEqual((code, content), (200, b"0123456789"))
+        # Existing Range-requesting TV players must also remain compatible.
+        url = self.url + f"/segment/{seq}.ts"
+        with urllib.request.urlopen(urllib.request.Request(
+                url, headers={"Range": "bytes=2-5"})) as response:
+            self.assertEqual((response.status, response.read()), (206, b"2345"))
+        data = json.loads(self.request("/status")[1])
+        self.assertEqual(data["legacy_channel"], first.name)
+        self.assertEqual(data["legacy_manifest_requests"], 1)
+        self.assertEqual(data["legacy_segment_requests"], 2)
+        self.assertEqual(data["streams"][0]["client_manifest_200"], 1)
+        self.assertEqual(data["streams"][0]["client_segment_200"], 1)
+        # Catalog still contains all channels and does not leak origin URLs.
+        self.request("/channels.m3u")
+        self.assertEqual(json.loads(self.request("/status")[1])["catalog_requests"], 1)
+        self.assertEqual(len(self.manager.active), 1)
+
+    def test_legacy_urls_are_not_enabled_without_explicit_prewarm(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.request("/index.m3u8")
+        self.assertEqual(ctx.exception.code, 404)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.request("/segment/100.ts")
+        self.assertEqual(ctx.exception.code, 404)
+        self.assertEqual(len(self.manager.active), 0)
+
     def test_bad_channel_or_token_is_not_a_public_proxy(self):
         for path in ("/channel/invalid/index.m3u8",
                      f"/channel/{self.channels[0].id}/anything"):
