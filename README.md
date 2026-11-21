@@ -265,6 +265,56 @@ final URL after CDN redirects.
 The review fixes are covered by synthetic HTTP/playlist regression tests,
 not by a guarantee against an unavailable Edem source.
 
+## Try other channels on your current TV (multi-channel experiment)
+
+The opt-in `iptv_multi.py` script creates a TV playlist containing **all** channels from
+the private M3U. It starts a source HLS worker only for channels viewers
+request, rather than pre-buffering thousands of streams. The original
+`iptv_gateway.py` remains unchanged for direct A/B comparison.
+
+Run on the **same Windows computer** after `git pull`. Stop the
+single-channel process with Ctrl+C before using the same port:
+
+```powershell
+# The private environment variable must already be set in this PowerShell.
+python iptv_multi.py --playlist forgpt.m3u8 --delay 30 --host 0.0.0.0 --advertise-host 192.168.94.109 --playlist-url-env EDEM_PLAYLIST_URL --prewarm "VF Теория большого взрыва"
+```
+
+The printed `TV playlist URL` retains the **same token** from the local
+`.iptv_gateway_token` and still ends in `/channels.m3u`. Refresh/reload
+the playlist inside the TV app to see the full channel catalog. Some
+players cache their previous one-channel M3U until re-imported. No new
+token is needed when the same token file/IP/port are reused.
+
+- Only activated channels consume bandwidth and memory; by default a
+  maximum of **3 simultaneous upstream channels** (configurable with
+  `--max-streams`). This limit is a technical safety cap, not permission
+  to exceed an Edem subscription's actual concurrent-stream allowance.
+- The prewarmed channel starts buffering immediately. Add another
+  `--prewarm "Exact channel name"` for quick channel switching, but
+  only if your subscription allows the resulting simultaneous sources.
+- **Cold channels take time to prepare.** A TV app might give up on the
+  temporary HTTP 503 from `/index.m3u8` until buffering has finished.
+  Try reselecting the channel after 30–60 seconds. Fast cold-channel
+  startup and per-client warmup are the next product improvements.
+- A non-pinned channel stops pulling upstream after 90 seconds without
+  segment/manifest requests. Pinned prewarmed channels run until shutdown.
+- With more than three recently active channels, new requests may receive
+  HTTP 503 until an old channel becomes idle. Check `/status`.
+- Filter the catalog to trial specific channels by repeating
+  `--filter "name part"`. Example:
+  `--filter "РБК" --filter "VF"`. Don't pass private source URLs as arguments.
+- Cached media is **not** persisted to disk. RAM limit is per active
+  channel (`--cache-mib 128`); total potential cache with three
+  active channels is 384 MiB.
+- This is a **LAN testing tool only**, not an internet-facing service.
+  Never port-forward it to the public internet. Future VPS/family
+  authentication, HTTPS, separate Edem accounts and multi-viewer shared
+  cache are addressed in [ROADMAP.md](ROADMAP.md).
+
+Current one-channel gateway behavior is preserved unchanged. To revert,
+stop `iptv_multi.py` and start `iptv_gateway.py` again. The token remains stable.
+
 ## Security
 
 Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions or channel source links. The experimental gateway serves only on localhost by default; LAN exposure requires explicit --host 0.0.0.0 and a random access token.

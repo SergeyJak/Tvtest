@@ -1,0 +1,139 @@
+"""Offline tests for the on-demand family TV catalog prototype."""
+import json
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+import iptv_multi as multi
+
+
+class MultiChannelTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.path = Path(self.temp.name) / "private.m3u"
+        self.entries = [
+            ("Channel Alpha", "Tests", "http://upstream.test/PRIVATE_TOKEN/alpha"),
+            ("Channel Beta", "Tests", "http://upstream.test/PRIVATE_TOKEN/beta"),
+        ]
+        self.channels = multi.channels_from_entries(self.entries)
+        # Workers should never touch actual network resources in a unit test.
+        self.worker_patch = patch.object(multi.Gateway, "run",
+                                         lambda gw: gw.stop.wait(10))
+        self.worker_patch.start()
+        self.manager = multi.MultiGateway(self.channels, self.path, delay=30,
+                                          max_streams=2, cache_mib=64,
+                                          idle_seconds=20)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0),
+                    multi.make_multi_handler(self.manager, "test-token-1234567890"))
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/test-token-1234567890"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+        self.manager.close()
+        self.worker_patch.stop()
+        self.temp.cleanup()
+
+    def request(self, path):
+        with urllib.request.urlopen(self.url + path, timeout=3) as resp:
+            return resp.status, resp.read()
+
+    def test_catalog_contains_multiple_channels_without_origin_url(self):
+        status, body = self.request("/channels.m3u")
+        self.assertEqual(status, 200)
+        text = body.decode()
+        self.assertEqual(text.count("#EXTINF:"), 2)
+        for item in self.channels:
+            self.assertIn(item.name, text)
+            self.assertIn(f"/channel/{item.id}/index.m3u8", text)
+        self.assertNotIn("PRIVATE_TOKEN", text)
+        self.assertNotIn("upstream.test", text)
+        self.assertEqual(len(self.manager.active), 0,
+                         "Browsing the catalog must not start every upstream.")
+
+    def test_channel_ids_stay_same_when_private_m3u_urls_rotate(self):
+        rotated = [(name, group, url + "/rotated") for name, group, url in self.entries]
+        self.assertEqual([c.id for c in self.channels],
+                         [c.id for c in multi.channels_from_entries(rotated)])
+        with_duplicates = multi.channels_from_entries(
+            self.entries + [self.entries[0]])
+        self.assertNotEqual(with_duplicates[0].id, with_duplicates[-1].id)
+
+    def test_on_demand_channel_is_warmed_only_when_requested(self):
+        first = self.channels[0]
+        with self.assertRaises(urllib.error.HTTPError) as warming:
+            self.request(f"/channel/{first.id}/index.m3u8")
+        self.assertEqual(warming.exception.code, 503)
+        self.assertEqual(len(self.manager.active), 1)
+        self.assertIn(first.id, self.manager.active)
+        self.assertNotIn(self.channels[1].id, self.manager.active)
+        gw = self.manager.active[first.id].gateway
+        with gw.lock:
+            for seq in range(10, 24):
+                gw.cache[seq] = (10.0, b"0123456789")
+                gw.total_bytes += 10
+            gw.latest = 23
+        status, body = self.request(f"/channel/{first.id}/index.m3u8")
+        self.assertEqual(status, 200)
+        data = body.decode()
+        self.assertIn(f"/test-token-1234567890/channel/{first.id}/segment/", data)
+        self.assertNotIn("/test-token-1234567890/segment/", data)
+        self.assertNotIn("PRIVATE_TOKEN", data)
+        published_seq = gw.last_published_seq
+        status, video = self.request(f"/channel/{first.id}/segment/{published_seq}.ts")
+        self.assertEqual((status, video), (200, b"0123456789"))
+        with urllib.request.urlopen(urllib.request.Request(
+                self.url + f"/channel/{first.id}/segment/{published_seq}.ts",
+                headers={"Range": "bytes=2-5"})) as response:
+            self.assertEqual((response.status, response.read()), (206, b"2345"))
+        metrics = json.loads(self.request("/status")[1])
+        self.assertEqual(metrics["active_streams"], 1)
+        stream = metrics["streams"][0]
+        self.assertEqual(stream["client_manifest_200"], 1)
+        self.assertEqual(stream["client_segment_200"], 1)
+
+    def test_bad_channel_or_token_is_not_a_public_proxy(self):
+        for path in ("/channel/invalid/index.m3u8",
+                     f"/channel/{self.channels[0].id}/anything"):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.request(path)
+            self.assertEqual(ctx.exception.code, 404)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.url.replace("test-token-1234567890",
+                                                    "wrong-token-1234567890") + "/status")
+        self.assertEqual(ctx.exception.code, 404)
+        self.assertEqual(len(self.manager.active), 0)
+
+    def test_limit_and_idle_cleanup(self):
+        first, second = self.channels
+        self.assertIsNotNone(self.manager.start(first.id))
+        self.assertIsNotNone(self.manager.start(second.id))
+        self.assertEqual(len(self.manager.active), 2)
+        # The cap is strict. Never open excess provider streams accidentally.
+        another = multi.channels_from_entries([("Third", "", "https://example.test/3")])[0]
+        self.manager.channels[another.id] = another
+        self.assertIsNone(self.manager.start(another.id))
+        self.manager.active[first.id].accessed -= 30
+        self.manager.sweep()
+        self.assertEqual(len(self.manager.active), 1)
+        self.assertIsNotNone(self.manager.start(another.id))
+
+    def test_pinned_stream_is_not_evicted(self):
+        first = self.channels[0]
+        stream = self.manager.start(first.id, pinned=True)
+        stream.accessed -= 1000
+        self.manager.sweep()
+        self.assertIn(first.id, self.manager.active)
+
+
+if __name__ == "__main__":
+    unittest.main()
