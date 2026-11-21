@@ -168,7 +168,8 @@ class AstraReviewRegressions(unittest.TestCase):
         for seq in range(100, 103):
             gw.cache[seq] = (10, b"x")
         gw.latest = 102
-        gw.last_advance_at = 10.0
+        with patch.object(gateway.time, "monotonic", return_value=10.0):
+            self.assertEqual(gw.published(), [])
         with patch.object(gateway.time, "monotonic", return_value=105.0):
             self.assertEqual(gw.published(), [])
             status = json.loads(gw.status())

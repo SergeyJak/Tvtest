@@ -201,7 +201,6 @@ class MultiChannelTests(unittest.TestCase):
         def cache(seq):
             gw.cache[seq] = (10.0, b"segment")
             gw.latest = seq
-            gw.last_advance_at = time.monotonic()
 
         with patch.object(time, "monotonic", return_value=100.0) as clock:
             for seq in range(100, 103):
@@ -235,7 +234,6 @@ class MultiChannelTests(unittest.TestCase):
                 for seq in range(100, 105):
                     gw.cache[seq] = (10.0, b"data")
                 gw.latest = 104
-                gw.last_advance_at = 1.0  # Upstream idle must not count as buffer.
             self.assertFalse(json.loads(gw.status())["ready"])
             with gw.lock:
                 gw.cache[105] = (10.0, b"data")

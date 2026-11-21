@@ -273,16 +273,20 @@ the private M3U. It starts a source HLS worker only for channels viewers
 request, rather than pre-buffering thousands of streams. The original
 `iptv_gateway.py` remains unchanged for direct A/B comparison.
 
-Run on the **same Windows computer** after `git pull`. Stop the
-single-channel process with Ctrl+C before using the same port:
+In PowerShell on the Windows PC, stop the running gateway with Ctrl+C,
+then launch the updated multi-channel gateway from the project directory.
+Use the PC's current LAN IPv4 address for `--advertise-host`.
 
 ```powershell
-# The private environment variable must already be set in this PowerShell.
+Set-Location C:\Users\angular\IdeaProjects\Tvtest
+# For remote playlist refresh, set EDEM_PLAYLIST_URL in this PowerShell first.
 python iptv_multi.py --playlist forgpt.m3u8 --delay 90 --startup-reserve 30 --host 0.0.0.0 --advertise-host 192.168.94.109 --playlist-url-env EDEM_PLAYLIST_URL
 ```
 
+For a local playlist only, omit `--playlist-url-env EDEM_PLAYLIST_URL`.
+
 **Recommended HD trial:** leave off `--prewarm` so the original test channel
-does not keep an idle upstream connection and occupy a slot. The 
+does not keep an idle upstream connection and occupy a slot. The
 `--delay 90` value is the **target** when enough video has been cached.
 The explicit `--startup-reserve 30` starts with at least 30 seconds
 of already downloaded reserve, not 90 seconds; the reserve cannot grow

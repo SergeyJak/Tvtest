@@ -168,7 +168,6 @@ class Gateway:
         self.last_client_manifest_access = None
         self.last_client_segment_access = None
         self.last_client_auth_failure = None
-        self.last_advance_at = None
         self.last_published_seq = None
         self._published_start = None
         self._last_published_at = None
@@ -245,7 +244,6 @@ class Gateway:
                     self._recovery_mode = False
                 if self.latest is None or self.latest != listed[-1].sequence:
                     self.last_progress = time.time()
-                    self.last_advance_at = time.monotonic()
                 self.latest = listed[-1].sequence
                 self.target = target
                 self.last_update = time.time()
@@ -388,22 +386,16 @@ class Gateway:
                 # but always move the published edge when new segments arrive.
                 cutoff = len(tail) - 2 if len(tail) >= 4 else 2
             else:
-                # Important: before FIRST publication, elapsed upstream idle
-                # time must never count as buffered playback time.
-                elapsed = (max(0.0, now - self.last_advance_at)
-                           if last is not None and self.last_advance_at is not None else 0.0)
-                balanced = self.startup_reserve < self.delay
-                required_behind = self.delay if balanced else max(0.0, self.delay - elapsed)
                 remaining = 0.0
                 cutoff = -1
                 for i in range(len(tail) - 1, -1, -1):
-                    if remaining >= required_behind:
+                    if remaining >= self.delay:
                         cutoff = i
                         break
                     remaining += tail[i][1]
-                if balanced and last is None and sum(s for _, s in tail[3:]) >= self.startup_reserve:
+                if last is None and cutoff < 2 and sum(s for _, s in tail[3:]) >= self.startup_reserve:
                     cutoff = max(cutoff, 2)
-                if balanced and last is not None and self._last_published_at is not None:
+                if last is not None and self._last_published_at is not None:
                     # The source can refill in bursts. Keep serving at playback
                     # speed even while the reserve is below the preferred delay.
                     paced, due = self._paced_edge(tail, last, now)

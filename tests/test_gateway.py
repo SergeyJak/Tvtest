@@ -42,7 +42,6 @@ class GatewayTests(unittest.TestCase):
         for seq in range(100, 112):
             gateway.cache[seq] = (10, b'packet')
         gateway.latest = 111
-        gateway.last_advance_at = 100.0
         with patch.object(g.time, 'monotonic', return_value=100.0):
             initial = gateway.published()[-1][0]
         with patch.object(g.time, 'monotonic', return_value=120.0):
@@ -50,7 +49,6 @@ class GatewayTests(unittest.TestCase):
         self.assertGreater(during_stall, initial)
         gateway.cache[112] = (10, b'packet')
         gateway.latest = 112
-        gateway.last_advance_at = 121.0
         with patch.object(g.time, 'monotonic', return_value=121.0):
             on_recovery = gateway.published()[-1][0]
         self.assertGreaterEqual(on_recovery, during_stall)

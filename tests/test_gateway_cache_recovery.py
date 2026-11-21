@@ -119,6 +119,31 @@ class GatewayRecoveryTests(unittest.TestCase):
         gw.latest = 110
         self.assertEqual([s for s, _ in gw.published()], [106, 107, 108, 109])
 
+    def test_full_startup_reserve_does_not_pause_playback_during_refill(self):
+        gw = self.gateway(range(100, 105), delay=30)
+
+        def download(seq):
+            manifest = f'#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:{seq}\n#EXTINF:10,\n{seq}.ts\n'
+            with patch.object(g, 'media_manifest', return_value=(manifest, 'http://upstream.test/live')), \
+                 patch.object(g, 'fetch_segment', return_value=b'x'):
+                gw.cycle()
+
+        with patch.object(g.time, 'monotonic', return_value=100.0) as clock:
+            self.assertFalse(gw.published())
+            download(105)
+            self.assertEqual(gw.published()[-1][0], 102)
+
+            # Spend two segments of reserve while the source is stalled.
+            for expected in (103, 104):
+                clock.return_value += 10
+                self.assertEqual(gw.published()[-1][0], expected)
+
+            # Each resumed download must allow the next cached segment to play.
+            for seq in (106, 107, 108):
+                clock.return_value += 10
+                download(seq)
+                self.assertEqual(gw.published()[-1][0], seq - 1)
+
     def test_paced_publication_uses_current_segment_extinf(self):
         gw = g.Gateway('http://upstream.test/live', delay=90, startup_reserve=30)
         # A segment with 2s EXTINF followed by a segment with 10s EXTINF.
