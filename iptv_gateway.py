@@ -142,6 +142,15 @@ class Gateway:
         self.last_segment_download = None
         self.client_manifest_503 = 0
         self.client_segment_404 = 0
+        self.client_auth_404 = 0
+        self.client_playlist_200 = 0
+        self.client_manifest_200 = 0
+        self.client_segment_200 = 0
+        self.client_segment_206 = 0
+        self.last_client_playlist_access = None
+        self.last_client_manifest_access = None
+        self.last_client_segment_access = None
+        self.last_client_auth_failure = None
         self.last_advance_at = None
         self.last_published_seq = None
         self.stop = threading.Event()
@@ -321,6 +330,31 @@ class Gateway:
             found = self.cache.get(seq)
             return found[1] if found is not None else None
 
+    def record_client(self, kind: str, status: int) -> None:
+        """Count client HTTP responses without storing IPs, paths, or tokens."""
+        now = time.time()
+        with self.lock:
+            if kind == 'auth' and status == 404:
+                self.client_auth_404 += 1
+                self.last_client_auth_failure = now
+            elif kind == 'playlist' and status == 200:
+                self.client_playlist_200 += 1
+                self.last_client_playlist_access = now
+            elif kind == 'manifest':
+                if status == 200:
+                    self.client_manifest_200 += 1
+                elif status == 503:
+                    self.client_manifest_503 += 1
+                self.last_client_manifest_access = now
+            elif kind == 'segment':
+                if status == 200:
+                    self.client_segment_200 += 1
+                elif status == 206:
+                    self.client_segment_206 += 1
+                elif status == 404:
+                    self.client_segment_404 += 1
+                self.last_client_segment_access = now
+
     def status(self) -> bytes:
         with self.lock:
             # Read-only observation must not move the TV's playback cursor.
@@ -341,6 +375,15 @@ class Gateway:
                         latest_upstream_sequence=self.latest,
                         client_manifest_503=self.client_manifest_503,
                         client_segment_404=self.client_segment_404,
+                        client_playlist_200=self.client_playlist_200,
+                        client_manifest_200=self.client_manifest_200,
+                        client_segment_200=self.client_segment_200,
+                        client_segment_206=self.client_segment_206,
+                        client_auth_404=self.client_auth_404,
+                        seconds_since_client_playlist=round(time.time()-self.last_client_playlist_access, 1) if self.last_client_playlist_access else None,
+                        seconds_since_client_manifest=round(time.time()-self.last_client_manifest_access, 1) if self.last_client_manifest_access else None,
+                        seconds_since_client_segment=round(time.time()-self.last_client_segment_access, 1) if self.last_client_segment_access else None,
+                        seconds_since_client_auth_failure=round(time.time()-self.last_client_auth_failure, 1) if self.last_client_auth_failure else None,
                         seconds_since_segment_download=round(time.time() - self.last_segment_download, 1) if self.last_segment_download else None,
                         cached_segments=len(self.cache), cached_mib=round(self.total_bytes / 1048576, 2),
                         errors=self.errors, slow_segments=self.slow_segments,
@@ -388,6 +431,7 @@ def make_handler(gateway: Gateway, token: str, channel_name: str):
         def serve(self, head_only: bool):
             path = urllib.parse.urlparse(self.path).path
             if not path.startswith(prefix + '/'):
+                gateway.record_client('auth', 404)
                 return self.respond(b'Not found', 'text/plain', head_only, 404)
             part = path[len(prefix):]
             if part == '/status':
@@ -399,14 +443,15 @@ def make_handler(gateway: Gateway, token: str, channel_name: str):
                 if any(ch in host for ch in ('\r', '\n', ' ')):
                     return self.respond(b'Bad host', 'text/plain', head_only, 400)
                 content = f'#EXTM3U\n#EXTINF:-1,{clean_name}\nhttp://{host}{prefix}/index.m3u8\n'
+                gateway.record_client('playlist', 200)
                 return self.respond(content.encode('utf-8'), 'audio/x-mpegurl', head_only)
             if part == '/index.m3u8':
                 content = gateway.playlist(token)
                 if content is None:
-                    with gateway.lock:
-                        gateway.client_manifest_503 += 1
+                    gateway.record_client('manifest', 503)
                     return self.respond(b'Buffer warming up', 'text/plain', head_only, 503,
                                         {'Retry-After': '5'})
+                gateway.record_client('manifest', 200)
                 return self.respond(content, 'application/vnd.apple.mpegurl', head_only)
             if part.startswith('/segment/') and part.endswith('.ts'):
                 try:
@@ -415,8 +460,7 @@ def make_handler(gateway: Gateway, token: str, channel_name: str):
                     return self.respond(b'Not found', 'text/plain', head_only, 404)
                 data = gateway.segment(seq)
                 if data is None:
-                    with gateway.lock:
-                        gateway.client_segment_404 += 1
+                    gateway.record_client('segment', 404)
                     return self.respond(b'Segment expired', 'text/plain', head_only, 404)
                 headers = {'Accept-Ranges': 'bytes'}
                 range_header = self.headers.get('Range')
@@ -437,7 +481,9 @@ def make_handler(gateway: Gateway, token: str, channel_name: str):
                                             {'Content-Range': f'bytes */{len(data)}'})
                     end = min(len(data) - 1, end)
                     headers['Content-Range'] = f'bytes {start}-{end}/{len(data)}'
+                    gateway.record_client('segment', 206)
                     return self.respond(data[start:end + 1], 'video/mp2t', head_only, 206, headers)
+                gateway.record_client('segment', 200)
                 return self.respond(data, 'video/mp2t', head_only, extra=headers)
             return self.respond(b'Not found', 'text/plain', head_only, 404)
     return Handler
