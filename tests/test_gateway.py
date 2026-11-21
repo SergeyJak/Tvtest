@@ -37,6 +37,24 @@ class GatewayTests(unittest.TestCase):
         records = gateway.published()
         self.assertEqual([x[0] for x in records], [105, 106, 107])
 
+    def test_buffer_releases_cached_segments_during_stall_without_rewind(self):
+        gateway = g.Gateway('http://upstream.test', delay=40)
+        for seq in range(100, 112):
+            gateway.cache[seq] = (10, b'packet')
+        gateway.latest = 111
+        gateway.last_advance_at = 100.0
+        with patch.object(g.time, 'monotonic', return_value=100.0):
+            initial = gateway.published()[-1][0]
+        with patch.object(g.time, 'monotonic', return_value=120.0):
+            during_stall = gateway.published()[-1][0]
+        self.assertGreater(during_stall, initial)
+        gateway.cache[112] = (10, b'packet')
+        gateway.latest = 112
+        gateway.last_advance_at = 121.0
+        with patch.object(g.time, 'monotonic', return_value=121.0):
+            on_recovery = gateway.published()[-1][0]
+        self.assertGreaterEqual(on_recovery, during_stall)
+
     def test_gateway_download_caches_segments(self):
         manifest = ('#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXT-X-MEDIA-SEQUENCE:5\n'
                     '#EXTINF:10,\n5.ts\n#EXTINF:10,\n6.ts\n')
