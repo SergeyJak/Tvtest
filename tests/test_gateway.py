@@ -50,6 +50,15 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(gateway.last_error, None)
         self.assertEqual(gateway.total_bytes, 10)
 
+    def test_upstream_stale_status_and_out_of_order_cache(self):
+        gateway = g.Gateway('http://upstream.test', delay=40)
+        gateway.cache[101] = (10, b'b')
+        gateway.cache[100] = (10, b'a')
+        gateway.cache = g.OrderedDict(sorted(gateway.cache.items()))
+        self.assertEqual(list(gateway.cache), [100, 101])
+        gateway.last_progress = g.time.time() - 61
+        self.assertTrue(json.loads(gateway.status())['upstream_stalled'])
+
     def test_http_playlist_and_range_and_auth(self):
         gateway = g.Gateway('http://example.test', delay=30)
         for seq in range(30, 45):
