@@ -324,9 +324,12 @@ class Gateway:
         """Advance from the last published segment using actual segment durations."""
         index = last - run[0][0]
         due = self._last_published_at if self._last_published_at is not None else now
-        while index + 1 < len(run) and due + run[index + 1][1] <= now:
-            index += 1
+        # A new segment can be published after the currently published
+        # segment's EXTINF duration has elapsed. Using the *next* segment's
+        # duration delays playback on variable-duration HLS streams.
+        while index + 1 < len(run) and due + run[index][1] <= now:
             due += run[index][1]
+            index += 1
         return index, due if index < len(run) - 1 else now
 
     def published(self, commit: bool = True) -> list[tuple[int, float]]:
