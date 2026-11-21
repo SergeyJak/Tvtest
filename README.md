@@ -277,8 +277,18 @@ single-channel process with Ctrl+C before using the same port:
 
 ```powershell
 # The private environment variable must already be set in this PowerShell.
-python iptv_multi.py --playlist forgpt.m3u8 --delay 30 --host 0.0.0.0 --advertise-host 192.168.94.109 --playlist-url-env EDEM_PLAYLIST_URL --prewarm "VF Теория большого взрыва"
+python iptv_multi.py --playlist forgpt.m3u8 --delay 30 --host 0.0.0.0 --advertise-host 192.168.94.109 --playlist-url-env EDEM_PLAYLIST_URL
 ```
+
+**Current recommendation (multi-channel test): no `--prewarm`.**
+The first test channel was permanently pinned and continued to consume an
+upstream slot/bandwidth after the viewer switched away. Without `--prewarm`,
+all channels start on demand and their idle workers are automatically
+stopped. The *catalog URL and saved token* stay the same. However, an app
+that still uses a cached **old single-channel media URL**
+(`/TOKEN/index.m3u8`) will need to select the channel from the freshly
+imported multi-channel playlist, because that legacy alias is enabled
+only with `--prewarm`.
 
 **Existing TV favorite compatibility:** Some Samsung/LG apps remember the
 old single-channel `/TOKEN/index.m3u8` and `/TOKEN/segment/NN.ts` URLs
@@ -370,6 +380,7 @@ The private `/status` for each channel now exposes:
 - `last_upstream_failure` and `seconds_since_last_upstream_failure`,
   which survive subsequent successful manifest polls.
 - `effective_buffer_delay_seconds`, `last_published_sequence`,
+  `seconds_since_published_advance`, `recovery_mode`,
   `last_downloaded_sequence`, `latest_upstream_sequence`,
   `seconds_since_new_segment` and `seconds_since_segment_download`
   alongside existing client HTTP error counters.
