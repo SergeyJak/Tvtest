@@ -280,6 +280,24 @@ single-channel process with Ctrl+C before using the same port:
 python iptv_multi.py --playlist forgpt.m3u8 --delay 30 --host 0.0.0.0 --advertise-host 192.168.94.109 --playlist-url-env EDEM_PLAYLIST_URL --prewarm "VF Теория большого взрыва"
 ```
 
+**Existing TV favorite compatibility:** Some Samsung/LG apps remember the
+old single-channel `/TOKEN/index.m3u8` and `/TOKEN/segment/NN.ts` URLs
+even after the source switches to `iptv_multi.py`. When you supply
+`--prewarm "VF Теория большого взрыва"`, those old paths remain valid
+aliases for the **first prewarmed channel**. Other channels use
+`/TOKEN/channel/ID/index.m3u8`. The private `/status` now shows
+`legacy_manifest_requests`, `legacy_segment_requests`, and
+`catalog_requests`:
+
+- Increasing `legacy_manifest_requests` means the TV still uses its
+  cached old one-channel URL, now repaired by the compatibility alias.
+- Increasing `catalog_requests` means the TV actually fetched the new
+  channel list; after that select a channel from the freshly loaded list.
+- **All request counters at zero:** the TV is still not contacting this
+  server, so check its saved playlist URL/IP and refresh or re-import it.
+- If the old one-channel URLs should map to a different channel, put that
+  exact channel first in `--prewarm`. No automatic guessing.
+
 The printed `TV playlist URL` retains the **same token** from the local
 `.iptv_gateway_token` and still ends in `/channels.m3u`. Refresh/reload
 the playlist inside the TV app to see the full channel catalog. Some
