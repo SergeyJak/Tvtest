@@ -142,6 +142,20 @@ class GatewayRecoveryTests(unittest.TestCase):
             clock.return_value = 112.0
             self.assertEqual(gw.published()[-1][0], 104)
 
+    def test_status_reports_age_of_published_window_without_moving_cursor(self):
+        gw = self.gateway(range(100, 120), delay=90)
+        clock = [100.0]
+        with patch.object(g.time, 'monotonic', side_effect=lambda: clock[0]):
+            self.assertIsNone(json.loads(gw.status())['seconds_since_published_advance'])
+            start = gw.published()[-1][0]
+            clock[0] += 25
+            info = json.loads(gw.status())
+            self.assertEqual(info['last_published_sequence'], start)
+            self.assertEqual(info['seconds_since_published_advance'], 25.0)
+            self.assertFalse(info['recovery_mode'])
+            # A diagnostic GET must not move the playback cursor.
+            self.assertEqual(gw.last_published_seq, start)
+
     def test_status_is_read_only_for_tv_cursor(self):
         gw = self.gateway(range(100, 120))
         self.assertIsNone(gw.last_published_seq)
