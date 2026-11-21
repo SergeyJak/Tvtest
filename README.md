@@ -29,6 +29,42 @@ For meaningful comparison, test the **same playlist twice**: once on a computer 
 
 A strong connection speed alone doesn't rule out intermittent upstream stalls. Monitor multiple rounds and compare the home/remote results before enabling a relay. A relay can help if the route is bad; it **cannot** repair an upstream feed that has stopped delivering segments. Sending the entire stream through metered hosting can be expensive.
 
+
+## Next step: 10-minute continuous HLS stall test
+
+The first 64/64 startup checks were fast (p95 first-byte delays 87–127 ms) but
+**cannot rule out freezes later in playback**. The continuous monitor follows
+consecutive live media segments from a *single channel*, instead of repeatedly
+sampling the beginning of the same segment.
+
+Run from the machine that showed the previous clean startup result:
+
+
+ ```powershell
+python iptv_continuous.py --playlist forgpt.m3u8 --channel "НТВ HD" --minutes 15
+```
+
+If that name doesn't match, preview with `--dry-run` or use another channel name.
+The monitor downloads video segments, so **data usage can be significant**.
+Avoid watching on another device simultaneously if your subscription limits
+concurrent sessions. Results are written to `iptv_continuous_report.csv`
+without any stream addresses or subscription tokens.
+
+Important result codes:
+
+- `OK`: full segment received in less time than its playback duration.
+- `SLOW_SEGMENT`: the full segment took at least its playback duration to download. Repeated cases can cause buffering.
+- `STALE_MANIFEST`: the live HLS manifest has not advanced for at least three target durations (minimum 15 seconds).
+- `MISSED_WINDOW`: the newest playlist no longer contains some expected sequences; may mean polling/downloading fell behind.
+- `SEGMENT_HTTP_...` / `MANIFEST_HTTP_...` / `NETWORK_ERROR`: video or playlist request failed.
+- `PARTIAL_CAP`: segment exceeded the per-segment safety cap (default 32 MiB); this is **not** proof of successful complete playback.
+
+**Interpretation:** compare errors and timing with the exact moment TV freezes.
+If the continuous test is clean during a TV freeze, investigate player buffer,
+codec/bitrate, Wi-Fi, and device settings. If it fails on the PC too, test the
+same channel from a second network before paying for a relay. A relay cannot
+restore missing segments from the upstream provider.
+
 ## Security
 
 Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions, channel links, or video re-streaming endpoint.
