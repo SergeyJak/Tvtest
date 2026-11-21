@@ -100,7 +100,8 @@ class MultiGateway:
                  private_url: str | None = None, delay: int = 30,
                  timeout: float = 12, poll: float = 2, cache_mib: int = 128,
                  max_streams: int = 3, idle_seconds: float = 90,
-                 startup_wait: float = 18, switch_grace: float = 20):
+                 startup_wait: float = 18, switch_grace: float = 20,
+                 startup_reserve: float = 30):
         self.channels = {c.id: c for c in channels}
         self.order = [c.id for c in channels]
         self.path = playlist_path
@@ -113,6 +114,7 @@ class MultiGateway:
         self.upstream_slots = threading.BoundedSemaphore(max_streams)
         self.idle_seconds = idle_seconds
         self.startup_wait = startup_wait
+        self.startup_reserve = min(startup_reserve, delay)
         self.switch_grace = switch_grace
         self.warmup_successes = 0
         self.warmup_timeouts = 0
@@ -140,7 +142,8 @@ class MultiGateway:
 
         gateway = Gateway(channel.url, delay=self.delay, timeout=self.timeout,
                           poll=self.poll, max_bytes=self.cache_mib * 1048576,
-                          source_refresher=refresh)
+                          source_refresher=refresh,
+                          startup_reserve=None if pinned else self.startup_reserve)
         return ActiveStream(channel, gateway, self.upstream_slots, pinned)
 
     def start(self, cid: str, *, pinned: bool = False) -> ActiveStream | None:
@@ -217,6 +220,7 @@ class MultiGateway:
                     "buffer_state": details["buffer_state"],
                     "contiguous_tail_seconds": details["contiguous_tail_seconds"],
                     "effective_buffer_delay_seconds": details["effective_buffer_delay_seconds"],
+                    "startup_reserve_seconds": details["startup_reserve_seconds"],
                     "last_published_sequence": details["last_published_sequence"],
                     "seconds_since_published_advance": details["seconds_since_published_advance"],
                     "recovery_mode": details["recovery_mode"],
@@ -231,6 +235,7 @@ class MultiGateway:
                     "recent_upstream_failures": details["recent_upstream_failures"],
                     "client_manifest_503": details["client_manifest_503"],
                     "client_segment_404": details["client_segment_404"],
+                    "recent_client_segment_404": details["recent_client_segment_404"],
                     "pending_requests": stream.pending_requests,
                     "upstream_stalled": details["upstream_stalled"],
                     "errors": details["errors"],
@@ -389,9 +394,8 @@ def make_multi_handler(manager: MultiGateway, token: str):
                 stream = manager.active_stream(cid)
                 if stream is None:
                     return self.respond(404, b"Stream expired", "text/plain", head)
-                data = stream.gateway.segment(seq)
+                data = stream.gateway.segment(seq, record_miss=True)
                 if data is None:
-                    stream.gateway.record_client("segment", 404)
                     return self.respond(404, b"Segment not in cache", "text/plain", head)
                 extra = {"Accept-Ranges": "bytes"}
                 requested_range = self.headers.get("Range")
@@ -436,6 +440,8 @@ def main(argv=None):
     p.add_argument("--idle-seconds", type=float, default=90)
     p.add_argument("--startup-wait", type=float, default=18,
                    help="Hold a cold channel's first manifest request up to N seconds")
+    p.add_argument("--startup-reserve", type=float, default=30,
+                   help="Minimum cached-video reserve at cold start (default 30s, capped at --delay; 10s is an explicit fast/fragile mode)")
     p.add_argument("--switch-grace", type=float, default=20,
                    help="At stream limit, reclaim non-pinned channels idle for N seconds")
     p.add_argument("--prewarm", action="append", default=[],
@@ -448,9 +454,10 @@ def main(argv=None):
     if not (15 <= args.delay <= 120 and args.poll > 0 and args.timeout > 0
             and 32 <= args.cache_mib <= 2048 and 1 <= args.max_streams <= 8
             and args.idle_seconds >= 15 and 0 <= args.startup_wait <= 60
+            and 0 < args.startup_reserve <= 120
             and 10 <= args.switch_grace <= args.idle_seconds
             and 1 <= args.port <= 65535):
-        p.error("Invalid delay, poll, timeout, cache-mib, max-streams, idle-seconds, startup-wait, switch-grace, or port")
+        p.error("Invalid delay, poll, timeout, cache-mib, max-streams, idle-seconds, startup-wait, startup-reserve, switch-grace, or port")
     private_url = os.environ.get(args.playlist_url_env) if args.playlist_url_env else None
     if args.playlist_url_env and not private_url:
         p.error("Playlist URL environment variable was not set")
@@ -481,7 +488,7 @@ def main(argv=None):
     manager = MultiGateway(channels, args.playlist, private_url, args.delay,
                            args.timeout, args.poll, args.cache_mib,
                            args.max_streams, args.idle_seconds,
-                           args.startup_wait, args.switch_grace)
+                           args.startup_wait, args.switch_grace, args.startup_reserve)
     try:
         token = load_or_create_token(args.token_file)
     except (OSError, UnicodeError, ValueError):
