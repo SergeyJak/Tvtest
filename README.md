@@ -312,14 +312,21 @@ token is needed when the same token file/IP/port are reused.
 - The prewarmed channel starts buffering immediately. Add another
   `--prewarm "Exact channel name"` for quick channel switching, but
   only if your subscription allows the resulting simultaneous sources.
-- **Cold channels take time to prepare.** The first `/index.m3u8`
-  request now waits up to **18 seconds** by default (`--startup-wait 18`)
-  for enough fully downloaded segments. This avoids an immediate 503 that
-  some TV apps never retry. The initial buffer could take longer,
-  especially for UHD; after a 503, wait for the requested channel's
-  `ready: true` in `/status` and **reselect that channel**. Some TV apps
-  may give up before 18 seconds; adjust the timeout or prewarm favorites.
-  Prewarming *all* 2774 channels is not practical.
+- **Cold channel startup.** By default, the first TV request can play three
+  consecutive cached segments once the gateway has another 10 seconds of
+  contiguous video in reserve (`--startup-reserve 10`). With 10-second
+  segments this takes four downloads. If the provider already lists all four,
+  they can be fetched immediately. A shorter playlist may require waiting
+  for the next live segment. The HTTP request waits up to `--startup-wait 18`
+  seconds and returns as soon as the playlist is ready.
+- **Buffer during viewing.** The gateway uses available history up to
+  `--delay` at startup and continues publishing at playback speed during
+  a short interruption or refill. Extra segments downloaded in a burst can
+  increase the reserve. A source producing video at playback speed cannot
+  build additional reserve while the TV keeps playing. Check each channel's
+  `effective_buffer_delay_seconds`. Prewarmed channels require the full
+  configured delay. Set `--startup-reserve` equal to `--delay` to require
+  the same startup reserve on every channel.
 - **Fast switching:** at the `--max-streams` cap, the gateway may reclaim
   the least recently used **non-pinned** channel if it has been idle for
   at least 20 seconds (`--switch-grace 20`). It never intentionally
@@ -334,6 +341,9 @@ token is needed when the same token file/IP/port are reused.
   `buffer_state`, `contiguous_tail_seconds` and
   `pending_requests`. Check both `client_segment_200` and
   `client_segment_206` when counting successful segment requests.
+  `recent_client_segment_404` keeps the eight most recent cache misses
+  for each active channel, including UTC time, requested sequence and the
+  first and last cached sequences at the time of the request.
   A channel with successful segment requests but a black picture can
   be a player/codec compatibility problem: try ordinary HD/SD instead
   of UHD to compare.
@@ -383,11 +393,10 @@ the gateway's HLS playback cursor. If both progress and client requests
 succeed, the TV decoder or local network remains a possibility.
 Avoid treating cumulative errors as evidence of *when* a freeze occurred.
 
-The known good single-channel test used a 90-second delay; the multi-channel
-trial defaults to 30 seconds for quicker switching. A higher delay provides
-more cushion against source hiccups but slows the first startup.
-Try a longer delay only with this tradeoff in mind, preferably prewarming
-channels you regularly watch.
+The single-channel trial used a 90-second delay. To use that target with
+faster switching in the multi-channel gateway, keep `--delay 90` and the
+default `--startup-reserve 10`. Use the measured reserve in `/status` to
+estimate how long each channel can keep serving cached video during an outage.
 
 ## Security
 

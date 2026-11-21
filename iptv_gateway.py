@@ -125,7 +125,7 @@ class Gateway:
                  poll: float = 2, max_bytes: int = 128 * 1024 * 1024,
                  max_segment: int = 32 * 1024 * 1024,
                  source_refresher: Callable[[], str] | None = None,
-                 refresh_cooldown: float = 20):
+                 refresh_cooldown: float = 20, startup_reserve: float | None = None):
         self._url = url
         self.source_refresher = source_refresher
         self.refresh_cooldown = refresh_cooldown
@@ -137,6 +137,7 @@ class Gateway:
         self.source_refresh_error = None
         self.consecutive_manifest_404 = 0
         self.delay, self.timeout, self.poll = delay, timeout, poll
+        self.startup_reserve = delay if startup_reserve is None else min(startup_reserve, delay)
         self.max_bytes, self.max_segment = max_bytes, max_segment
         self.lock = threading.RLock()
         self.cache: OrderedDict[int, tuple[float, bytes]] = OrderedDict()
@@ -157,6 +158,7 @@ class Gateway:
         self.last_segment_download = None
         self.client_manifest_503 = 0
         self.client_segment_404 = 0
+        self.recent_client_segment_404 = deque(maxlen=8)
         self.client_auth_404 = 0
         self.client_playlist_200 = 0
         self.client_manifest_200 = 0
@@ -318,13 +320,22 @@ class Gateway:
             self._published_start = run[start][0]
         return run[start:end + 1]
 
+    def _paced_edge(self, run: list[tuple[int, float]], last: int, now: float) -> tuple[int, float]:
+        """Advance from the last published segment using actual segment durations."""
+        index = last - run[0][0]
+        due = self._last_published_at if self._last_published_at is not None else now
+        while index + 1 < len(run) and due + run[index + 1][1] <= now:
+            index += 1
+            due += run[index][1]
+        return index, due if index < len(run) - 1 else now
+
     def published(self, commit: bool = True) -> list[tuple[int, float]]:
         """Publish a monotonic HLS window, including through a missing segment.
 
         Preserve the preceding cached run until the new run can supply at
         least three segments. Then follow the new run at a temporarily
         reduced delay instead of freezing on the first three fragments.
-        A first-time viewer always requires the *real* configured delay.
+        Startup requires the configured reserve in fully downloaded segments.
         """
         with self.lock:
             if not self.cache or self.latest is None:
@@ -337,6 +348,7 @@ class Gateway:
                 runs[-1].append((seq, duration))
             tail = runs[-1]
             last = self.last_published_seq
+            now = time.monotonic()
             if last is not None and tail[-1][0] < last:
                 return []  # Never rewind the HLS sequence.
 
@@ -348,15 +360,10 @@ class Gateway:
                 if old and (old[-1][0] > last or len(tail) < 3):
                     # Do not jump over cached older video. Release at the
                     # advertised segment pace while the new run warms up.
-                    old_index = next(i for i, item in enumerate(old) if item[0] == last)
-                    elapsed_old = (max(0.0, time.monotonic() - self._last_published_at)
-                                   if self._last_published_at is not None else 0.0)
-                    step_duration = max(1.0, old[min(old_index + 1, len(old) - 1)][1])
-                    steps = int(elapsed_old / step_duration)
-                    end_index = min(len(old) - 1, old_index + steps)
-                    if commit and end_index > old_index:
+                    end_index, advanced_at = self._paced_edge(old, last, now)
+                    if commit and old[end_index][0] > last:
                         self.last_published_seq = old[end_index][0]
-                        self._last_published_at = time.monotonic() - (elapsed_old % step_duration)
+                        self._last_published_at = advanced_at
                     return self._window(old, end_index, commit)
                 if len(tail) < 3:
                     return []
@@ -372,6 +379,7 @@ class Gateway:
             if len(tail) < 3:
                 return []
 
+            advanced_at = now
             if recovery:
                 # Keep a little headroom once four or more segments exist,
                 # but always move the published edge when new segments arrive.
@@ -379,9 +387,10 @@ class Gateway:
             else:
                 # Important: before FIRST publication, elapsed upstream idle
                 # time must never count as buffered playback time.
-                elapsed = (max(0.0, time.monotonic() - self.last_advance_at)
+                elapsed = (max(0.0, now - self.last_advance_at)
                            if last is not None and self.last_advance_at is not None else 0.0)
-                required_behind = max(0.0, self.delay - elapsed)
+                balanced = self.startup_reserve < self.delay
+                required_behind = self.delay if balanced else max(0.0, self.delay - elapsed)
                 remaining = 0.0
                 cutoff = -1
                 for i in range(len(tail) - 1, -1, -1):
@@ -389,8 +398,17 @@ class Gateway:
                         cutoff = i
                         break
                     remaining += tail[i][1]
+                if balanced and last is None and sum(s for _, s in tail[3:]) >= self.startup_reserve:
+                    cutoff = max(cutoff, 2)
+                if balanced and last is not None and self._last_published_at is not None:
+                    # The source can refill in bursts. Keep serving at playback
+                    # speed even while the reserve is below the preferred delay.
+                    paced, due = self._paced_edge(tail, last, now)
+                    if paced >= cutoff:
+                        cutoff = max(2, paced)
+                        advanced_at = due if paced >= 2 else now
                 if cutoff < 2:
-                    return []  # Require three consecutive published segments.
+                    return []
 
             if last is not None:
                 forward_index = next((i for i, (seq, _) in enumerate(tail)
@@ -399,7 +417,7 @@ class Gateway:
                     cutoff = max(cutoff, forward_index)
             if commit:
                 if self.last_published_seq != tail[cutoff][0]:
-                    self._last_published_at = time.monotonic()
+                    self._last_published_at = advanced_at
                 self.last_published_seq = tail[cutoff][0]
             return self._window(tail, cutoff, commit)
 
@@ -414,9 +432,15 @@ class Gateway:
             lines.extend((f'#EXTINF:{duration:.3f},', f'/{token}/segment/{sequence}.ts'))
         return ('\n'.join(lines) + '\n').encode('utf-8')
 
-    def segment(self, seq: int) -> bytes | None:
+    def segment(self, seq: int, *, record_miss: bool = False) -> bytes | None:
         with self.lock:
             found = self.cache.get(seq)
+            if found is None and record_miss:
+                self.record_client('segment', 404)
+                self.recent_client_segment_404.append(dict(
+                    utc_unix=round(self.last_client_segment_access, 1), sequence=seq,
+                    cache_first=next(iter(self.cache), None),
+                    cache_last=next(reversed(self.cache), None)))
             return found[1] if found is not None else None
 
     def record_client(self, kind: str, status: int) -> None:
@@ -455,6 +479,7 @@ class Gateway:
             state = ('READY' if playable else 'WAITING_FOR_VIDEO' if not self.cache
                      else 'WARMING_OR_REBUILDING_BUFFER')
             info = dict(ready=bool(playable), delay_seconds=self.delay,
+                        startup_reserve_seconds=self.startup_reserve,
                         buffer_state=state,
                         contiguous_tail_segments=len(tail),
                         contiguous_tail_seconds=tail_seconds,
@@ -468,6 +493,7 @@ class Gateway:
                         latest_upstream_sequence=self.latest,
                         client_manifest_503=self.client_manifest_503,
                         client_segment_404=self.client_segment_404,
+                        recent_client_segment_404=list(self.recent_client_segment_404),
                         client_playlist_200=self.client_playlist_200,
                         client_manifest_200=self.client_manifest_200,
                         client_segment_200=self.client_segment_200,
@@ -557,9 +583,8 @@ def make_handler(gateway: Gateway, token: str, channel_name: str):
                     seq = int(part[len('/segment/'):-3])
                 except ValueError:
                     return self.respond(b'Not found', 'text/plain', head_only, 404)
-                data = gateway.segment(seq)
+                data = gateway.segment(seq, record_miss=True)
                 if data is None:
-                    gateway.record_client('segment', 404)
                     return self.respond(b'Segment expired', 'text/plain', head_only, 404)
                 headers = {'Accept-Ranges': 'bytes'}
                 range_header = self.headers.get('Range')
