@@ -65,15 +65,57 @@ codec/bitrate, Wi-Fi, and device settings. If it fails on the PC too, test the
 same channel from a second network before paying for a relay. A relay cannot
 restore missing segments from the upstream provider.
 
+## Local buffering gateway experiment (no VPS)
+
+**First try changing Edem/iLook CDN in your provider's playlist settings.** Their
+FAQ advises a manual CDN change if streams buffer on the automatic server.
+For Latvia, compare Germany, France and Automatic using **the same channel**,
+with one test at a time. Regenerate/update your downloaded playlist if necessary.
+
+If the stream still stalls, try this single-channel diagnostic gateway. It
+fetches full TS segments in the background and publishes them with a
+45-second delay so the TV can play from the local cache. This does not repair
+a consistently dead or very slow upstream stream. It adds roughly 45 seconds
+(or more, depending on the player's own buffer) of live TV delay.
+
+On your **home Windows PC**:
+
+
+ ```powershell
+ipconfig
+python iptv_gateway.py --playlist forgpt.m3u8 --channel "VF Теория большого взрыва" --delay 45 --host 0.0.0.0 --advertise-host 192.168.1.100
+```
+
+Replace `192.168.1.100` with **your PC's actual local IPv4** from `ipconfig`.
+Keep this PC powered on with the console open. Allow Python to listen on
+**private networks only** in Windows Firewall; do not forward port 8787 on
+your router. The gateway uses a random access token in its URL.
+
+The process prints two links:
+- `.../channels.m3u`: add this as a **new playlist URL** to Samsung, LG or Android TV (one test channel).
+- `.../status`: open in a browser first. Wait until `"ready": true` before starting TV. Check `upstream_stalled`, `slow_segments`, and `last_error` if the picture still freezes.
+
+Run without changing your existing playlist and compare the channel directly
+vs the new buffered channel on the same TV. The buffer uses up to 128 MiB RAM
+and downloads every segment of the selected channel, even with no TV connected.
+Stop with Ctrl+C.
+
+**Limits:** unencrypted MPEG-TS HLS only; unsupported tags (encrypted HLS,
+fMP4 initialization maps, byte ranges, discontinuities and low-latency HLS)
+are rejected explicitly in `last_error`. If the CDN stops generating
+segments, the relay cannot invent missing video. One channel per running
+gateway instance. Do not run a public streaming service or violate the
+subscription's simultaneous-connection rules.
+
 ## Security
 
-Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions, channel links, or video re-streaming endpoint.
+Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions or channel source links. The experimental gateway serves only on localhost by default; LAN exposure requires explicit --host 0.0.0.0 and a random access token.
 
 ## Roadmap (after we inspect real measurements)
 
 1. Capture intermittent stalls across multiple channels.
 2. Compare direct path vs EU relay/network route.
-3. Only if warranted, implement a private, authorized HLS gateway with limited buffering, per-channel monitoring, and spending caps.
+3. Compare the experimental local HLS gateway to direct playback before considering any paid relay.
 
 ## Tests
 
