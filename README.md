@@ -178,6 +178,39 @@ changes, reserve `192.168.94.109` for it in your router's DHCP settings.
 To deliberately rotate access, stop the gateway, delete the local
 `.iptv_gateway_token` file and restart. This invalidates older TV URLs.
 
+## If TV freezes while upstream is healthy (ready: false)
+
+A real incident showed `ready: false` with 15 cached segments, 124 MiB,
+`last_error: null` and `upstream_stalled: false`. This can occur when a
+previous upstream outage leaves a missing segment in the in-memory cache:
+there are plenty of total segments, but not enough **consecutive** segments
+to hold the full 90-second target delay. The old gateway then returned HTTP
+503 for the local media manifest and could cause the TV player to stop.
+
+The gateway now:
+- Keeps a larger **256 MiB** cache by default, adjustable with `--cache-mib`.
+- Requires the full configured delay when first starting, then temporarily
+  reduces the effective delay to resume with 3 consecutive *newer* cached
+  segments if a gap destroys the old delayed window.
+- Does not advance the TV playlist cursor when somebody polls `/status`.
+- Reports `contiguous_tail_segments`, `contiguous_tail_seconds`,
+  `effective_buffer_delay_seconds`, `client_manifest_503`,
+  `client_segment_404` and `seconds_since_segment_download`.
+
+Use the same local IP, port and persisted gateway token to keep your existing
+TV playlist URL:
+
+```powershell
+# Your EDEM_PLAYLIST_URL environment variable must already be set.
+python iptv_gateway.py --playlist forgpt.m3u8 --channel "VF Теория большого взрыва" --delay 90 --cache-mib 256 --host 0.0.0.0 --advertise-host 192.168.94.109 --playlist-url-env EDEM_PLAYLIST_URL
+```
+
+If the upstream continues returning 404, this still cannot reconstruct missing
+live video. If the TV player stops permanently on a previous 503, selecting
+the existing channel again may be necessary after recovery. `ready:true`
+means the gateway can publish its current media window; it is **not** a
+guarantee that the TV is playing.
+
 ## Security
 
 Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions or channel source links. The experimental gateway serves only on localhost by default; LAN exposure requires explicit --host 0.0.0.0 and a random access token.
