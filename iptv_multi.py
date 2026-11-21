@@ -114,7 +114,7 @@ class MultiGateway:
         self.upstream_slots = threading.BoundedSemaphore(max_streams)
         self.idle_seconds = idle_seconds
         self.startup_wait = startup_wait
-        self.startup_reserve = startup_reserve
+        self.startup_reserve = min(startup_reserve, delay)
         self.switch_grace = switch_grace
         self.warmup_successes = 0
         self.warmup_timeouts = 0
@@ -454,7 +454,7 @@ def main(argv=None):
     if not (15 <= args.delay <= 120 and args.poll > 0 and args.timeout > 0
             and 32 <= args.cache_mib <= 2048 and 1 <= args.max_streams <= 8
             and args.idle_seconds >= 15 and 0 <= args.startup_wait <= 60
-            and 0 < args.startup_reserve <= args.delay
+            and 0 < args.startup_reserve <= 120
             and 10 <= args.switch_grace <= args.idle_seconds
             and 1 <= args.port <= 65535):
         p.error("Invalid delay, poll, timeout, cache-mib, max-streams, idle-seconds, startup-wait, startup-reserve, switch-grace, or port")
