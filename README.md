@@ -243,11 +243,9 @@ Do not increase delay as a substitute for fixing repeated upstream 404s.
 
 Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions or channel source links. The experimental gateway serves only on localhost by default; LAN exposure requires explicit --host 0.0.0.0 and a random access token.
 
-## Roadmap (after we inspect real measurements)
+## Roadmap: family IPTV service on VPS
 
-1. Capture intermittent stalls across multiple channels.
-2. Compare direct path vs EU relay/network route.
-3. Compare the experimental local HLS gateway to direct playback before considering any paid relay.
+See **[ROADMAP.md](ROADMAP.md)** for the phased plan: harden the current single-channel gateway, deploy on a permitted EU VPS, build a multi-channel catalog and shared caches, then add separate access for Sergey, Kristina and parents using authorized Edem accounts. Railway services remain untouched until a separate migration decision.
 
 ## Tests
 
