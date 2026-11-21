@@ -449,6 +449,10 @@ class Gateway:
                         contiguous_tail_seconds=tail_seconds,
                         effective_buffer_delay_seconds=behind_seconds,
                         last_published_sequence=self.last_published_seq,
+                        seconds_since_published_advance=round(
+                            max(0.0, time.monotonic() - self._last_published_at), 1
+                        ) if self._last_published_at is not None else None,
+                        recovery_mode=self._recovery_mode,
                         last_downloaded_sequence=next(reversed(self.cache), None) if self.cache else None,
                         latest_upstream_sequence=self.latest,
                         client_manifest_503=self.client_manifest_503,
