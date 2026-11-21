@@ -1,0 +1,9 @@
+# Never publish IPTV credentials, playlist URLs, or generated reports.
+*.m3u
+*.m3u8
+*.csv
+*.json
+.env*
+__pycache__/
+.pytest_cache/
+.venv/
