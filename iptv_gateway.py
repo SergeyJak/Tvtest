@@ -162,6 +162,7 @@ class Gateway:
         self.last_client_auth_failure = None
         self.last_advance_at = None
         self.last_published_seq = None
+        self._last_published_at = None
         # After a discontinuous recovery window, temporarily publish closer to
         # live instead of waiting for an unattainable full 90-second backlog.
         self._recovery_mode = False
@@ -213,6 +214,7 @@ class Gateway:
                     self.cache.clear()
                     self.total_bytes = 0
                     self.last_published_seq = None
+                    self._last_published_at = None
                     self._recovery_mode = False
                 if self.latest is None or self.latest != listed[-1].sequence:
                     self.last_progress = time.time()
@@ -313,9 +315,18 @@ class Gateway:
                 # Continue serving cached video on the old side of the gap
                 # while the new run is still too short to restart playback.
                 if old and (old[-1][0] > last or len(tail) < 3):
-                    if commit:
-                        self.last_published_seq = old[-1][0]
-                    return old[-8:]
+                    # Do not jump over cached older video. Release at the
+                    # advertised segment pace while the new run warms up.
+                    old_index = next(i for i, item in enumerate(old) if item[0] == last)
+                    elapsed_old = (max(0.0, time.monotonic() - self._last_published_at)
+                                   if self._last_published_at is not None else 0.0)
+                    step_duration = max(1.0, old[min(old_index + 1, len(old) - 1)][1])
+                    steps = int(elapsed_old / step_duration)
+                    end_index = min(len(old) - 1, old_index + steps)
+                    if commit and end_index > old_index:
+                        self.last_published_seq = old[end_index][0]
+                        self._last_published_at = time.monotonic() - (elapsed_old % step_duration)
+                    return old[max(0, end_index - 7):end_index + 1]
                 if len(tail) < 3:
                     return []
                 # Crossing an upstream gap is a deliberate jump. Retain this
@@ -356,6 +367,8 @@ class Gateway:
                 if forward_index is not None:
                     cutoff = max(cutoff, forward_index)
             if commit:
+                if self.last_published_seq != tail[cutoff][0]:
+                    self._last_published_at = time.monotonic()
                 self.last_published_seq = tail[cutoff][0]
             return tail[max(0, cutoff - 7):cutoff + 1]
 
