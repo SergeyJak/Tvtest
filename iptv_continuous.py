@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import http.client
 import time
 import urllib.error
 import urllib.parse
@@ -61,14 +62,12 @@ def parse_media(body: str, base_url: str) -> Media:
 
 
 def fetch_media(source_url: str, timeout: float) -> tuple[Media, int]:
-    body, ttfb = get_text(source_url, timeout)
-    base = source_url
+    body, ttfb, base = get_text(source_url, timeout, return_final_url=True)
     if '#EXT-X-STREAM-INF' in body:
-        variant = hls_next_url(body, source_url, master=True)
+        variant = hls_next_url(body, base, master=True)
         if not variant:
             raise ValueError('missing_variant')
-        body, ttfb = get_text(variant, timeout)
-        base = variant
+        body, ttfb, base = get_text(variant, timeout, return_final_url=True)
     media = parse_media(body, base)
     if not media.segments:
         raise ValueError('empty_media_playlist')
@@ -84,6 +83,8 @@ def download_segment(url: str, timeout: float, cap: int) -> tuple[str, int, int,
     request = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept': '*/*'})
     total = 0
     with urllib.request.urlopen(request, timeout=timeout) as response:
+        raw_length = response.headers.get('Content-Length')
+        expected = int(raw_length) if raw_length is not None and raw_length.isdecimal() else None
         first = response.read(1)
         ttfb = round((time.perf_counter() - started) * 1000)
         if not first:
@@ -95,12 +96,15 @@ def download_segment(url: str, timeout: float, cap: int) -> tuple[str, int, int,
                 break
             total += len(chunk)
     elapsed = round((time.perf_counter() - started) * 1000)
-    status = 'PARTIAL_CAP' if total > cap else 'OK'
+    status = 'PARTIAL_CAP' if total > cap else (
+        'TRUNCATED_SEGMENT' if expected is not None and total != expected else 'OK')
     return status, total, ttfb, elapsed
 
 
 def safe_status(exc: Exception) -> str:
     """Exception messages can contain subscription tokens, so never return them."""
+    if isinstance(exc, http.client.IncompleteRead):
+        return 'INCOMPLETE_READ'
     if isinstance(exc, urllib.error.HTTPError):
         return f'HTTP_{exc.code}'
     if isinstance(exc, (TimeoutError,)):
@@ -146,6 +150,17 @@ def observe(entry: tuple[str, str, str], minutes: float, interval: float,
             if last_seq is None:
                 # On live HLS, older segments are already in the past.
                 last_seq = latest - 1
+            # Detect a genuine upstream sequence restart, rather than
+            # treating a fresh low-numbered live stream as forever stale.
+            # Require a substantial backward jump to tolerate ordinary CDN
+            # inconsistencies between adjacent playlist polls.
+            if latest_seen is not None and latest + max(20, len(media.segments) * 3) < latest_seen:
+                event = row(name, 'SEQUENCE_RESET', latest, manifest_ttfb=manifest_ttfb)
+                results.append(event)
+                on_row(event)
+                last_seq = media.segments[0].sequence - 1
+                latest_seen = None
+                stale_emitted = False
             if latest_seen is None or latest > latest_seen:
                 latest_seen = latest
                 last_progress = time.monotonic()
@@ -175,13 +190,13 @@ def observe(entry: tuple[str, str, str], minutes: float, interval: float,
                         status = 'SLOW_SEGMENT'
                     event = row(name, status, segment.sequence, segment.duration,
                                 manifest_ttfb, first_ms, elapsed_ms, nbytes, ratio)
-                except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.IncompleteRead) as exc:
                     event = row(name, 'SEGMENT_' + safe_status(exc), segment.sequence,
                                 segment.duration, manifest_ttfb)
                 results.append(event)
                 on_row(event)
                 last_seq = segment.sequence
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.IncompleteRead) as exc:
             event = row(name, 'MANIFEST_' + safe_status(exc))
             results.append(event)
             on_row(event)

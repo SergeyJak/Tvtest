@@ -7,6 +7,7 @@ No subscriptions or upstream URLs are ever printed or saved.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
 import os
@@ -89,13 +90,21 @@ def parse_media(text: str, base: str) -> tuple[float, list[Segment]]:
 def fetch_segment(url: str, timeout: float, max_bytes: int) -> bytes:
     req = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept': '*/*'})
     with urllib.request.urlopen(req, timeout=timeout) as response:
+        raw_length = response.headers.get('Content-Length')
+        expected = int(raw_length) if raw_length is not None and raw_length.isdecimal() else None
+        if expected is not None and expected > max_bytes:
+            raise ValueError('empty_or_oversize_segment')
         data = response.read(max_bytes + 1)
     if not data or len(data) > max_bytes:
         raise ValueError('empty_or_oversize_segment')
+    if expected is not None and len(data) != expected:
+        raise ValueError('truncated_segment')
     return data
 
 
 def safe_error(exc: Exception) -> str:
+    if isinstance(exc, http.client.IncompleteRead):
+        return 'INCOMPLETE_READ'
     if isinstance(exc, urllib.error.HTTPError):
         return f'HTTP_{exc.code}'
     if isinstance(exc, urllib.error.URLError):
@@ -106,7 +115,7 @@ def safe_error(exc: Exception) -> str:
         return str(exc) if str(exc) in {
             'not_hls', 'unsupported_hls_features', 'empty_or_oversize_segment',
             'unsupported_segment_scheme', 'playlist_too_large',
-            'missing_variant', 'too_many_master_playlists'
+            'missing_variant', 'too_many_master_playlists', 'truncated_segment'
         } else 'INVALID_HLS'
     return type(exc).__name__
 
@@ -153,6 +162,10 @@ class Gateway:
         self.last_client_auth_failure = None
         self.last_advance_at = None
         self.last_published_seq = None
+        self._last_published_at = None
+        # After a discontinuous recovery window, temporarily publish closer to
+        # live instead of waiting for an unattainable full 90-second backlog.
+        self._recovery_mode = False
         self.stop = threading.Event()
 
     def refresh_source(self) -> bool:
@@ -174,7 +187,7 @@ class Gateway:
             candidate = self.source_refresher()
             if not candidate or urllib.parse.urlsplit(candidate).scheme not in ('http', 'https'):
                 raise ValueError('invalid_refreshed_url')
-        except (OSError, UnicodeError, urllib.error.URLError, TimeoutError, ValueError) as exc:
+        except (OSError, UnicodeError, urllib.error.URLError, TimeoutError, ValueError, http.client.IncompleteRead) as exc:
             with self.lock:
                 self.source_refresh_errors += 1
                 self.source_refresh_error = safe_error(exc)
@@ -201,6 +214,8 @@ class Gateway:
                     self.cache.clear()
                     self.total_bytes = 0
                     self.last_published_seq = None
+                    self._last_published_at = None
+                    self._recovery_mode = False
                 if self.latest is None or self.latest != listed[-1].sequence:
                     self.last_progress = time.time()
                     self.last_advance_at = time.monotonic()
@@ -219,7 +234,7 @@ class Gateway:
                 start = time.monotonic()
                 try:
                     data = fetch_segment(segment.url, self.timeout, self.max_segment)
-                except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.IncompleteRead) as exc:
                     with self.lock:
                         self.errors += 1
                         self.last_error = 'SEGMENT_' + safe_error(exc)
@@ -234,7 +249,7 @@ class Gateway:
                         self.cache = OrderedDict(sorted(self.cache.items()))
                         self.total_bytes += len(data)
                     self._evict()
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.IncompleteRead) as exc:
             with self.lock:
                 self.errors += 1
                 self.last_error = 'MANIFEST_' + safe_error(exc)
@@ -273,44 +288,87 @@ class Gateway:
         return tail
 
     def published(self, commit: bool = True) -> list[tuple[int, float]]:
-        """Publish playable segments, recovering after a hole in the cache.
+        """Publish a monotonic HLS window, including through a missing segment.
 
-        During a healthy stream, stay --delay seconds behind the latest
-        downloaded segment. A missing segment can split the cache into
-        discontinuous runs. Once a player has started, return a small playable
-        *newer* run rather than HTTP 503 forever while the full delayed window
-        refills. This temporarily reduces the effective delay.
+        Preserve the preceding cached run until the new run can supply at
+        least three segments. Then follow the new run at a temporarily
+        reduced delay instead of freezing on the first three fragments.
+        A first-time viewer always requires the *real* configured delay.
         """
         with self.lock:
             if not self.cache or self.latest is None:
                 return []
-            tail = self._contiguous_tail()
-            # At startup, demand a real full delay window before publishing.
-            # During recovery, three contiguous segments can resume playback.
+            # Split the ordered cache at missing sequence numbers.
+            runs: list[list[tuple[int, float]]] = []
+            for seq, (duration, _) in self.cache.items():
+                if not runs or seq != runs[-1][-1][0] + 1:
+                    runs.append([])
+                runs[-1].append((seq, duration))
+            tail = runs[-1]
+            last = self.last_published_seq
+            if last is not None and tail[-1][0] < last:
+                return []  # Never rewind the HLS sequence.
+
+            if last is not None and not self._recovery_mode and tail[0][0] > last:
+                old = next((run for run in runs[:-1]
+                            if run[0][0] <= last <= run[-1][0]), None)
+                # Continue serving cached video on the old side of the gap
+                # while the new run is still too short to restart playback.
+                if old and (old[-1][0] > last or len(tail) < 3):
+                    # Do not jump over cached older video. Release at the
+                    # advertised segment pace while the new run warms up.
+                    old_index = next(i for i, item in enumerate(old) if item[0] == last)
+                    elapsed_old = (max(0.0, time.monotonic() - self._last_published_at)
+                                   if self._last_published_at is not None else 0.0)
+                    step_duration = max(1.0, old[min(old_index + 1, len(old) - 1)][1])
+                    steps = int(elapsed_old / step_duration)
+                    end_index = min(len(old) - 1, old_index + steps)
+                    if commit and end_index > old_index:
+                        self.last_published_seq = old[end_index][0]
+                        self._last_published_at = time.monotonic() - (elapsed_old % step_duration)
+                    return old[max(0, end_index - 7):end_index + 1]
+                if len(tail) < 3:
+                    return []
+                # Crossing an upstream gap is a deliberate jump. Retain this
+                # mode until a fresh session/sequence reset, otherwise the
+                # old 90-second requirement would freeze the next 10 updates.
+                if commit:
+                    self._recovery_mode = True
+                recovery = True
+            else:
+                recovery = self._recovery_mode
+
             if len(tail) < 3:
                 return []
-            if self.last_published_seq is not None and tail[-1][0] < self.last_published_seq:
-                return []  # Never silently rewind the HLS media sequence.
-            elapsed = max(0.0, time.monotonic() - self.last_advance_at) if self.last_advance_at is not None else 0.0
-            required_behind = max(0.0, self.delay - elapsed)
-            remaining = 0.0
-            cutoff = -1
-            for i in range(len(tail) - 1, -1, -1):
-                if remaining >= required_behind:
-                    cutoff = i
-                    break
-                remaining += tail[i][1]
-            if cutoff < 2:
-                if self.last_published_seq is None:
-                    return []  # New TV session must warm up before playback.
-                # Resume from a newer local run after an upstream segment gap.
-                cutoff = 2
-            if self.last_published_seq is not None:
+
+            if recovery:
+                # Keep a little headroom once four or more segments exist,
+                # but always move the published edge when new segments arrive.
+                cutoff = len(tail) - 2 if len(tail) >= 4 else 2
+            else:
+                # Important: before FIRST publication, elapsed upstream idle
+                # time must never count as buffered playback time.
+                elapsed = (max(0.0, time.monotonic() - self.last_advance_at)
+                           if last is not None and self.last_advance_at is not None else 0.0)
+                required_behind = max(0.0, self.delay - elapsed)
+                remaining = 0.0
+                cutoff = -1
+                for i in range(len(tail) - 1, -1, -1):
+                    if remaining >= required_behind:
+                        cutoff = i
+                        break
+                    remaining += tail[i][1]
+                if cutoff < 2:
+                    return []  # Require three consecutive published segments.
+
+            if last is not None:
                 forward_index = next((i for i, (seq, _) in enumerate(tail)
-                                      if seq >= self.last_published_seq), None)
+                                      if seq >= last), None)
                 if forward_index is not None:
                     cutoff = max(cutoff, forward_index)
             if commit:
+                if self.last_published_seq != tail[cutoff][0]:
+                    self._last_published_at = time.monotonic()
                 self.last_published_seq = tail[cutoff][0]
             return tail[max(0, cutoff - 7):cutoff + 1]
 

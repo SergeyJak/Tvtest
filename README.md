@@ -239,6 +239,32 @@ to a newly returned channel URL, **but cannot restore** a feed when the
 refreshed M3U still returns the same unusable URL (`source_changes: 0`).
 Do not increase delay as a substitute for fixing repeated upstream 404s.
 
+## Reliability fixes from Astra's offline review
+
+The gateway now **keeps the older cached window** across a missing HLS
+sequence, then moves continuously through the new run instead of freezing
+until the full delay becomes available. Initial startup still needs the
+configured buffer and never pretends that time spent with a stalled source
+is buffered video.
+
+**Important tradeoff:** after jumping over a missing segment, the current
+process continues with a **smaller effective delay** for smooth playback.
+It cannot magically regain 90 seconds of safety margin while broadcasting
+at normal live speed. Check `effective_buffer_delay_seconds` in
+`/status`. Restart at a convenient time to rebuild the configured delay;
+the persisted gateway token keeps the television playlist URL unchanged.
+
+On HTTP transport issues, partial `Content-Length` bodies are rejected,
+chunked `IncompleteRead` errors are retried next polling cycle, and the
+continuous monitor records `TRUNCATED_SEGMENT`, `SEQUENCE_RESET`
+and `SEGMENT_INCOMPLETE_READ` without storing subscription URLs.
+The quick probe records `EMPTY_SEGMENT` rather than reporting empty
+HTTP 200 responses as OK. Relative segment URLs are resolved against the
+final URL after CDN redirects.
+
+The review fixes are covered by synthetic HTTP/playlist regression tests,
+not by a guarantee against an unavailable Edem source.
+
 ## Security
 
 Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions or channel source links. The experimental gateway serves only on localhost by default; LAN exposure requires explicit --host 0.0.0.0 and a random access token.

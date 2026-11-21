@@ -4,6 +4,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 
 import iptv_gateway as g
@@ -46,6 +47,42 @@ class GatewayRecoveryTests(unittest.TestCase):
         playlist = gw.playlist('lan-token').decode('utf-8')
         self.assertIn('#EXT-X-MEDIA-SEQUENCE:', playlist)
         self.assertGreaterEqual(gw.last_published_seq, previous_seq)
+
+    def test_multiple_playlists_keep_advancing_after_missing_segment(self):
+        gw = self.gateway(range(100, 120), delay=90)
+        clock = [100.0]
+        with patch.object(g.time, 'monotonic', side_effect=lambda: clock[0]):
+            before = gw.published()
+            self.assertEqual(before[-1][0], 110)
+            # Missing 116 splits cache into old 100..115 and new 117..119.
+            del gw.cache[116]
+            self.assertEqual(gw.published()[-1][0], 110)
+            # Preserve old cached window at the advertised 10s video pace,
+            # even while the newer run is too small for the 90s buffer.
+            for seq in range(111, 116):
+                clock[0] += 10
+                records = gw.published()
+                self.assertTrue(records, 'must not emit HTTP 503 while old cache remains')
+                self.assertEqual(records[-1][0], seq)
+
+            # Cross the gap and start with the new contiguous run.
+            clock[0] += 10
+            self.assertEqual(gw.published()[-1][0], 119)
+            self.assertTrue(gw._recovery_mode)
+
+            ends = []
+            for seq in range(120, 134):
+                gw.cache[seq] = (10.0, b'x' * 16)
+                gw.latest = seq
+                clock[0] += 10
+                playlist = gw.playlist('test-token')
+                self.assertIsNotNone(playlist)
+                ends.append(gw.last_published_seq)
+                self.assertEqual(gw.published(commit=False)[-1][0], ends[-1])
+            self.assertGreater(ends[-1], 130)
+            self.assertEqual(ends, sorted(ends))
+            self.assertGreaterEqual(len(set(ends)), 11,
+                                    'published edge must not freeze until full delay fills')
 
     def test_status_is_read_only_for_tv_cursor(self):
         gw = self.gateway(range(100, 120))
