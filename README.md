@@ -282,7 +282,7 @@ python iptv_multi.py --playlist forgpt.m3u8 --delay 90 --startup-reserve 30 --ho
 ```
 
 **Recommended HD trial:** leave off `--prewarm` so the original test channel
-does not keep an idle upstream connection and occupy a slot. The 
+does not keep an idle upstream connection and occupy a slot. The
 `--delay 90` value is the **target** when enough video has been cached.
 The explicit `--startup-reserve 30` starts with at least 30 seconds
 of already downloaded reserve, not 90 seconds; the reserve cannot grow
@@ -333,7 +333,10 @@ token is needed when the same token file/IP/port are reused.
   `--delay` if the configured delay is less than 30 seconds.
 - **Buffer during viewing.** The gateway uses available history up to
   `--delay` at startup and continues publishing at playback speed during
-  a short interruption or refill. Extra segments downloaded in a burst can
+  a short interruption or refill, **including when `--startup-reserve`
+  equals `--delay`**. Only the first publication requires the complete
+  configured startup reserve; subsequent playlists advance at EXTINF pace
+  as cached fragments become available. Extra segments downloaded in a burst can
   increase the reserve. A source producing video at playback speed cannot
   build additional reserve while the TV keeps playing. Check each channel's
   `effective_buffer_delay_seconds`. Prewarmed channels require the full
