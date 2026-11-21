@@ -101,7 +101,7 @@ class MultiGateway:
                  timeout: float = 12, poll: float = 2, cache_mib: int = 128,
                  max_streams: int = 3, idle_seconds: float = 90,
                  startup_wait: float = 18, switch_grace: float = 20,
-                 startup_reserve: float = 10):
+                 startup_reserve: float = 30):
         self.channels = {c.id: c for c in channels}
         self.order = [c.id for c in channels]
         self.path = playlist_path
@@ -440,8 +440,8 @@ def main(argv=None):
     p.add_argument("--idle-seconds", type=float, default=90)
     p.add_argument("--startup-wait", type=float, default=18,
                    help="Hold a cold channel's first manifest request up to N seconds")
-    p.add_argument("--startup-reserve", type=float, default=10,
-                   help="Minimum seconds of cached video behind the published edge at cold start (default 10, capped at --delay)")
+    p.add_argument("--startup-reserve", type=float, default=30,
+                   help="Minimum cached-video reserve at cold start (default 30s, capped at --delay; 10s is an explicit fast/fragile mode)")
     p.add_argument("--switch-grace", type=float, default=20,
                    help="At stream limit, reclaim non-pinned channels idle for N seconds")
     p.add_argument("--prewarm", action="append", default=[],
@@ -453,7 +453,8 @@ def main(argv=None):
     args = p.parse_args(argv)
     if not (15 <= args.delay <= 120 and args.poll > 0 and args.timeout > 0
             and 32 <= args.cache_mib <= 2048 and 1 <= args.max_streams <= 8
-            and args.idle_seconds >= 15 and 0 <= args.startup_wait <= 60 and 0 < args.startup_reserve <= 120
+            and args.idle_seconds >= 15 and 0 <= args.startup_wait <= 60
+            and 0 < args.startup_reserve <= args.delay
             and 10 <= args.switch_grace <= args.idle_seconds
             and 1 <= args.port <= 65535):
         p.error("Invalid delay, poll, timeout, cache-mib, max-streams, idle-seconds, startup-wait, startup-reserve, switch-grace, or port")
