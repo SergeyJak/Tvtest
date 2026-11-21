@@ -10,3 +10,7 @@ __pycache__/
 
 # Keep the LAN gateway's persistent URL access token local.
 .iptv_gateway_token
+
+# Local JetBrains / IntelliJ IDEA project metadata.
+.idea/
+*.iml
