@@ -206,6 +206,8 @@ class MultiGateway:
                     "contiguous_tail_seconds": details["contiguous_tail_seconds"],
                     "effective_buffer_delay_seconds": details["effective_buffer_delay_seconds"],
                     "last_published_sequence": details["last_published_sequence"],
+                    "seconds_since_published_advance": details["seconds_since_published_advance"],
+                    "recovery_mode": details["recovery_mode"],
                     "last_downloaded_sequence": details["last_downloaded_sequence"],
                     "latest_upstream_sequence": details["latest_upstream_sequence"],
                     "seconds_since_new_segment": details["seconds_since_new_segment"],
