@@ -139,6 +139,9 @@ class Gateway:
         self.errors = 0
         self.last_update = None
         self.last_progress = None
+        self.last_segment_download = None
+        self.client_manifest_503 = 0
+        self.client_segment_404 = 0
         self.last_advance_at = None
         self.last_published_seq = None
         self.stop = threading.Event()
@@ -217,6 +220,7 @@ class Gateway:
                     if duration >= segment.duration:
                         self.slow_segments += 1
                     if segment.sequence not in self.cache:
+                        self.last_segment_download = time.time()
                         self.cache[segment.sequence] = (segment.duration, data)
                         self.cache = OrderedDict(sorted(self.cache.items()))
                         self.total_bytes += len(data)
@@ -247,20 +251,37 @@ class Gateway:
             self.cycle()
             self.stop.wait(max(0.2, self.poll - (time.monotonic() - start)))
 
-    def published(self) -> list[tuple[int, float]]:
+    def _contiguous_tail(self) -> list[tuple[int, float]]:
+        """The newest uninterrupted run of locally downloaded segments."""
+        items = [(seq, entry[0]) for seq, entry in self.cache.items()]
+        if not items:
+            return []
+        tail = [items[-1]]
+        for entry in reversed(items[:-1]):
+            if entry[0] + 1 != tail[0][0]:
+                break
+            tail.insert(0, entry)
+        return tail
+
+    def published(self, commit: bool = True) -> list[tuple[int, float]]:
+        """Publish playable segments, recovering after a hole in the cache.
+
+        During a healthy stream, stay --delay seconds behind the latest
+        downloaded segment. A missing segment can split the cache into
+        discontinuous runs. Once a player has started, return a small playable
+        *newer* run rather than HTTP 503 forever while the full delayed window
+        refills. This temporarily reduces the effective delay.
+        """
         with self.lock:
             if not self.cache or self.latest is None:
                 return []
-            items = [(seq, entry[0]) for seq, entry in self.cache.items()]
-            # Most recent contiguous cached tail ending at or behind the live edge.
-            tail = [items[-1]]
-            for entry in reversed(items[:-1]):
-                if entry[0] + 1 != tail[0][0]:
-                    break
-                tail.insert(0, entry)
-            # Normally stay <delay> behind the newest downloaded segment.
-            # If the upstream stalls, progressively release queued segments
-            # from the cache instead of freezing the local manifest too.
+            tail = self._contiguous_tail()
+            # At startup, demand a real full delay window before publishing.
+            # During recovery, three contiguous segments can resume playback.
+            if len(tail) < 3:
+                return []
+            if self.last_published_seq is not None and tail[-1][0] < self.last_published_seq:
+                return []  # Never silently rewind the HLS media sequence.
             elapsed = max(0.0, time.monotonic() - self.last_advance_at) if self.last_advance_at is not None else 0.0
             required_behind = max(0.0, self.delay - elapsed)
             remaining = 0.0
@@ -270,11 +291,18 @@ class Gateway:
                     cutoff = i
                     break
                 remaining += tail[i][1]
-            if self.last_published_seq is not None and cutoff >= 0:
-                cutoff = max(cutoff, next((i for i, (seq, _) in enumerate(tail) if seq >= self.last_published_seq), cutoff))
             if cutoff < 2:
-                return []  # Need at least three playable segments in the window.
-            self.last_published_seq = tail[cutoff][0]
+                if self.last_published_seq is None:
+                    return []  # New TV session must warm up before playback.
+                # Resume from a newer local run after an upstream segment gap.
+                cutoff = 2
+            if self.last_published_seq is not None:
+                forward_index = next((i for i, (seq, _) in enumerate(tail)
+                                      if seq >= self.last_published_seq), None)
+                if forward_index is not None:
+                    cutoff = max(cutoff, forward_index)
+            if commit:
+                self.last_published_seq = tail[cutoff][0]
             return tail[max(0, cutoff - 7):cutoff + 1]
 
     def playlist(self, token: str) -> bytes | None:
@@ -295,7 +323,25 @@ class Gateway:
 
     def status(self) -> bytes:
         with self.lock:
-            info = dict(ready=bool(self.published()), delay_seconds=self.delay,
+            # Read-only observation must not move the TV's playback cursor.
+            playable = self.published(commit=False)
+            tail = self._contiguous_tail()
+            tail_seconds = round(sum(duration for _, duration in tail), 1)
+            behind_seconds = round(sum(duration for seq, duration in tail
+                                       if playable and seq > playable[-1][0]), 1) if playable else None
+            state = ('READY' if playable else 'WAITING_FOR_VIDEO' if not self.cache
+                     else 'WARMING_OR_REBUILDING_BUFFER')
+            info = dict(ready=bool(playable), delay_seconds=self.delay,
+                        buffer_state=state,
+                        contiguous_tail_segments=len(tail),
+                        contiguous_tail_seconds=tail_seconds,
+                        effective_buffer_delay_seconds=behind_seconds,
+                        last_published_sequence=self.last_published_seq,
+                        last_downloaded_sequence=next(reversed(self.cache), None) if self.cache else None,
+                        latest_upstream_sequence=self.latest,
+                        client_manifest_503=self.client_manifest_503,
+                        client_segment_404=self.client_segment_404,
+                        seconds_since_segment_download=round(time.time() - self.last_segment_download, 1) if self.last_segment_download else None,
                         cached_segments=len(self.cache), cached_mib=round(self.total_bytes / 1048576, 2),
                         errors=self.errors, slow_segments=self.slow_segments,
                         last_error=self.last_error,
@@ -357,6 +403,8 @@ def make_handler(gateway: Gateway, token: str, channel_name: str):
             if part == '/index.m3u8':
                 content = gateway.playlist(token)
                 if content is None:
+                    with gateway.lock:
+                        gateway.client_manifest_503 += 1
                     return self.respond(b'Buffer warming up', 'text/plain', head_only, 503,
                                         {'Retry-After': '5'})
                 return self.respond(content, 'application/vnd.apple.mpegurl', head_only)
@@ -367,6 +415,8 @@ def make_handler(gateway: Gateway, token: str, channel_name: str):
                     return self.respond(b'Not found', 'text/plain', head_only, 404)
                 data = gateway.segment(seq)
                 if data is None:
+                    with gateway.lock:
+                        gateway.client_segment_404 += 1
                     return self.respond(b'Segment expired', 'text/plain', head_only, 404)
                 headers = {'Accept-Ranges': 'bytes'}
                 range_header = self.headers.get('Range')
@@ -460,13 +510,16 @@ def main(argv=None):
     parser.add_argument('--port', type=int, default=8787)
     parser.add_argument('--timeout', type=float, default=12)
     parser.add_argument('--poll', type=float, default=2)
+    parser.add_argument('--cache-mib', type=int, default=256,
+                        help='Maximum segment cache memory in MiB (default 256; 128 was too small for 90-second delayed streams)')
     parser.add_argument('--token-file', type=Path, default=Path('.iptv_gateway_token'),
                         help='Local private token file; stable playlist link across restarts')
     parser.add_argument('--playlist-url-env', default=None,
                         help='Optional name of environment variable containing private Edem playlist URL; never pass the URL itself')
     args = parser.parse_args(argv)
-    if args.delay < 15 or args.delay > 120 or args.timeout <= 0 or args.poll <= 0 or not 1 <= args.port <= 65535:
-        parser.error('delay must be 15..120, timeout/poll > 0, and port 1..65535')
+    if (args.delay < 15 or args.delay > 120 or args.timeout <= 0 or args.poll <= 0
+            or not 64 <= args.cache_mib <= 2048 or not 1 <= args.port <= 65535):
+        parser.error('delay must be 15..120, timeout/poll > 0, cache-mib 64..2048, port 1..65535')
     try:
         entries = entries_from_m3u(args.playlist)
     except (OSError, UnicodeError):
@@ -483,6 +536,7 @@ def main(argv=None):
         text = private_playlist_text(args.playlist, private_url, args.timeout)
         return playlist_entry_from_text(text, args.channel)
     gateway = Gateway(matches[0][2], delay=args.delay, timeout=args.timeout, poll=args.poll,
+                      max_bytes=args.cache_mib * 1024 * 1024,
                       source_refresher=source_refresher)
     try:
         token = load_or_create_token(args.token_file)
