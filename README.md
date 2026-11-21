@@ -230,8 +230,9 @@ The gateway now tracks private, aggregated HTTP response counters:
 `client_auth_404`, and seconds since the last client HLS
 request. It does **not** record client IP addresses, tokens or paths.
 Poll `/status` from your browser and then start the TV channel:
-`client_manifest_200` and `client_segment_200` should increase
-when playback uses the gateway. Merely requesting `/status` doesn't increase them.
+`client_manifest_200` counts playlist responses. For successful segment
+requests, check both `client_segment_200` (full) and `client_segment_206`
+(byte range). Merely requesting `/status` doesn't increase them.
 
 Separately, when `MANIFEST_HTTP_404` repeats, the upstream provider isn't
 serving its live HLS manifest. Re-fetching the authorized Edem M3U can switch
@@ -323,15 +324,16 @@ token is needed when the same token file/IP/port are reused.
   the least recently used **non-pinned** channel if it has been idle for
   at least 20 seconds (`--switch-grace 20`). It never intentionally
   interrupts a recent viewer or a channel still handling a pending
-  manifest request. Rapidly switching among four channels can still
+  manifest request. If the old channel has a download in progress at
+  the limit, its replacement waits for the worker to finish. Rapidly switching among four channels can still
   produce a temporary 503; allow old viewers to go idle.
 - **Diagnostics:** `/status` now shows `warmup_successes`,
   `warmup_timeouts`, `stream_limit_denials`, and
   `recycled_idle_streams`; each channel also reports
   `client_manifest_503`, `client_segment_404`,
   `buffer_state`, `contiguous_tail_seconds` and
-  `pending_requests`. A channel with `ready: true` but **zero
-  successful segment requests** has not delivered any video to the TV.
+  `pending_requests`. Check both `client_segment_200` and
+  `client_segment_206` when counting successful segment requests.
   A channel with successful segment requests but a black picture can
   be a player/codec compatibility problem: try ordinary HD/SD instead
   of UHD to compare.

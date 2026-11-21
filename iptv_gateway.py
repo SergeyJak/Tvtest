@@ -168,6 +168,7 @@ class Gateway:
         self.last_client_auth_failure = None
         self.last_advance_at = None
         self.last_published_seq = None
+        self._published_start = None
         self._last_published_at = None
         # After a discontinuous recovery window, temporarily publish closer to
         # live instead of waiting for an unattainable full 90-second backlog.
@@ -237,6 +238,7 @@ class Gateway:
                     self.cache.clear()
                     self.total_bytes = 0
                     self.last_published_seq = None
+                    self._published_start = None
                     self._last_published_at = None
                     self._recovery_mode = False
                 if self.latest is None or self.latest != listed[-1].sequence:
@@ -307,6 +309,15 @@ class Gateway:
             tail.insert(0, entry)
         return tail
 
+    def _window(self, run: list[tuple[int, float]], end: int, commit: bool) -> list[tuple[int, float]]:
+        start = max(0, end - 7)
+        if self._published_start is not None:
+            # A late download can extend this contiguous run to the left.
+            start = max(start, self._published_start - run[0][0])
+        if commit:
+            self._published_start = run[start][0]
+        return run[start:end + 1]
+
     def published(self, commit: bool = True) -> list[tuple[int, float]]:
         """Publish a monotonic HLS window, including through a missing segment.
 
@@ -329,7 +340,7 @@ class Gateway:
             if last is not None and tail[-1][0] < last:
                 return []  # Never rewind the HLS sequence.
 
-            if last is not None and not self._recovery_mode and tail[0][0] > last:
+            if last is not None and tail[0][0] > last:
                 old = next((run for run in runs[:-1]
                             if run[0][0] <= last <= run[-1][0]), None)
                 # Continue serving cached video on the old side of the gap
@@ -346,7 +357,7 @@ class Gateway:
                     if commit and end_index > old_index:
                         self.last_published_seq = old[end_index][0]
                         self._last_published_at = time.monotonic() - (elapsed_old % step_duration)
-                    return old[max(0, end_index - 7):end_index + 1]
+                    return self._window(old, end_index, commit)
                 if len(tail) < 3:
                     return []
                 # Crossing an upstream gap is a deliberate jump. Retain this
@@ -390,7 +401,7 @@ class Gateway:
                 if self.last_published_seq != tail[cutoff][0]:
                     self._last_published_at = time.monotonic()
                 self.last_published_seq = tail[cutoff][0]
-            return tail[max(0, cutoff - 7):cutoff + 1]
+            return self._window(tail, cutoff, commit)
 
     def playlist(self, token: str) -> bytes | None:
         records = self.published()

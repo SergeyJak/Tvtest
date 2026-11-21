@@ -84,6 +84,41 @@ class GatewayRecoveryTests(unittest.TestCase):
             self.assertGreaterEqual(len(set(ends)), 11,
                                     'published edge must not freeze until full delay fills')
 
+    def gateway_after_first_gap(self):
+        gw = self.gateway(range(100, 105), delay=20)
+        with patch.object(g.time, 'monotonic', return_value=100.0):
+            self.assertEqual(gw.published()[-1][0], 102)
+        for seq in (106, 107, 108):
+            gw.cache[seq] = (10.0, b'x')
+        gw.latest = 108
+        with patch.object(g.time, 'monotonic', return_value=120.0):
+            self.assertEqual(gw.published()[-1][0], 104)
+            self.assertEqual([s for s, _ in gw.published()], [106, 107, 108])
+        return gw
+
+    def test_second_gap_preserves_window_until_three_new_segments_arrive(self):
+        gw = self.gateway_after_first_gap()
+        for seq in (110, 111):
+            gw.cache[seq] = (10.0, b'x')
+            gw.latest = seq
+            self.assertTrue(json.loads(gw.status())['ready'])
+            self.assertEqual([s for s, _ in gw.published()], [106, 107, 108])
+        gw.cache[112] = (10.0, b'x')
+        gw.latest = 112
+        self.assertEqual([s for s, _ in gw.published()], [110, 111, 112])
+
+    def test_late_repair_keeps_published_media_sequence_monotonic(self):
+        gw = self.gateway_after_first_gap()
+        gw.cache[105] = (10.0, b'x')
+        gw.cache = type(gw.cache)(sorted(gw.cache.items()))
+        gw.cache[109] = (10.0, b'x')
+        gw.latest = 109
+        self.assertEqual([s for s, _ in gw.published(commit=False)], [106, 107, 108])
+        self.assertIn(b'#EXT-X-MEDIA-SEQUENCE:106\n', gw.playlist('token'))
+        gw.cache[110] = (10.0, b'x')
+        gw.latest = 110
+        self.assertEqual([s for s, _ in gw.published()], [106, 107, 108, 109])
+
     def test_status_is_read_only_for_tv_cursor(self):
         gw = self.gateway(range(100, 120))
         self.assertIsNone(gw.last_published_seq)

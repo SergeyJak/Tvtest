@@ -1,4 +1,5 @@
 """Offline tests for the on-demand family TV catalog prototype."""
+import http.client
 import json
 import threading
 import time
@@ -100,6 +101,7 @@ class MultiChannelTests(unittest.TestCase):
         stream = metrics["streams"][0]
         self.assertEqual(stream["client_manifest_200"], 1)
         self.assertEqual(stream["client_segment_200"], 1)
+        self.assertEqual(stream.get("client_segment_206"), 1)
 
     def test_existing_single_channel_tv_urls_still_play_after_upgrade(self):
         # This simulates the TV app caching its old /TOKEN/index.m3u8 URL
@@ -255,6 +257,54 @@ class MultiChannelTests(unittest.TestCase):
         stream.accessed -= 1000
         self.manager.sweep()
         self.assertIn(first.id, self.manager.active)
+
+
+class MultiChannelStartupTests(unittest.TestCase):
+    def test_remote_failure_falls_back_to_local_catalog(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "local.m3u"
+            path.write_text("#EXTM3U\n#EXTINF:-1,Local\nhttps://example.test/local\n", encoding="utf-8")
+            args = ["--playlist", str(path), "--playlist-url-env", "TEST_PLAYLIST",
+                    "--prewarm", "Local", "--token-file", str(path.with_suffix(".token"))]
+            for failure in (http.client.IncompleteRead(b""), "<html>Maintenance</html>"):
+                with self.subTest(failure=type(failure).__name__), \
+                     patch.dict(multi.os.environ, {"TEST_PLAYLIST": "https://example.test/list"}), \
+                     patch.object(multi, "private_playlist_text", side_effect=[failure]), \
+                     patch.object(multi.Gateway, "run", lambda gw: gw.stop.wait(2)), \
+                     patch.object(multi, "ThreadingHTTPServer"), patch("builtins.print"):
+                    self.assertEqual(multi.main(args), 0)
+
+    def test_replacement_waits_for_inflight_upstream_request(self):
+        channels = multi.channels_from_entries([
+            ("A", "", "http://example.test/a"), ("B", "", "http://example.test/b")])
+        manager = multi.MultiGateway(channels, Path("unused"), max_streams=1)
+        reading, release, replacement = threading.Event(), threading.Event(), threading.Event()
+
+        def fetch(url, timeout):
+            if url == channels[0].url:
+                reading.set()
+                release.wait(5)
+            else:
+                replacement.set()
+            raise OSError("offline")
+
+        with patch("iptv_gateway.media_manifest", side_effect=fetch):
+            first = manager.start(channels[0].id)
+            second = None
+            try:
+                self.assertTrue(reading.wait(2))
+                first.accessed -= 25
+                second = manager.start(channels[1].id)
+                self.assertIsNotNone(second)
+                self.assertFalse(replacement.wait(0.2), "upstream requests overlapped")
+                release.set()
+                self.assertTrue(replacement.wait(2))
+            finally:
+                manager.close()
+                release.set()
+                first.worker.join(2)
+                if second is not None:
+                    second.worker.join(2)
 
 
 if __name__ == "__main__":

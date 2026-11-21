@@ -9,14 +9,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -71,14 +70,26 @@ def channels_from_text(text: str) -> list[Channel]:
 
 
 class ActiveStream:
-    def __init__(self, channel: Channel, gateway: Gateway, pinned: bool = False):
+    def __init__(self, channel: Channel, gateway: Gateway, slots: threading.BoundedSemaphore,
+                 pinned: bool = False):
         self.channel = channel
         self.gateway = gateway
         self.pinned = pinned
         self.accessed = time.monotonic()
         self.pending_requests = 0
-        self.worker = threading.Thread(target=gateway.run, daemon=True)
+        self.worker = threading.Thread(target=self._run, args=(slots,), daemon=True)
         self.worker.start()
+
+    def _run(self, slots: threading.BoundedSemaphore):
+        # A replaced worker may still be reading from the provider.
+        while not self.gateway.stop.is_set():
+            if slots.acquire(timeout=0.25):
+                try:
+                    if not self.gateway.stop.is_set():
+                        self.gateway.run()
+                finally:
+                    slots.release()
+                return
 
     def close(self):
         self.gateway.stop.set()
@@ -99,6 +110,7 @@ class MultiGateway:
         self.poll = poll
         self.cache_mib = cache_mib
         self.max_streams = max_streams
+        self.upstream_slots = threading.BoundedSemaphore(max_streams)
         self.idle_seconds = idle_seconds
         self.startup_wait = startup_wait
         self.switch_grace = switch_grace
@@ -129,7 +141,7 @@ class MultiGateway:
         gateway = Gateway(channel.url, delay=self.delay, timeout=self.timeout,
                           poll=self.poll, max_bytes=self.cache_mib * 1048576,
                           source_refresher=refresh)
-        return ActiveStream(channel, gateway, pinned)
+        return ActiveStream(channel, gateway, self.upstream_slots, pinned)
 
     def start(self, cid: str, *, pinned: bool = False) -> ActiveStream | None:
         """Start a requested channel; do not silently evict active viewers."""
@@ -226,6 +238,7 @@ class MultiGateway:
                     "cached_mib": details["cached_mib"],
                     "client_manifest_200": details["client_manifest_200"],
                     "client_segment_200": details["client_segment_200"],
+                    "client_segment_206": details["client_segment_206"],
                     "seconds_since_access": round(time.monotonic() - stream.accessed, 1),
                 })
             return json.dumps({
@@ -444,17 +457,20 @@ def main(argv=None):
 
     # Prefer a fresh authorized playlist on startup; fall back to the local
     # private M3U if the source service is temporarily unavailable.
-    try:
-        if private_url:
+    channels = []
+    if private_url:
+        try:
             source = private_playlist_text(args.playlist, private_url, args.timeout)
             channels = channels_from_text(source)
-        else:
+            if not channels:
+                print("Remote playlist contains no channels; using local M3U.")
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            print(f"Remote playlist unavailable ({safe_error(exc)}); using local M3U.")
+    if not channels:
+        try:
             channels = channels_from_entries(entries_from_m3u(args.playlist))
-    except (OSError, UnicodeError, ValueError, urllib.error.URLError) as exc:
-        if not private_url:
+        except (OSError, ValueError):
             p.error("Could not read local M3U playlist")
-        print(f"Remote playlist unavailable ({safe_error(exc)}); using local M3U.")
-        channels = channels_from_entries(entries_from_m3u(args.playlist))
     if args.filter:
         patterns = [x.casefold() for x in args.filter]
         channels = [c for c in channels if any(q in c.name.casefold() for q in patterns)]
