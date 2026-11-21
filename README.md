@@ -292,6 +292,17 @@ On a cold channel the gateway gives the downloader up to three seconds
 to build the preferred reserve. Downloads continue during playback.
 The URL and token for the multi-channel TV catalog stay unchanged.
 
+**HTTPS catalog links behind a reverse proxy (VPS experiment):** When
+the gateway listens on `127.0.0.1:8787` and a separate HTTPS reverse proxy
+serves `https://tv.example.org`, start the gateway with
+`--public-base-url https://tv.example.org`. The catalog then advertises
+HTTPS channel URLs instead of the internal HTTP address. HLS manifests
+already use relative segment paths. Do not open port 8787 publicly or
+put the upstream playlist/subscription credentials in the repository.
+The catalog URL contains a bearer token; treat it as a password.
+This flag only corrects playlist URLs: it does not configure TLS,
+user accounts, access controls, or make the gateway internet-hardened.
+
 **Existing TV favorite compatibility:** Some Samsung/LG apps remember the
 old single-channel `/TOKEN/index.m3u8` and `/TOKEN/segment/NN.ts` URLs
 even after the source switches to `iptv_multi.py`. When you supply

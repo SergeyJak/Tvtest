@@ -232,14 +232,17 @@ class MultiChannelTests(unittest.TestCase):
         self.manager.delay = 90
         self.manager.startup_reserve = 10
         cid = self.channels[0].id
-        gw = self.manager.start(cid).gateway
         path = f"/channel/{cid}/index.m3u8"
 
-        def cache(seq):
-            gw.cache[seq] = (10.0, b"segment")
-            gw.latest = seq
-
         with patch.object(time, "monotonic", return_value=100.0) as clock:
+            # The gateway's fast-start deadline is based on its creation time.
+            # Use the same controlled clock for creation and assertions.
+            gw = self.manager.start(cid).gateway
+
+            def cache(seq):
+                gw.cache[seq] = (10.0, b"segment")
+                gw.latest = seq
+
             for seq in range(100, 103):
                 cache(seq)
             self.assertFalse(json.loads(gw.status())["ready"])
@@ -264,9 +267,10 @@ class MultiChannelTests(unittest.TestCase):
         self.manager.delay = 90
         self.assertEqual(self.manager.startup_reserve, 30)
         cid = self.channels[0].id
-        gw = self.manager.start(cid).gateway
-        self.assertEqual(gw.startup_reserve, 30)
         with patch.object(time, "monotonic", return_value=100.0):
+            # Keep the fast-start deadline on the same controlled clock.
+            gw = self.manager.start(cid).gateway
+            self.assertEqual(gw.startup_reserve, 30)
             with gw.lock:
                 for seq in range(100, 105):
                     gw.cache[seq] = (10.0, b"data")
