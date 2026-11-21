@@ -126,6 +126,8 @@ class Gateway:
         self.errors = 0
         self.last_update = None
         self.last_progress = None
+        self.last_advance_at = None
+        self.last_published_seq = None
         self.stop = threading.Event()
 
     def cycle(self):
@@ -138,8 +140,10 @@ class Gateway:
                 if self.latest is not None and listed[-1].sequence < self.latest - 10:
                     self.cache.clear()
                     self.total_bytes = 0
+                    self.last_published_seq = None
                 if self.latest is None or self.latest != listed[-1].sequence:
                     self.last_progress = time.time()
+                    self.last_advance_at = time.monotonic()
                 self.latest = listed[-1].sequence
                 self.target = target
                 self.last_update = time.time()
@@ -197,17 +201,23 @@ class Gateway:
                 if entry[0] + 1 != tail[0][0]:
                     break
                 tail.insert(0, entry)
-            # Preserve at least <delay> seconds of cached content ahead of
-            # the presented live edge, providing a jitter buffer for clients.
+            # Normally stay <delay> behind the newest downloaded segment.
+            # If the upstream stalls, progressively release queued segments
+            # from the cache instead of freezing the local manifest too.
+            elapsed = max(0.0, time.monotonic() - self.last_advance_at) if self.last_advance_at is not None else 0.0
+            required_behind = max(0.0, self.delay - elapsed)
             remaining = 0.0
             cutoff = -1
             for i in range(len(tail) - 1, -1, -1):
-                if remaining >= self.delay:
+                if remaining >= required_behind:
                     cutoff = i
                     break
                 remaining += tail[i][1]
+            if self.last_published_seq is not None and cutoff >= 0:
+                cutoff = max(cutoff, next((i for i, (seq, _) in enumerate(tail) if seq >= self.last_published_seq), cutoff))
             if cutoff < 2:
                 return []  # Need at least three playable segments in the window.
+            self.last_published_seq = tail[cutoff][0]
             return tail[max(0, cutoff - 7):cutoff + 1]
 
     def playlist(self, token: str) -> bytes | None:
