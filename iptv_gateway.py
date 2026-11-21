@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Single-channel LAN HLS cache with configurable delayed playback.
+
+Designed as a diagnostic experiment, not a public IPTV redistribution service.
+No subscriptions or upstream URLs are ever printed or saved.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import secrets
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import OrderedDict
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+from iptv_healthcheck import UA, entries_from_m3u
+
+
+@dataclass(frozen=True)
+class Segment:
+    sequence: int
+    duration: float
+    url: str
+
+
+def fetch_text(url: str, timeout: float) -> tuple[str, str]:
+    request = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept': '*/*'})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = response.read(1024 * 1024 + 1)
+        final_url = response.geturl()
+    if len(data) > 1024 * 1024:
+        raise ValueError('playlist_too_large')
+    return data.decode('utf-8-sig', errors='replace'), final_url
+
+
+def media_manifest(url: str, timeout: float) -> tuple[str, str]:
+    for _ in range(3):
+        body, base = fetch_text(url, timeout)
+        if '#EXT-X-STREAM-INF' not in body:
+            return body, base
+        lines = body.splitlines()
+        variant = next((lines[j].strip() for i, line in enumerate(lines)
+                        if line.startswith('#EXT-X-STREAM-INF')
+                        for j in range(i + 1, len(lines))
+                        if lines[j].strip() and not lines[j].startswith('#')), None)
+        if not variant:
+            raise ValueError('missing_variant')
+        url = urllib.parse.urljoin(base, variant)
+    raise ValueError('too_many_master_playlists')
+
+
+def parse_media(text: str, base: str) -> tuple[float, list[Segment]]:
+    if not text.lstrip('\ufeff').startswith('#EXTM3U'):
+        raise ValueError('not_hls')
+    # Encryption, fMP4 maps, byte ranges and discontinuities require their own
+    # tags/key handling. Never silently publish broken HLS output.
+    unsupported = ('#EXT-X-KEY:', '#EXT-X-MAP:', '#EXT-X-BYTERANGE:',
+                   '#EXT-X-DISCONTINUITY', '#EXT-X-PART:', '#EXT-X-PRELOAD-HINT:')
+    if any(line.strip().startswith(unsupported) for line in text.splitlines()):
+        raise ValueError('unsupported_hls_features')
+    sequence, duration, target = 0, None, 6.0
+    segments = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith('#EXT-X-MEDIA-SEQUENCE:'):
+            sequence = int(line.split(':', 1)[1])
+        elif line.startswith('#EXT-X-TARGETDURATION:'):
+            target = max(1.0, float(line.split(':', 1)[1]))
+        elif line.startswith('#EXTINF:'):
+            duration = float(line.split(':', 1)[1].split(',', 1)[0])
+        elif line and not line.startswith('#') and duration is not None:
+            url = urllib.parse.urljoin(base, line)
+            if urllib.parse.urlparse(url).scheme not in ('http', 'https'):
+                raise ValueError('unsupported_segment_scheme')
+            segments.append(Segment(sequence + len(segments), duration, url))
+            duration = None
+    return target, segments
+
+
+def fetch_segment(url: str, timeout: float, max_bytes: int) -> bytes:
+    req = urllib.request.Request(url, headers={'User-Agent': UA, 'Accept': '*/*'})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        data = response.read(max_bytes + 1)
+    if not data or len(data) > max_bytes:
+        raise ValueError('empty_or_oversize_segment')
+    return data
+
+
+def safe_error(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return f'HTTP_{exc.code}'
+    if isinstance(exc, urllib.error.URLError):
+        return 'NETWORK_ERROR'
+    if isinstance(exc, TimeoutError):
+        return 'TIMEOUT'
+    if isinstance(exc, ValueError):
+        return str(exc) if str(exc) in {
+            'not_hls', 'unsupported_hls_features', 'empty_or_oversize_segment',
+            'unsupported_segment_scheme', 'playlist_too_large',
+            'missing_variant', 'too_many_master_playlists'
+        } else 'INVALID_HLS'
+    return type(exc).__name__
+
+
+class Gateway:
+    def __init__(self, url: str, delay: float = 45, timeout: float = 12,
+                 poll: float = 2, max_bytes: int = 128 * 1024 * 1024,
+                 max_segment: int = 32 * 1024 * 1024):
+        self._url = url
+        self.delay, self.timeout, self.poll = delay, timeout, poll
+        self.max_bytes, self.max_segment = max_bytes, max_segment
+        self.lock = threading.RLock()
+        self.cache: OrderedDict[int, tuple[float, bytes]] = OrderedDict()
+        self.total_bytes = 0
+        self.latest = None
+        self.target = 6.0
+        self.last_error = None
+        self.slow_segments = 0
+        self.errors = 0
+        self.last_update = None
+        self.stop = threading.Event()
+
+    def cycle(self):
+        try:
+            body, base = media_manifest(self._url, self.timeout)
+            target, listed = parse_media(body, base)
+            if not listed:
+                raise ValueError('empty_playlist')
+            with self.lock:
+                if self.latest is not None and listed[-1].sequence < self.latest - 10:
+                    self.cache.clear()
+                    self.total_bytes = 0
+                self.latest = listed[-1].sequence
+                self.target = target
+                self.last_update = time.time()
+                self.last_error = None
+            for segment in listed:
+                if self.stop.is_set():
+                    return
+                with self.lock:
+                    present = segment.sequence in self.cache
+                if present:
+                    continue
+                start = time.monotonic()
+                try:
+                    data = fetch_segment(segment.url, self.timeout, self.max_segment)
+                except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                    with self.lock:
+                        self.errors += 1
+                        self.last_error = 'SEGMENT_' + safe_error(exc)
+                    continue
+                duration = time.monotonic() - start
+                with self.lock:
+                    if duration >= segment.duration:
+                        self.slow_segments += 1
+                    if segment.sequence not in self.cache:
+                        self.cache[segment.sequence] = (segment.duration, data)
+                        self.total_bytes += len(data)
+                    self._evict()
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+            with self.lock:
+                self.errors += 1
+                self.last_error = 'MANIFEST_' + safe_error(exc)
+
+    def _evict(self):
+        duration = sum(item[0] for item in self.cache.values())
+        while self.cache and (duration > max(self.delay + 150, 180) or self.total_bytes > self.max_bytes):
+            _, (seconds, data) = self.cache.popitem(last=False)
+            duration -= seconds
+            self.total_bytes -= len(data)
+
+    def run(self):
+        while not self.stop.is_set():
+            start = time.monotonic()
+            self.cycle()
+            self.stop.wait(max(0.2, self.poll - (time.monotonic() - start)))
+
+    def published(self) -> list[tuple[int, float]]:
+        with self.lock:
+            if not self.cache or self.latest is None:
+                return []
+            items = [(seq, entry[0]) for seq, entry in self.cache.items()]
+            # Most recent contiguous cached tail ending at or behind the live edge.
+            tail = [items[-1]]
+            for entry in reversed(items[:-1]):
+                if entry[0] + 1 != tail[0][0]:
+                    break
+                tail.insert(0, entry)
+            # Preserve at least <delay> seconds of cached content ahead of
+            # the presented live edge, providing a jitter buffer for clients.
+            remaining = 0.0
+            cutoff = -1
+            for i in range(len(tail) - 1, -1, -1):
+                if remaining >= self.delay:
+                    cutoff = i
+                    break
+                remaining += tail[i][1]
+            if cutoff < 2:
+                return []  # Need at least three playable segments in the window.
+            return tail[max(0, cutoff - 7):cutoff + 1]
+
+    def playlist(self, token: str) -> bytes | None:
+        records = self.published()
+        if not records:
+            return None
+        target = max(1, math.ceil(max(s for _, s in records)))
+        lines = ['#EXTM3U', '#EXT-X-VERSION:3', f'#EXT-X-TARGETDURATION:{target}',
+                 f'#EXT-X-MEDIA-SEQUENCE:{records[0][0]}']
+        for sequence, duration in records:
+            lines.extend((f'#EXTINF:{duration:.3f},', f'/{token}/segment/{sequence}.ts'))
+        return ('\n'.join(lines) + '\n').encode('utf-8')
+
+    def segment(self, seq: int) -> bytes | None:
+        with self.lock:
+            found = self.cache.get(seq)
+            return found[1] if found is not None else None
+
+    def status(self) -> bytes:
+        with self.lock:
+            info = dict(ready=bool(self.published()), delay_seconds=self.delay,
+                        cached_segments=len(self.cache), cached_mib=round(self.total_bytes / 1048576, 2),
+                        errors=self.errors, slow_segments=self.slow_segments,
+                        last_error=self.last_error,
+                        seconds_since_playlist_update=round(time.time() - self.last_update, 1) if self.last_update else None)
+        return json.dumps(info, ensure_ascii=False).encode('utf-8')
+
+
+def make_handler(gateway: Gateway, token: str, channel_name: str):
+    prefix = '/' + token
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass  # URLs may contain access token; do not log HTTP request lines.
+
+        def do_HEAD(self):
+            self.serve(head_only=True)
+
+        def do_GET(self):
+            self.serve(head_only=False)
+
+        def respond(self, data: bytes, mimetype: str, head_only: bool, status=200, extra=None):
+            self.send_response(status)
+            self.send_header('Content-Type', mimetype)
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'no-store' if mimetype.endswith('mpegurl') else 'private, max-age=60')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            if not head_only:
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        def serve(self, head_only: bool):
+            path = urllib.parse.urlparse(self.path).path
+            if not path.startswith(prefix + '/'):
+                return self.respond(b'Not found', 'text/plain', head_only, 404)
+            part = path[len(prefix):]
+            if part == '/status':
+                return self.respond(gateway.status(), 'application/json; charset=utf-8', head_only)
+            if part == '/channels.m3u':
+                # A single-channel playlist suitable for IPTV player imports.
+                clean_name = channel_name.replace('\r', ' ').replace('\n', ' ').replace('"', '')
+                host = self.headers.get('Host', '127.0.0.1:8787').split('/')[0]
+                if any(ch in host for ch in ('\r', '\n', ' ')):
+                    return self.respond(b'Bad host', 'text/plain', head_only, 400)
+                content = f'#EXTM3U\n#EXTINF:-1,{clean_name}\nhttp://{host}{prefix}/index.m3u8\n'
+                return self.respond(content.encode('utf-8'), 'audio/x-mpegurl', head_only)
+            if part == '/index.m3u8':
+                content = gateway.playlist(token)
+                if content is None:
+                    return self.respond(b'Buffer warming up', 'text/plain', head_only, 503,
+                                        {'Retry-After': '5'})
+                return self.respond(content, 'application/vnd.apple.mpegurl', head_only)
+            if part.startswith('/segment/') and part.endswith('.ts'):
+                try:
+                    seq = int(part[len('/segment/'):-3])
+                except ValueError:
+                    return self.respond(b'Not found', 'text/plain', head_only, 404)
+                data = gateway.segment(seq)
+                if data is None:
+                    return self.respond(b'Segment expired', 'text/plain', head_only, 404)
+                headers = {'Accept-Ranges': 'bytes'}
+                range_header = self.headers.get('Range')
+                if range_header:
+                    import re
+                    match = re.fullmatch(r'bytes=(\d*)-(\d*)', range_header)
+                    if not match or not any(match.groups()):
+                        return self.respond(b'', 'video/mp2t', head_only, 416,
+                                            {'Content-Range': f'bytes */{len(data)}'})
+                    if match.group(1):
+                        start = int(match.group(1))
+                        end = int(match.group(2)) if match.group(2) else len(data) - 1
+                    else:
+                        suffix = int(match.group(2))
+                        start, end = max(0, len(data) - suffix), len(data) - 1
+                    if start >= len(data) or end < start:
+                        return self.respond(b'', 'video/mp2t', head_only, 416,
+                                            {'Content-Range': f'bytes */{len(data)}'})
+                    end = min(len(data) - 1, end)
+                    headers['Content-Range'] = f'bytes {start}-{end}/{len(data)}'
+                    return self.respond(data[start:end + 1], 'video/mp2t', head_only, 206, headers)
+                return self.respond(data, 'video/mp2t', head_only, extra=headers)
+            return self.respond(b'Not found', 'text/plain', head_only, 404)
+    return Handler
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Local HLS buffering gateway: single channel')
+    parser.add_argument('--playlist', required=True, type=Path)
+    parser.add_argument('--channel', required=True, help='Exact case-insensitive channel name')
+    parser.add_argument('--delay', type=int, default=45, help='Playback delay in seconds (default: 45)')
+    parser.add_argument('--host', default='127.0.0.1', help='Use 0.0.0.0 for access from LAN TVs')
+    parser.add_argument('--advertise-host', help='PC LAN IP, used only for printed URL')
+    parser.add_argument('--port', type=int, default=8787)
+    parser.add_argument('--timeout', type=float, default=12)
+    parser.add_argument('--poll', type=float, default=2)
+    args = parser.parse_args(argv)
+    if args.delay < 15 or args.delay > 120 or args.timeout <= 0 or args.poll <= 0 or not 1 <= args.port <= 65535:
+        parser.error('delay must be 15..120, timeout/poll > 0, and port 1..65535')
+    try:
+        entries = entries_from_m3u(args.playlist)
+    except (OSError, UnicodeError):
+        parser.error('Could not load local playlist')
+    matches = [entry for entry in entries if entry[0].casefold() == args.channel.casefold()]
+    if len(matches) != 1:
+        parser.error(f'Expected exactly one exact channel match; got {len(matches)}')
+    gateway = Gateway(matches[0][2], delay=args.delay, timeout=args.timeout, poll=args.poll)
+    token = secrets.token_urlsafe(16)
+    httpd = ThreadingHTTPServer((args.host, args.port), make_handler(gateway, token, matches[0][0]))
+    httpd.daemon_threads = True
+    thread = threading.Thread(target=gateway.run, daemon=True)
+    thread.start()
+    shown_host = args.advertise_host or ('<PC_LAN_IP>' if args.host == '0.0.0.0' else args.host)
+    print(f'Buffering {matches[0][0]} with {args.delay}s delay. URLs to source are hidden.')
+    print(f'TV playlist URL: http://{shown_host}:{args.port}/{token}/channels.m3u')
+    print(f'Status: http://{shown_host}:{args.port}/{token}/status')
+    print('Start playback after status says ready:true. Keep this PC running. Ctrl+C to stop.')
+    try:
+        httpd.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        print('Stopping gateway.')
+    finally:
+        gateway.stop.set()
+        httpd.server_close()
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
