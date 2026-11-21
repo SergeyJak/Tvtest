@@ -353,6 +353,40 @@ token is needed when the same token file/IP/port are reused.
 Current one-channel gateway behavior is preserved unchanged. To revert,
 stop `iptv_multi.py` and start `iptv_gateway.py` again. The token remains stable.
 
+## Diagnosing intermittent freezes across different channels
+
+When the TV briefly pauses but the active stream is still `ready: true`
+and `client_manifest_503/client_segment_404` are zero, do **not**
+automatically blame the TV or upstream CDN. A successful subsequent HLS
+manifest previously reset `last_error`, concealing the reason for
+cumulative `errors` (e.g. 57).
+
+The private `/status` for each channel now exposes:
+
+- `error_breakdown`: sanitized counts by `SEGMENT_HTTP_404`,
+  `SEGMENT_TIMEOUT`, `MANIFEST_HTTP_503`, etc.
+- `recent_upstream_failures`: last 8 sanitized events, optionally with
+  HLS media sequence and Unix timestamp; no account keys or source URLs.
+- `last_upstream_failure` and `seconds_since_last_upstream_failure`,
+  which survive subsequent successful manifest polls.
+- `effective_buffer_delay_seconds`, `last_published_sequence`,
+  `last_downloaded_sequence`, `latest_upstream_sequence`,
+  `seconds_since_new_segment` and `seconds_since_segment_download`
+  alongside existing client HTTP error counters.
+
+During the next short pause, compare a previous and a fresh `/status`:
+if error counts grow, investigate upstream transport and segmentation.
+If published sequence stalls while downloaded segments advance, investigate
+the gateway's HLS playback cursor. If both progress and client requests
+succeed, the TV decoder or local network remains a possibility.
+Avoid treating cumulative errors as evidence of *when* a freeze occurred.
+
+The known good single-channel test used a 90-second delay; the multi-channel
+trial defaults to 30 seconds for quicker switching. A higher delay provides
+more cushion against source hiccups but slows the first startup.
+Try a longer delay only with this tradeoff in mind, preferably prewarming
+channels you regularly watch.
+
 ## Security
 
 Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions or channel source links. The experimental gateway serves only on localhost by default; LAN exposure requires explicit --host 0.0.0.0 and a random access token.
