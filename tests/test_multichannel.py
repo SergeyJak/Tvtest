@@ -267,9 +267,10 @@ class MultiChannelTests(unittest.TestCase):
         self.manager.delay = 90
         self.assertEqual(self.manager.startup_reserve, 30)
         cid = self.channels[0].id
-        gw = self.manager.start(cid).gateway
-        self.assertEqual(gw.startup_reserve, 30)
         with patch.object(time, "monotonic", return_value=100.0):
+            # Keep the fast-start deadline on the same controlled clock.
+            gw = self.manager.start(cid).gateway
+            self.assertEqual(gw.startup_reserve, 30)
             with gw.lock:
                 for seq in range(100, 105):
                     gw.cache[seq] = (10.0, b"data")
