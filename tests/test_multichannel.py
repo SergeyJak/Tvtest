@@ -28,7 +28,7 @@ class MultiChannelTests(unittest.TestCase):
         self.worker_patch.start()
         self.manager = multi.MultiGateway(self.channels, self.path, delay=30,
                                           max_streams=2, cache_mib=64,
-                                          idle_seconds=20)
+                                          idle_seconds=20, startup_wait=0)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0),
                     multi.make_multi_handler(self.manager, "test-token-1234567890"))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -143,6 +143,85 @@ class MultiChannelTests(unittest.TestCase):
             self.request("/segment/100.ts")
         self.assertEqual(ctx.exception.code, 404)
         self.assertEqual(len(self.manager.active), 0)
+
+    def test_cold_channel_waits_for_video_and_returns_200_on_first_request(self):
+        self.manager.startup_wait = 2.0
+        first = self.channels[0]
+        result, error = [], []
+        def open_cold_channel():
+            try:
+                result.append(self.request(f"/channel/{first.id}/index.m3u8"))
+            except Exception as exc:
+                error.append(exc)
+        reader = threading.Thread(target=open_cold_channel, daemon=True)
+        reader.start()
+        deadline = time.monotonic() + 2
+        while first.id not in self.manager.active and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIn(first.id, self.manager.active)
+        self.assertTrue(reader.is_alive(), "cold manifest request must still be waiting")
+        # Test the source producing enough complete segments *after*
+        # the TV's original GET, before the timeout expires.
+        gw = self.manager.active[first.id].gateway
+        with gw.lock:
+            for seq in range(10, 24):
+                gw.cache[seq] = (10.0, b"0123456789")
+                gw.total_bytes += 10
+            gw.latest = 23
+        reader.join(timeout=3)
+        self.assertFalse(reader.is_alive())
+        self.assertFalse(error, repr(error))
+        self.assertEqual(result[0][0], 200)
+        self.assertIn(f"/channel/{first.id}/segment/", result[0][1].decode())
+        metrics = json.loads(self.request("/status")[1])
+        self.assertEqual(metrics["warmup_successes"], 1)
+        self.assertEqual(metrics["warmup_timeouts"], 0)
+        self.assertEqual(metrics["streams"][0]["client_manifest_503"], 0)
+        self.assertEqual(metrics["streams"][0]["pending_requests"], 0)
+
+    def test_cold_channel_timeout_exposes_manifest_503_and_warmup_count(self):
+        self.manager.startup_wait = 0.1
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.request(f"/channel/{self.channels[0].id}/index.m3u8")
+        self.assertEqual(ctx.exception.code, 503)
+        metrics = json.loads(self.request("/status")[1])
+        self.assertEqual(metrics["warmup_timeouts"], 1)
+        self.assertEqual(metrics["streams"][0]["client_manifest_503"], 1)
+
+    def test_switch_reuses_only_inactive_stream_slot(self):
+        first, second = self.channels
+        self.manager.idle_seconds = 90
+        self.assertIsNotNone(self.manager.start(first.id))
+        self.assertIsNotNone(self.manager.start(second.id))
+        third = multi.channels_from_entries([("Third", "", "https://example.test/3")])[0]
+        self.manager.channels[third.id] = third
+        self.assertIsNone(self.manager.start(third.id))
+        self.assertEqual(self.manager.stream_limit_denials, 1)
+        first_stream = self.manager.active[first.id]
+        first_stream.accessed -= 25
+        # Do not reclaim a stream while its first manifest GET is waiting.
+        first_stream.pending_requests = 1
+        self.assertIsNone(self.manager.start(third.id))
+        first_stream.pending_requests = 0
+        self.assertIsNotNone(self.manager.start(third.id))
+        self.assertNotIn(first.id, self.manager.active)
+        self.assertIn(second.id, self.manager.active)
+        self.assertEqual(self.manager.recycled_idle_streams, 1)
+        self.assertEqual(self.manager.stream_limit_denials, 2)
+
+    def test_active_and_prewarmed_streams_are_not_evicted_on_switch(self):
+        first, second = self.channels
+        self.manager.idle_seconds = 90
+        self.assertIsNotNone(self.manager.start(first.id, pinned=True))
+        self.assertIsNotNone(self.manager.start(second.id))
+        third = multi.channels_from_entries([("Third", "", "https://example.test/3")])[0]
+        self.manager.channels[third.id] = third
+        self.manager.active[first.id].accessed -= 50
+        self.assertIsNone(self.manager.start(third.id))
+        self.manager.active[second.id].accessed -= 25
+        self.assertIsNotNone(self.manager.start(third.id))
+        self.assertIn(first.id, self.manager.active)
+        self.assertNotIn(second.id, self.manager.active)
 
     def test_bad_channel_or_token_is_not_a_public_proxy(self):
         for path in ("/channel/invalid/index.m3u8",
