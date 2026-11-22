@@ -7,6 +7,8 @@ A separate random password (not the TV playlist token) protects all data APIs.
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import gzip
 import hashlib
 import hmac
@@ -27,7 +29,7 @@ from pathlib import Path
 
 from iptv_multi import channels_from_text
 from iptv_profiles import ProfileStore, ProfileError
-from iptv_telemetry import query_viewing, query_incidents
+from iptv_telemetry import query_viewing, query_incidents, export_incident_rows, clear_incidents
 
 ASSETS = Path(__file__).resolve().parent / "admin"
 SESSION_SECONDS = 8 * 3600
@@ -335,6 +337,29 @@ class AdminState:
         data["recording_active"] = bool(state and state.get("telemetry_enabled"))
         return data
 
+    def incident_csv(self, days: int = 7, kind: str = "all") -> bytes:
+        buffer = io.StringIO(newline="")
+        buffer.write("\ufeff")
+        writer = csv.writer(buffer)
+        writer.writerow(("utc_time", "channel", "channel_id",
+                         "event", "detail", "duration_seconds"))
+        labels = self._channel_labels()
+        def safe_cell(value):
+            # Spreadsheet apps may execute formulas in untrusted channel labels.
+            cell = str(value)
+            return "'" + cell if cell.lstrip().startswith(("=", "+", "-", "@")) else cell
+        for event in export_incident_rows(self.telemetry_db, days, kind):
+            timestamp = datetime.fromtimestamp(event["occurred_at"], timezone.utc).isoformat()
+            writer.writerow((timestamp,
+                             safe_cell(labels.get(event["channel_id"], "Неизвестный канал")),
+                             safe_cell(event["channel_id"]),
+                             safe_cell(event["kind"]), safe_cell(event["detail"]),
+                             event["duration_seconds"] if event["duration_seconds"] is not None else ""))
+        return buffer.getvalue().encode("utf-8")
+
+    def clear_incident_history(self) -> int:
+        return clear_incidents(self.telemetry_db)
+
     def incident_history(self, days: int = 7, kind: str = "all") -> dict:
         data = query_incidents(self.telemetry_db, days, kind)
         names = self._channel_labels()
@@ -420,7 +445,8 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                             "/admin/api/session", "/admin/api/login",
                             "/admin/api/logout", "/admin/api/overview",
                             "/admin/api/channels", "/admin/api/tv-links", "/admin/api/history",
-                            "/admin/api/incidents", "/admin/api/profiles") and not re.fullmatch(
+                            "/admin/api/incidents", "/admin/api/incidents/export",
+                            "/admin/api/incidents/clear", "/admin/api/profiles") and not re.fullmatch(
                                 r"/admin/api/profiles/[123]", path):
                 return self.respond(404, b"Not found", "text/plain", head=head)
             if path in ("/admin/", "/admin/app.js", "/admin/style.css"):
@@ -470,6 +496,25 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                     message = str(exc) if isinstance(exc, ProfileError) else "Некорректные данные"
                     return self.respond(400, json.dumps({"error": message}, ensure_ascii=False).encode("utf-8"), head=head)
                 return self.respond(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), head=head)
+            if path == "/admin/api/incidents/clear" and self.command == "POST":
+                # SameSite cookie plus a non-simple custom header defends
+                # against cross-site form submissions. Never clear on GET.
+                if self.headers.get("X-Requested-With") != "XMLHttpRequest":
+                    return self.respond(403, b'{"error":"forbidden"}', head=head)
+                try:
+                    size = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < size <= 256:
+                        raise ValueError()
+                    payload = json.loads(self.rfile.read(size))
+                    if payload != {"confirm": "DELETE_INCIDENTS"}:
+                        raise ValueError()
+                    removed = state.clear_incident_history()
+                except (ValueError, json.JSONDecodeError):
+                    return self.respond(400, b'{"error":"confirmation_required"}', head=head)
+                except OSError:
+                    return self.respond(503, b'{"error":"database_unavailable"}', head=head)
+                return self.respond(
+                    200, json.dumps({"deleted": removed}).encode("utf-8"), head=head)
             if path == "/admin/api/logout" and self.command == "POST":
                 state.logout(current)
                 return self.respond(200, b'{"ok":true}', head=head,
@@ -478,7 +523,8 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                 return self.respond(405, b"", head=head)
             if path == "/admin/api/session":
                 return self.respond(200, b'{"ok":true}', head=head)
-            if path in ("/admin/api/history", "/admin/api/incidents"):
+            if path in ("/admin/api/history", "/admin/api/incidents",
+                        "/admin/api/incidents/export"):
                 from urllib.parse import parse_qs
                 qs = parse_qs(urlsplit(self.path).query)
                 try:
@@ -486,10 +532,18 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                     if days not in (1, 7, 30):
                         raise ValueError()
                     kind = qs.get("kind", ["all"])[0]
+                    if path == "/admin/api/incidents/export":
+                        content = state.incident_csv(days, kind)
+                        return self.respond(
+                            200, content, "text/csv; charset=utf-8", head=head,
+                            headers={"Content-Disposition":
+                                     f'attachment; filename="tv-incidents-{days}d.csv"'})
                     data = (state.viewing_history(days) if path.endswith("/history")
                             else state.incident_history(days, kind))
                 except (ValueError, TypeError):
                     return self.respond(400, b'{"error":"invalid_filter"}', head=head)
+                except OSError:
+                    return self.respond(503, b'{"error":"database_unavailable"}', head=head)
                 return self.respond(200, json.dumps(data, ensure_ascii=False,
                                                     separators=(",", ":")).encode("utf-8"), head=head)
             if path == "/admin/api/profiles":
