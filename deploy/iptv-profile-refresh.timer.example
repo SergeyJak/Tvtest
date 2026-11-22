@@ -1,0 +1,11 @@
+[Unit]
+Description=HeySmart TV: refresh configured IPTV cabinets daily
+
+[Timer]
+OnCalendar=*-*-* 04:45:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+Unit=iptv-profile-refresh.service
+
+[Install]
+WantedBy=timers.target
