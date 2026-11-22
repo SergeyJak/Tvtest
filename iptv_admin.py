@@ -28,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from iptv_multi import channels_from_text
+from iptv_resource_monitor import ResourceSampler
 from iptv_profiles import ProfileStore, ProfileError
 from iptv_telemetry import query_viewing, query_incidents, export_incident_rows, clear_incidents
 
@@ -172,6 +173,7 @@ class AdminState:
         self.failed: dict[str, list[float]] = defaultdict(list)
         self.lock = threading.Lock()
         self.started = time.time()
+        self.resource_sampler = ResourceSampler()
         self._catalogue_key = None
         self._channels: list[dict] = []
 
@@ -208,17 +210,60 @@ class AdminState:
         }
 
     def gateway_status(self) -> dict | None:
+        """Aggregate live status across configured cabins on the same gateway.
+
+        Previously this queried only the legacy manager, which is closed when
+        cabinet 1 switches to a provider M3U URL. No private token is returned.
+        """
+        statuses = []
         try:
-            token = self.gateway_token_file.read_text(encoding="ascii").strip()
-            if not re.fullmatch(r"[A-Za-z0-9_-]{12,}", token):
-                return None
-            url = f"http://127.0.0.1:{self.gateway_port}/{token}/status"
-            with urllib.request.urlopen(url, timeout=2) as response:
-                if response.status != 200:
-                    return None
-                return json.loads(response.read(2 * 1024 * 1024))
-        except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
+            profiles = self.profiles.all()
+        except (OSError, ValueError):
             return None
+        for profile in profiles:
+            if profile["slot"] != 1 and not self.profiles.configured(profile):
+                continue
+            token = profile["token"]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{12,}", token):
+                continue
+            try:
+                url = f"http://127.0.0.1:{self.gateway_port}/{token}/status"
+                with urllib.request.urlopen(url, timeout=1.5) as response:
+                    if response.status != 200:
+                        continue
+                    item = json.loads(response.read(2 * 1024 * 1024))
+                    if isinstance(item, dict):
+                        statuses.append((profile, item))
+            except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
+                continue
+        if not statuses:
+            return None
+        def total(field):
+            return sum(int(value.get(field) or 0) for _, value in statuses)
+        streams = []
+        cabins = []
+        for profile, data in statuses:
+            cabins.append({
+                "slot": profile["slot"], "name": profile["name"],
+                "active_streams": len(data.get("streams") or []),
+                "max_streams": data.get("max_streams", 0),
+            })
+            for stream in data.get("streams") or []:
+                # Gateways are trusted, but expose only labels and known metrics.
+                streams.append(dict(stream, profile_slot=profile["slot"],
+                                    profile_name=profile["name"]))
+        return {
+            "channels": total("channels"),
+            "active_streams": len(streams),
+            "max_streams": total("max_streams"),
+            "delay_seconds": statuses[0][1].get("delay_seconds"),
+            "stream_limit_denials": total("stream_limit_denials"),
+            "warmup_timeouts": total("warmup_timeouts"),
+            "catalog_requests": total("catalog_requests"),
+            "telemetry_enabled": any(bool(s.get("telemetry_enabled")) for _, s in statuses),
+            "streams": streams,
+            "cabins": cabins,
+        }
 
     def login(self, password: str, peer: str) -> str | None:
         now = time.time()
@@ -260,11 +305,14 @@ class AdminState:
         status = self.gateway_status()
         covered = guide["covered_ids"]
         active = []
+        resources = self.resource_sampler.snapshot()
         if isinstance(status, dict):
             for stream in status.get("streams", []):
                 active.append({
                     "id": stream.get("id"),
                     "name": stream.get("channel"),
+                    "profile_name": stream.get("profile_name"),
+                    "profile_slot": stream.get("profile_slot"),
                     "ready": bool(stream.get("ready")),
                     "pinned": bool(stream.get("pinned")),
                     "stalled": bool(stream.get("upstream_stalled")),
@@ -277,6 +325,10 @@ class AdminState:
                 })
         return {
             "gateway_online": status is not None,
+            "resources": resources,
+            "cached_mib": round(sum(float(row.get("cached_mib") or 0) for row in active), 1),
+            "stalled_streams": sum(1 for row in active if row.get("stalled")),
+            "cabins": status.get("cabins", []) if status else [],
             "channels": len(channels),
             "active_streams": len(active),
             "max_streams": status.get("max_streams") if status else None,

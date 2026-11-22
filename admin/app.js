@@ -66,6 +66,86 @@
     if (value !== undefined) node.textContent = value;
     return node;
   }
+  function storage(value) {
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+    const amount = Number(value);
+    if (amount < 1024) return Math.round(amount) + " Б";
+    if (amount < 1048576) return (amount / 1024).toFixed(1).replace(".", ",") + " КБ";
+    if (amount < 1073741824) return (amount / 1048576).toFixed(1).replace(".", ",") + " МБ";
+    return (amount / 1073741824).toFixed(2).replace(".", ",") + " ГБ";
+  }
+  function rate(value) { return value === null || value === undefined ? "—" : storage(value) + "/с"; }
+  function percentLabel(value) {
+    return value === null || value === undefined || !Number.isFinite(Number(value))
+      ? "—" : Number(value).toLocaleString("ru-RU", {maximumFractionDigits:1}) + "%";
+  }
+  function resourceBar(id, value) {
+    const bar = $(id);
+    if (!bar) return;
+    const available = value !== null && value !== undefined && Number.isFinite(Number(value));
+    const pctValue = available ? Math.max(0, Math.min(100, Number(value))) : 0;
+    bar.style.width = pctValue + "%";
+    bar.classList.toggle("high", available && Number(value) >= 85);
+    bar.classList.toggle("critical", available && Number(value) >= 95);
+    bar.parentElement.setAttribute("role", "progressbar");
+    bar.parentElement.setAttribute("aria-valuemin", "0");
+    bar.parentElement.setAttribute("aria-valuemax", "100");
+    bar.parentElement.setAttribute("aria-valuenow", available ? String(Math.round(pctValue)) : "0");
+    bar.parentElement.setAttribute("aria-valuetext", available ? percentLabel(value) : "Нет данных");
+  }
+  function updateResources(data) {
+    const vps = data.resources?.vps || {};
+    const service = data.resources?.service || {};
+    const gateway = service.gateway || {};
+    const admin = service.admin || {};
+    const ram = vps.memory || {};
+    const disk = vps.disk || {};
+    text("vps-cpu", percentLabel(vps.cpu_percent));
+    text("vps-ram", percentLabel(ram.percent));
+    text("vps-ram-detail", ram.total_bytes === undefined ? "Нет данных" :
+         storage(ram.used_bytes) + " / " + storage(ram.total_bytes));
+    text("vps-disk", percentLabel(disk.percent));
+    text("vps-disk-detail", disk.total_bytes === undefined ? "Нет данных" :
+         storage(disk.used_bytes) + " / " + storage(disk.total_bytes));
+    text("vps-load", vps.load_1m === null || vps.load_1m === undefined ? "—" :
+         Number(vps.load_1m).toLocaleString("ru-RU") +
+         (vps.cores ? " / " + vps.cores + " CPU" : ""));
+    text("vps-rx", rate(vps.rx_bytes_per_second));
+    text("vps-tx", rate(vps.tx_bytes_per_second));
+    resourceBar("vps-cpu-bar", vps.cpu_percent);
+    resourceBar("vps-ram-bar", ram.percent);
+    resourceBar("vps-disk-bar", disk.percent);
+    text("service-cpu", percentLabel(gateway.cpu_percent));
+    text("service-ram", storage(gateway.rss_bytes));
+    const serviceShare = ram.total_bytes && gateway.rss_bytes !== null &&
+                         gateway.rss_bytes !== undefined
+      ? (100 * gateway.rss_bytes / ram.total_bytes) : null;
+    resourceBar("service-cpu-bar", gateway.cpu_percent);
+    resourceBar("service-ram-bar", serviceShare);
+    text("service-cache", data.cached_mib === undefined ? "—" :
+         Number(data.cached_mib).toLocaleString("ru-RU") + " МБ");
+    text("service-stalled", n(data.stalled_streams));
+    text("service-admin-ram", storage(admin.rss_bytes));
+    text("service-admin-cpu", percentLabel(admin.cpu_percent));
+    text("service-health", data.gateway_online ? "● На связи" : "● Нет связи");
+    text("sys-vps-cpu", percentLabel(vps.cpu_percent));
+    text("sys-vps-ram", percentLabel(ram.percent));
+    text("sys-vps-disk", percentLabel(disk.percent));
+    text("sys-service-cpu", percentLabel(gateway.cpu_percent));
+    text("sys-service-ram", storage(gateway.rss_bytes));
+    const cabins = $("service-cabins");
+    cabins.replaceChildren();
+    if (!data.cabins?.length) {
+      cabins.append(element("div", "resource-note", "Кабинеты недоступны для мониторинга"));
+    } else {
+      data.cabins.forEach(item => {
+        const row = element("div", "resource-cabin");
+        row.append(element("span", "", item.name || "Кабинет " + item.slot));
+        row.append(element("strong", "", n(item.active_streams) + " / " + n(item.max_streams) + " потоков"));
+        cabins.append(row);
+      });
+    }
+  }
   function updateOverview(data) {
     state.overview = data;
     const online = data.gateway_online;
@@ -110,6 +190,7 @@
     text("sys-uptime", Math.floor(data.admin_uptime_seconds / 3600) + " ч " + Math.floor(data.admin_uptime_seconds % 3600 / 60) + " мин");
     text("last-updated", "Обновлено в " + new Date().toLocaleTimeString("ru-RU", {hour:"2-digit",minute:"2-digit",second:"2-digit"}));
     text("footer-time", new Date().getFullYear());
+    updateResources(data);
     renderStreams(data.streams);
   }
   function renderStreams(streams) {
