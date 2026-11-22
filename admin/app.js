@@ -5,7 +5,7 @@
   const app = $("app");
   const loginScreen = $("login-screen");
   const state = {overview: null, channels: [], epgStatus: "", page: 0, size: 50, lastCatalog: 0, view: "overview", busy: false};
-  const views = {overview:"ОБЗОР", channels:"КАНАЛЫ", epg:"ТЕЛЕПРОГРАММА", system:"ДИАГНОСТИКА"};
+  const views = {overview:"ОБЗОР", channels:"КАНАЛЫ", epg:"ТЕЛЕПРОГРАММА", history:"ПРОСМОТРЫ", incidents:"ОШИБКИ И ЗАВИСАНИЯ", system:"ДИАГНОСТИКА"};
 
   function text(id, value) {
     const node = $(id);
@@ -32,6 +32,8 @@
     text("crumb", views[name]);
     if (name === "channels") renderChannels();
     if (name === "epg") renderGroups();
+    if (name === "history") loadHistory();
+    if (name === "incidents") loadIncidents();
   }
   function showLogin() {
     state.overview = null;
@@ -232,6 +234,118 @@
     renderChannels();
     renderGroups();
   }
+  function duration(seconds) {
+    const value = Math.max(0, Math.round(Number(seconds) || 0));
+    if (value < 60) return value + " с";
+    const hours = Math.floor(value / 3600);
+    const minutes = Math.floor((value % 3600) / 60);
+    return hours ? hours + " ч " + minutes + " мин" : minutes + " мин";
+  }
+  function localTime(seconds) {
+    if (!Number.isFinite(Number(seconds))) return "—";
+    return new Date(Number(seconds) * 1000).toLocaleString("ru-RU", {
+      day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit"
+    });
+  }
+  async function loadHistory() {
+    const days = $("history-days").value;
+    const ranking = $("history-ranking");
+    const recent = $("history-recent");
+    try {
+      const data = await api("history?days=" + encodeURIComponent(days));
+      text("history-total-time", duration(data.total_seconds));
+      text("history-sessions", n(data.total_sessions));
+      text("history-channels", n(data.channels.length));
+      text("history-recording", data.recording_active ? "Включена" : "Выключена");
+      $("history-notice").textContent = data.recording_active
+        ? "Учёт включён. Длительность приблизительная: учитываются успешные запросы HLS-сегментов, а не состояние экрана телевизора."
+        : "Сбор данных на шлюзе не включён. Добавь --telemetry-db в действующий systemd ExecStart. Прошлые просмотры восстановить нельзя.";
+      ranking.replaceChildren();
+      recent.replaceChildren();
+      if (!data.channels.length) ranking.append(element("div", "empty-state", "За выбранный период просмотренные каналы пока не обнаружены."));
+      const longest = Math.max(1, ...data.channels.map(row => row.seconds));
+      data.channels.slice(0, 20).forEach((row, i) => {
+        const wrapper = element("div", "rank-row");
+        wrapper.append(element("span", "rank-number", String(i + 1).padStart(2, "0")));
+        const info = element("div", "");
+        info.append(element("div", "rank-title", row.channel_name));
+        info.append(element("div", "rank-sub", n(row.sessions) + " сессий · Последний запрос " + localTime(row.last_seen)));
+        const track = element("div", "rank-progress");
+        const bar = document.createElement("div");
+        bar.style.width = Math.max(2, Math.round(row.seconds / longest * 100)) + "%";
+        track.append(bar);
+        info.append(track);
+        wrapper.append(info);
+        wrapper.append(element("div", "rank-duration", duration(row.seconds)));
+        ranking.append(wrapper);
+      });
+      if (!data.sessions.length) recent.append(element("div", "empty-state", "История пока пуста."));
+      data.sessions.slice(0, 12).forEach(row => {
+        const node = element("div", "activity-row");
+        const heading = element("div", "activity-row-top");
+        heading.append(element("span", "activity-title", row.channel_name));
+        heading.append(element("span", "activity-duration", duration(row.seconds)));
+        node.append(heading);
+        node.append(element("div", "activity-sub", localTime(row.started_at) + " → " +
+          localTime(row.last_seen) + " · Устройство " + row.viewer.slice(0, 6)));
+        recent.append(node);
+      });
+    } catch (error) {
+      if (app.hidden) return;
+      ranking.replaceChildren(element("div", "empty-state", "Не удалось получить историю просмотров."));
+      recent.replaceChildren();
+    }
+  }
+  const incidentLabels = {
+    stream_stalled:["Зависание", "danger"], stream_recovered:["Восстановление", "success"],
+    upstream_error:["Ошибка источника", "danger"], client_error:["Ошибка клиента", "warning"],
+    startup_timeout:["Таймаут запуска", "warning"], segment_slow:["Медленный сегмент", "warning"]
+  };
+  async function loadIncidents() {
+    const days = $("incident-days").value;
+    const kind = $("incident-filter").value;
+    const table = $("incident-table");
+    try {
+      const data = await api("incidents?days=" + encodeURIComponent(days) + "&kind=" + encodeURIComponent(kind));
+      text("incident-stalls", n(data.summary.stream_stalled || 0));
+      text("incident-upstream", n(data.summary.upstream_error || 0));
+      text("incident-client", n((data.summary.client_error || 0) + (data.summary.startup_timeout || 0)));
+      text("incident-slow", n(data.summary.segment_slow || 0));
+      text("incident-total", n(data.total) + " событий");
+      $("incident-notice").textContent = data.recording_active
+        ? "Журнал собирается автоматически. «Зависание» означает отсутствие новых сегментов у источника, а не гарантированную остановку изображения на ТВ."
+        : "Учёт событий на IPTV-шлюзе пока выключен. Для сбора добавь --telemetry-db в его ExecStart.";
+      table.replaceChildren();
+      if (!data.events.length) {
+        const tr = document.createElement("tr");
+        const td = element("td", "", "За выбранный период событий не найдено.");
+        td.colSpan = 5;
+        tr.append(td);
+        table.append(tr);
+      }
+      data.events.forEach(row => {
+        const tr = document.createElement("tr");
+        tr.append(element("td", "", localTime(row.occurred_at)));
+        tr.append(element("td", "", row.channel_name));
+        const type = document.createElement("td");
+        const info = incidentLabels[row.kind] || [row.kind, "neutral"];
+        type.append(element("span", "incident-type " + info[1], info[0]));
+        tr.append(type);
+        tr.append(element("td", "incident-details", row.detail || "—"));
+        tr.append(element("td", "", row.duration_seconds === null ? "—" : duration(row.duration_seconds)));
+        table.append(tr);
+      });
+    } catch (error) {
+      if (app.hidden) return;
+      table.replaceChildren();
+      const tr = document.createElement("tr");
+      const td = element("td", "", "Не удалось загрузить журнал.");
+      td.colSpan = 5;
+      tr.append(td);
+      table.append(tr);
+    }
+  }
+
   async function refresh(force) {
     if (state.busy || app.hidden) return;
     state.busy = true;
@@ -240,6 +354,8 @@
       const data = await api("overview");
       updateOverview(data);
       await loadChannels(force || state.epgStatus !== data.epg.status);
+      if (state.view === "history") await loadHistory();
+      if (state.view === "incidents") await loadIncidents();
     } catch (error) {
       text("last-updated", "Ошибка подключения");
       if (!app.hidden) badge("overall-status", "● Нет связи с админкой", true);
@@ -255,6 +371,10 @@
   $("prev-page").addEventListener("click", () => { state.page--; renderChannels(); });
   $("next-page").addEventListener("click", () => { state.page++; renderChannels(); });
   $("refresh-button").addEventListener("click", () => refresh(true));
+  $("history-days").addEventListener("change", loadHistory);
+  $("incident-days").addEventListener("change", loadIncidents);
+  $("incident-filter").addEventListener("change", loadIncidents);
+  $("incident-refresh").addEventListener("click", loadIncidents);
   $("login-form").addEventListener("submit", async event => {
     event.preventDefault();
     text("login-error", "");
