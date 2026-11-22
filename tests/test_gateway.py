@@ -148,7 +148,7 @@ class GatewayTests(unittest.TestCase):
         failure = urllib.error.HTTPError(secret, 404, "gone", None, None)
         gw = g.Gateway(secret, poll=2, source_refresher=lambda: secret)
         with patch.object(g, "media_manifest", side_effect=failure) as fetch, \
-             patch.object(g.time, "monotonic", side_effect=[100.0, 101.0, 101.0, 102.0, 106.0, 106.0]):
+             patch.object(g.time, "monotonic", side_effect=[100.0, 100.0, 100.0, 100.0, 100.0, 106.0, 106.0]):
             gw.cycle()
             gw.cycle()
             gw.cycle()  # no new HTTP request during backoff
@@ -167,9 +167,9 @@ class GatewayTests(unittest.TestCase):
         gw.total_bytes = len(b"old-video")
         gw.latest = 55
         gw.last_published_seq = 55
-        manifest = ('#EXTM3U\\n#EXT-X-TARGETDURATION:6\\n'
-                    '#EXT-X-MEDIA-SEQUENCE:55\\n'
-                    '#EXTINF:6,\\n55.ts\\n')
+        manifest = ('#EXTM3U\n#EXT-X-TARGETDURATION:6\n'
+                    '#EXT-X-MEDIA-SEQUENCE:55\n'
+                    '#EXTINF:6,\n55.ts\n')
         failure = urllib.error.HTTPError(old_url, 404, "expired", None, None)
         with patch.object(g, "media_manifest", side_effect=[
             failure, (manifest, new_url)]), \
