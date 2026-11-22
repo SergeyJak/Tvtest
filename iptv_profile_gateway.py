@@ -26,6 +26,7 @@ class ProfileRegistry:
         self.managers = {}  # slot -> (revision, manager)
         self.routes = {}
         self.closed = False
+        self.legacy_detached = False
         self._reload()
 
     def _reload(self):
@@ -49,6 +50,11 @@ class ProfileRegistry:
                 if not self.store.configured(row):
                     continue
                 live_slots.add(slot)
+                if slot == 1 and not self.legacy_detached:
+                    # The original manager may be pinned/prewarmed. Release it
+                    # when the original token moves to the new source.
+                    self.legacy_manager.close()
+                    self.legacy_detached = True
                 cached = self.managers.get(slot)
                 if cached and cached[0] == row["revision"]:
                     manager = cached[1]
