@@ -147,11 +147,15 @@ class GatewayTests(unittest.TestCase):
         secret = "https://provider.example/hidden/SECRET"
         failure = urllib.error.HTTPError(secret, 404, "gone", None, None)
         gw = g.Gateway(secret, poll=2, source_refresher=lambda: secret)
+        clock = [100.0]
         with patch.object(g, "media_manifest", side_effect=failure) as fetch, \
-             patch.object(g.time, "monotonic", side_effect=[100.0, 100.0, 100.0, 100.0, 100.0, 106.0, 106.0]):
+             patch.object(g.time, "monotonic", side_effect=lambda: clock[0]):
             gw.cycle()
+            clock[0] = 101.0
             gw.cycle()
+            clock[0] = 102.0
             gw.cycle()  # no new HTTP request during backoff
+            clock[0] = 107.0
             gw.cycle()
         self.assertEqual(fetch.call_count, 3)
         self.assertEqual(gw.manifest_failure_streak, 3)
