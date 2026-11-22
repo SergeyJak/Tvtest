@@ -123,6 +123,38 @@ class AdminTests(unittest.TestCase):
         self.assertNotIn("SECRET_TOKEN", json.dumps(channels))
         self.assertEqual([c["group"] for c in channels], ["News", "Movies"])
 
+    def test_tv_links_are_available_only_to_logged_in_admin(self):
+        token = "private-playlist-token-for-test"
+        self.state.gateway_token_file.write_text(token, encoding="ascii")
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request("/admin/api/tv-links")
+        self.assertEqual(error.exception.code, 401)
+        with self.request("/admin/") as response:
+            self.assertNotIn(token, response.read().decode())
+        with self.request("/admin/app.js") as response:
+            self.assertNotIn(token, response.read().decode())
+        self.login().close()
+        with self.request("/admin/api/tv-links") as response:
+            data = json.load(response)
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+            self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+        self.assertTrue(data["available"])
+        self.assertEqual(data["m3u"],
+                         "https://tv.heysmart.lv/" + token + "/channels.m3u")
+        self.assertEqual(data["epg"],
+                         "https://tv.heysmart.lv/" + token + "/epg.xml.gz")
+        self.assertTrue(data["automatic_epg"])
+        with self.request("/admin/api/logout", data=b"") as response:
+            self.assertEqual(response.status, 200)
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request("/admin/api/tv-links")
+        self.assertEqual(error.exception.code, 401)
+
+    def test_tv_links_fail_closed_without_private_token(self):
+        self.login().close()
+        with self.request("/admin/api/tv-links") as response:
+            self.assertEqual(json.load(response), {"available": False})
+
     def test_new_private_history_and_incident_endpoints(self):
         # The two pages require the same independent admin session.
         for path in ("/admin/api/history?days=7", "/admin/api/incidents?days=7"):
