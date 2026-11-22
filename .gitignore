@@ -21,3 +21,7 @@ epg-aliases.json
 
 # Private admin credential (never commit)
 .iptv_admin_password
+
+# Private persisted TV history, SQLite WAL/SHM files, anonymization salt
+.iptv_telemetry.sqlite3*
+.iptv_telemetry.salt
