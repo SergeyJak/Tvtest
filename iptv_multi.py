@@ -299,6 +299,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                        public_base_url: str | None = None,
                        epg_file: Path | None = None,
                        profile_registry=None):
+    configured_epg_file = epg_file
 
     class Handler(BaseHTTPRequestHandler):
         def viewer_identity(self):
@@ -416,19 +417,19 @@ def make_multi_handler(manager: MultiGateway, token: str,
             path = urllib.parse.urlsplit(self.path).path
             requested_token = path.split("/", 2)[1] if path.startswith("/") else ""
             if profile_registry is None:
-                resolved = (manager, token, epg_file) if requested_token == token else None
+                resolved = (manager, token, configured_epg_file) if requested_token == token else None
             else:
                 resolved = profile_registry.resolve(requested_token)
             if resolved is None:
                 return self.respond(404, b"Not found", "text/plain", head)
-            request_manager, active_token, epg_file = resolved
+            request_manager, active_token, active_epg_file = resolved
             self._request_manager = request_manager
             prefix = "/" + active_token
             if not path.startswith(prefix + "/"):
                 return self.respond(404, b"Not found", "text/plain", head)
             route = path[len(prefix) + 1:].split("/")
-            if route == ["epg.xml.gz"] and epg_file is not None:
-                return self.serve_epg(head, epg_file)
+            if route == ["epg.xml.gz"] and active_epg_file is not None:
+                return self.serve_epg(head, active_epg_file)
             if route == ["status"]:
                 return self.respond(200, request_manager.status(), "application/json", head)
             if route == ["channels.m3u"]:
@@ -439,7 +440,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                     request_manager.catalog_requests += 1
                 return self.respond(200, request_manager.playlist(active_token, host,
                                                           public_base_url=public_base_url,
-                                                          epg_enabled=epg_file is not None),
+                                                          epg_enabled=active_epg_file is not None),
                                     "audio/x-mpegurl", head)
             # Saved TV favorites may retain the old single-channel URLs
             # even after the catalog URL has been reloaded. Alias only to
