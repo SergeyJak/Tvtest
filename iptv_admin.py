@@ -104,10 +104,6 @@ def scan_epg(path: Path) -> dict:
                         ids.add(node.get("channel"))
                     count += 1
                 node.clear()
-                if root is not None and node is not root:
-                    # XMLTV <programme> can have nested elements. Clear only
-                    # completed top-level nodes, not children before use.
-                    pass
                 if root is not None and node.tag in ("channel", "programme"):
                     root.clear()
     return {"covered_ids": ids, "programmes": count}
@@ -245,7 +241,6 @@ class AdminState:
                     "delay_seconds": stream.get("effective_buffer_delay_seconds"),
                     "segment_404": stream.get("client_segment_404"),
                     "manifest_503": stream.get("client_manifest_503"),
-                    "last_error": stream.get("last_error"),
                     "seconds_since_access": stream.get("seconds_since_access"),
                 })
         return {
