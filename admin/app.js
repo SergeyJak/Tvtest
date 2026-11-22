@@ -326,7 +326,7 @@
         urls.append(group);
       });
       const epgLabels = {ready: "EPG готов", pending: "EPG подготавливается",
-                         unavailable: "Нет источника EPG"};
+                         unavailable: "Нет источника EPG", error: "Ошибка генерации EPG. Проверь XMLTV URL."};
       urls.append(element("div", "profile-epg-hint", epgLabels[profile.epg_status] || ""));
       card.append(urls);
       container.append(card);
