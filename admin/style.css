@@ -106,3 +106,29 @@ td{padding:13px 23px;border-top:1px solid #233044;color:#95a7bd;font-size:12px}t
 .tv-cache-info code{font-size:11px;color:var(--accent)}
 @media(max-width:900px){.tv-link-grid{grid-template-columns:1fr}.tv-link-card p{min-height:0}}
 @media(max-width:480px){.tv-link-control{flex-direction:column}.copy-link-btn{min-height:42px}.tv-intro{padding:20px}}
+
+
+/* Three private TV cabinets */
+.profiles-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:start;gap:16px;margin:20px 0 18px}
+.tv-profile-card{padding:24px;min-width:0;background:linear-gradient(155deg,#182435,#121b29)}
+.profile-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;margin-bottom:12px}
+.profile-card-head .eyebrow{font-size:9px;margin-bottom:10px}
+.profile-card-head h2{font-size:20px;overflow-wrap:anywhere}
+.profile-state{font-size:10px;white-space:nowrap;color:#a3adc1;background:#283547;border-radius:30px;padding:7px 9px}
+.profile-state.ready{color:#7bedc8;background:#193b35}
+.profile-source{min-height:42px;color:#8296ad;font-size:12px;margin-bottom:18px;overflow-wrap:anywhere}
+.profile-edit-form{display:flex;flex-direction:column;gap:12px}
+.profile-field label,.profile-url-row>label{display:block;margin:0 0 7px;font-size:11px;font-weight:670;color:#9fb2c9}
+.profile-field input{width:100%;font-size:12px;min-width:0}
+.profile-field input::placeholder{font-size:11px}
+.profile-save-btn{justify-content:center;margin:5px 0 0;font-size:12px}
+.profile-feedback{min-height:19px;font-size:11px;color:#86e8c9;line-height:1.4}
+.profile-links{margin-top:10px;padding-top:20px;border-top:1px solid #2c3b4f;display:grid;gap:13px}
+.profile-links>.eyebrow{font-size:9px}
+.profile-url-row{min-width:0}
+.profile-url-row input{font-size:10px;padding:10px 11px;color:#a6f0dd;min-height:39px}
+.profile-url-row .copy-link-btn{padding:0 9px;min-height:39px;font-size:10px}
+.profile-epg-hint{font-size:10px;color:#8f9db3}
+@media(max-width:1350px){.profiles-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:930px){.profiles-grid{grid-template-columns:1fr}.profile-source{min-height:0}}
+@media(max-width:540px){.tv-profile-card{padding:17px}.profile-url-row .tv-link-control{flex-direction:column}}
