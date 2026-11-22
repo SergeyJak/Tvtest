@@ -138,6 +138,9 @@ class Gateway:
         self.last_source_change = None
         self.source_refresh_error = None
         self.consecutive_manifest_404 = 0
+        self.manifest_failure_streak = 0
+        self.manifest_backoff_until = 0.0
+        self._pending_source_reset = False
         self.delay, self.timeout, self.poll = delay, timeout, poll
         self.startup_reserve = delay if startup_reserve is None else min(startup_reserve, delay)
         self._fast_start_at = time.monotonic() + 3.0 if fast_start else None
@@ -245,6 +248,11 @@ class Gateway:
             if candidate == self._url:
                 return False  # Same upstream: a 404 still requires provider recovery.
             self._url = candidate
+            # HLS sequence numbers may overlap between two distinct URLs.
+            # Invalidate the old cache only after the new URL yields valid HLS.
+            self._pending_source_reset = True
+            self.manifest_backoff_until = 0.0
+            self.manifest_failure_streak = 0
             self.source_changes += 1
             self.last_source_change = time.time()
             # Retain existing buffered segments for playback while reconnecting.
@@ -270,12 +278,30 @@ class Gateway:
         self._notify_event("upstream_error", label)
 
     def cycle(self):
+        # 404/502 bursts used to poll a broken provider manifest every 2 sec.
+        # Bound retries while still checking regularly for a recovered feed.
+        if time.monotonic() < self.manifest_backoff_until:
+            return
         try:
             body, base = media_manifest(self._url, self.timeout)
             target, listed = parse_media(body, base)
             if not listed:
                 raise ValueError('empty_playlist')
             with self.lock:
+                if self._pending_source_reset:
+                    # Never mix identical HLS sequence numbers from two
+                    # upstream URLs. The old cache is kept until validation.
+                    self.cache.clear()
+                    self.total_bytes = 0
+                    self.latest = None
+                    self.last_published_seq = None
+                    self._published_start = None
+                    self._last_published_at = None
+                    self._recovery_mode = False
+                    self._pending_source_reset = False
+                    self._fast_start_at = time.monotonic() + 3.0
+                self.manifest_failure_streak = 0
+                self.manifest_backoff_until = 0.0
                 if self.latest is not None and listed[-1].sequence < self.latest - 10:
                     self.cache.clear()
                     self.total_bytes = 0
@@ -318,14 +344,23 @@ class Gateway:
                     self._notify_event("segment_slow", "SEGMENT_DOWNLOAD_SLOW", round(duration, 2))
         except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.IncompleteRead) as exc:
             self.record_upstream_failure('MANIFEST', exc)
+            code = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+            transient_http = code in (404, 429, 500, 502, 503, 504)
+            # Retry transport failures too; invalid HLS parsing should not
+            # cause a tight loop of requests to a broken endpoint.
             with self.lock:
-                if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
-                    self.consecutive_manifest_404 += 1
-                else:
-                    self.consecutive_manifest_404 = 0
-            # 404 may indicate a rotated/expired stream URL. Re-resolve it from
-            # the user's authorized playlist, but never manufacture new URLs.
-            if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+                self.manifest_failure_streak += 1
+                self.consecutive_manifest_404 = (
+                    self.consecutive_manifest_404 + 1 if code == 404 else 0
+                )
+                streak = self.manifest_failure_streak
+                if streak >= 2:
+                    delay = min(60.0, 5.0 * (2 ** min(streak - 2, 4)))
+                    self.manifest_backoff_until = time.monotonic() + delay
+            # When 404 or repeated 5xx indicates a rotated/expired HLS URL,
+            # resolve a fresh channel URL from the newly configured provider M3U.
+            # refresh_source has its own 20s cooldown.
+            if code == 404 or (code in (500, 502, 503, 504) and streak >= 2):
                 self.refresh_source()
 
     def _evict(self):
