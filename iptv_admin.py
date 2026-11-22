@@ -158,7 +158,7 @@ class AdminState:
         self.gateway_port = gateway_port
         self.gateway_token_file = gateway_token_file
         self.password = password
-        self.telemetry_db = Path(telemetry_db or ".iptv_telemetry.sqlite3")
+        self.telemetry_db = Path(telemetry_db or ".iptv_state/telemetry.sqlite3")
         self.sessions: dict[str, float] = {}
         self.failed: dict[str, list[float]] = defaultdict(list)
         self.lock = threading.Lock()
@@ -439,7 +439,7 @@ def main():
     p.add_argument("--playlist", type=Path, default=Path("forgpt.m3u8"))
     p.add_argument("--epg-file", type=Path, default=Path("epg.xml.gz"))
     p.add_argument("--token-file", type=Path, default=Path(".iptv_gateway_token"))
-    p.add_argument("--telemetry-db", type=Path, default=Path(".iptv_telemetry.sqlite3"))
+    p.add_argument("--telemetry-db", type=Path, default=Path(".iptv_state/telemetry.sqlite3"))
     p.add_argument("--password-file", type=Path, default=Path(".iptv_admin_password"))
     p.add_argument("--gateway-port", type=int, default=8787)
     p.add_argument("--port", type=int, default=8790)
