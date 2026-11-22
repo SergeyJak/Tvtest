@@ -178,6 +178,26 @@ class AdminState:
                 self._catalogue_key = key
             return [dict(c) for c in self._channels]
 
+    def tv_links(self, base_url: str = "https://tv.heysmart.lv") -> dict:
+        """Expose playback URLs only to an authenticated admin session.
+
+        The provider playlist/source URL never leaves the backend; TV token
+        remains shared only with whoever the admin explicitly gives a link to.
+        """
+        try:
+            token = self.gateway_token_file.read_text(encoding="ascii").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{12,}", token):
+                raise ValueError("Invalid TV token")
+        except (OSError, ValueError):
+            return {"available": False}
+        base = base_url.rstrip("/")
+        return {
+            "available": True,
+            "m3u": f"{base}/{token}/channels.m3u",
+            "epg": f"{base}/{token}/epg.xml.gz",
+            "automatic_epg": True,
+        }
+
     def gateway_status(self) -> dict | None:
         try:
             token = self.gateway_token_file.read_text(encoding="ascii").strip()
@@ -362,7 +382,7 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
             if path not in ("/admin/", "/admin/app.js", "/admin/style.css",
                             "/admin/api/session", "/admin/api/login",
                             "/admin/api/logout", "/admin/api/overview",
-                            "/admin/api/channels", "/admin/api/history",
+                            "/admin/api/channels", "/admin/api/tv-links", "/admin/api/history",
                             "/admin/api/incidents"):
                 return self.respond(404, b"Not found", "text/plain", head=head)
             if path in ("/admin/", "/admin/app.js", "/admin/style.css"):
@@ -422,7 +442,10 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                     return self.respond(400, b'{"error":"invalid_filter"}', head=head)
                 return self.respond(200, json.dumps(data, ensure_ascii=False,
                                                     separators=(",", ":")).encode("utf-8"), head=head)
-            if path == "/admin/api/overview":
+            if path == "/admin/api/tv-links":
+                # This route runs after the admin session check above.
+                data = state.tv_links()
+            elif path == "/admin/api/overview":
                 data = state.overview()
             elif path == "/admin/api/channels":
                 data = state.channel_response()

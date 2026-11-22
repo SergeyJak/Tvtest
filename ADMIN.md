@@ -102,3 +102,25 @@ opt-in SQLite recorder. The admin itself reads the database using the existing
 WorkingDirectory, so you only need to enable the recorder on the gateway.
 See [TELEMETRY.md](TELEMETRY.md) for a backup-safe systemd installer, the
 retention policy and how duration/freeze detection works.
+
+## TV connection links and XMLTV fallback
+
+The admin panel now includes **Подключение ТВ** with two copyable URLs:
+
+- `https://tv.heysmart.lv/<TV_TOKEN>/channels.m3u` for the IPTV playlist.
+- `https://tv.heysmart.lv/<TV_TOKEN>/epg.xml.gz` for a manual XMLTV/EPG source when a player does not import the guide automatically.
+
+The same private TV token is used by both links. The actual URLs are returned only by `/admin/api/tv-links` **after admin login**, never embedded in public HTML/JavaScript or logged. The admin API uses `Cache-Control: no-store` and `Referrer-Policy: no-referrer`.
+
+The M3U header advertises the EPG with both `x-tvg-url` and `url-tvg` for broader player compatibility. The compressed guide endpoint supports `ETag` and `Last-Modified`; compatible players may request it conditionally and receive a zero-body `304 Not Modified`. Regular requests stream gzip in small chunks rather than copying the whole ~43 MB file into process RAM. Responses use `Cache-Control: private, max-age=300, must-revalidate`; clients without conditional request support may still redownload the file.
+
+**Deployment:** after merging and pulling the PR, restart both services to load the updated Python handlers:
+
+```bash
+cd ~/Tvtest && git pull --ff-only
+python3 -m unittest discover -s tests -p 'test_epg_http_cache.py' -v
+sudo systemctl restart iptv-gateway.service iptv-admin.service
+sudo systemctl is-active iptv-gateway.service iptv-admin.service
+```
+
+This does not modify Caddy, systemd units, EPG generation, or your private playlist. Restarting the gateway briefly interrupts live TV streams. The current guide is preserved.

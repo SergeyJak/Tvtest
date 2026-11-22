@@ -11,6 +11,9 @@ import argparse
 import ipaddress
 import hashlib
 import http.client
+import os
+import stat
+from email.utils import formatdate, parsedate_to_datetime
 import json
 import os
 import re
@@ -275,7 +278,10 @@ class MultiGateway:
     def playlist(self, token: str, host: str, *, filter_names: list[str] | None = None,
                  public_base_url: str | None = None, epg_enabled: bool = False) -> bytes:
         base_url = public_base_url or f"http://{host}"
-        lines = [f'#EXTM3U x-tvg-url="{base_url}/{token}/epg.xml.gz"' if epg_enabled else "#EXTM3U"]
+        lines = [(
+            f'#EXTM3U x-tvg-url="{base_url}/{token}/epg.xml.gz" '
+            f'url-tvg="{base_url}/{token}/epg.xml.gz"'
+        ) if epg_enabled else "#EXTM3U"]
         allowed = set(filter_names) if filter_names is not None else None
         for cid in self.order:
             c = self.channels[cid]
@@ -342,6 +348,66 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
+        def serve_epg(self, head: bool):
+            """Conditional and streaming EPG delivery without reading the 43 MB
+            gzip into memory for every HEAD/GET request.
+            """
+            try:
+                with epg_file.open("rb") as source:
+                    meta = os.fstat(source.fileno())
+                    if not stat.S_ISREG(meta.st_mode) or source.read(2) != b"\x1f\x8b":
+                        return self.respond(503, b"Invalid EPG", "text/plain", head)
+                    source.seek(0)
+                    # Weak validators reflect a file version (not a content hash).
+                    etag = f'W/"{meta.st_size:x}-{meta.st_mtime_ns:x}"'
+                    modified = formatdate(meta.st_mtime, usegmt=True)
+                    headers = {
+                        "ETag": etag,
+                        "Last-Modified": modified,
+                        "Cache-Control": "private, max-age=300, must-revalidate",
+                        "X-Content-Type-Options": "nosniff",
+                        "Content-Type": "application/gzip",
+                    }
+
+                    inm = self.headers.get("If-None-Match")
+                    not_modified = False
+                    if inm is not None:
+                        # RFC 9110: If-None-Match takes precedence over
+                        # If-Modified-Since and uses weak comparison.
+                        expected = etag.removeprefix("W/")
+                        not_modified = any(
+                            value.strip().removeprefix("W/") == expected or
+                            value.strip() == "*"
+                            for value in inm.split(",")
+                        )
+                    elif self.headers.get("If-Modified-Since"):
+                        try:
+                            date = parsedate_to_datetime(self.headers["If-Modified-Since"])
+                            if date.tzinfo is not None:
+                                not_modified = (
+                                    int(meta.st_mtime) <= int(date.timestamp())
+                                )
+                        except (ValueError, TypeError, OverflowError):
+                            pass
+
+                    self.send_response(304 if not_modified else 200)
+                    for key, value in headers.items():
+                        self.send_header(key, value)
+                    if not not_modified:
+                        self.send_header("Content-Length", str(meta.st_size))
+                    self.end_headers()
+                    if not head and not not_modified:
+                        try:
+                            while True:
+                                chunk = source.read(256 * 1024)
+                                if not chunk:
+                                    break
+                                self.wfile.write(chunk)
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+            except OSError:
+                return self.respond(503, b"EPG not generated yet", "text/plain", head)
+
         def serve(self, head: bool):
             self._head = head
             path = urllib.parse.urlsplit(self.path).path
@@ -349,13 +415,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 return self.respond(404, b"Not found", "text/plain", head)
             route = path[len(prefix) + 1:].split("/")
             if route == ["epg.xml.gz"] and epg_file is not None:
-                try:
-                    body = epg_file.read_bytes()
-                    if not body.startswith(b"\x1f\x8b"):
-                        return self.respond(503, b"Invalid EPG", "text/plain", head)
-                except OSError:
-                    return self.respond(503, b"EPG not generated yet", "text/plain", head)
-                return self.respond(200, body, "application/gzip", head)
+                return self.serve_epg(head)
             if route == ["status"]:
                 return self.respond(200, manager.status(), "application/json", head)
             if route == ["channels.m3u"]:
