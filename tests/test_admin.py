@@ -1,5 +1,7 @@
 """Offline integration tests for isolated HeySmart TV admin service."""
 import gzip
+import csv
+import io
 import http.cookiejar
 import json
 import os
@@ -195,6 +197,74 @@ class AdminTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as error:
                 self.request("/admin/api/history?days=500")
             self.assertEqual(error.exception.code, 400)
+        finally:
+            store.close()
+
+    def test_export_all_incidents_requires_login_and_respects_filters(self):
+        for route in ("/admin/api/incidents/export?days=7",
+                      "/admin/api/incidents/clear"):
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request(route)
+            self.assertEqual(error.exception.code, 401)
+        store = Telemetry(self.state.telemetry_db)
+        try:
+            cid = admin.channels_from_text(PLAYLIST)[0].id
+            for index in range(230):
+                store.incident(cid, "segment_slow", "SEGMENT_DOWNLOAD_SLOW",
+                               duration_seconds=11.4, timestamp=time.time()-index)
+            store.incident(cid, "stream_stalled", "NO_DOWNLOADED_SEGMENTS")
+            store.flush()
+            self.login().close()
+            with self.request("/admin/api/incidents/export?days=7") as response:
+                content = response.read().decode("utf-8-sig")
+                self.assertIn("text/csv", response.headers["Content-Type"])
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+            rows = list(csv.DictReader(io.StringIO(content)))
+            self.assertEqual(len(rows), 231)  # no 200-row UI limit
+            self.assertIn("Россия 24 HD", rows[0]["channel"])
+            self.assertNotIn("PRIVATE_SECRET_NEVER_EXPOSE", content)
+            with self.request("/admin/api/incidents/export?days=7&kind=stream_stalled") as response:
+                stalled = list(csv.DictReader(io.StringIO(response.read().decode("utf-8-sig"))))
+            self.assertEqual(len(stalled), 1)
+            with self.assertRaises(urllib.error.HTTPError) as bad:
+                self.request("/admin/api/incidents/export?days=999")
+            self.assertEqual(bad.exception.code, 400)
+        finally:
+            store.close()
+
+    def test_clear_incidents_only_after_confirmation_preserves_viewing_history(self):
+        store = Telemetry(self.state.telemetry_db)
+        try:
+            cid = admin.channels_from_text(PLAYLIST)[0].id
+            viewer = store.viewer("192.0.2.55", "Samsung")
+            store.observe_segment(cid, viewer, time.time()-5)
+            store.observe_segment(cid, viewer, time.time())
+            store.incident(cid, "upstream_error", "MANIFEST_HTTP_404")
+            store.incident(cid, "stream_stalled", "UPSTREAM_NO_PROGRESS")
+            store.flush()
+            self.login().close()
+            url = self.url + "/admin/api/incidents/clear"
+            valid_body = json.dumps({"confirm": "DELETE_INCIDENTS"}).encode()
+            for headers, body in [
+                ({"Content-Type": "application/json"}, valid_body),
+                ({"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"},
+                 b'{"confirm":"WRONG"}'),
+            ]:
+                with self.assertRaises(urllib.error.HTTPError) as response:
+                    self.opener.open(urllib.request.Request(url, data=body, headers=headers), timeout=4)
+                self.assertIn(response.exception.code, (400, 403))
+            with self.request("/admin/api/incidents?days=7") as response:
+                self.assertEqual(json.load(response)["total"], 2)
+            req = urllib.request.Request(
+                url, data=valid_body,
+                headers={"Content-Type": "application/json",
+                         "X-Requested-With": "XMLHttpRequest"})
+            with self.opener.open(req, timeout=4) as response:
+                self.assertEqual(json.load(response)["deleted"], 2)
+            with self.request("/admin/api/incidents?days=7") as response:
+                self.assertEqual(json.load(response)["total"], 0)
+            with self.request("/admin/api/history?days=7") as response:
+                self.assertEqual(json.load(response)["total_sessions"], 1)
         finally:
             store.close()
 

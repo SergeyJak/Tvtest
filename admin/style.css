@@ -132,3 +132,12 @@ td{padding:13px 23px;border-top:1px solid #233044;color:#95a7bd;font-size:12px}t
 @media(max-width:1350px){.profiles-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:930px){.profiles-grid{grid-template-columns:1fr}.profile-source{min-height:0}}
 @media(max-width:540px){.tv-profile-card{padding:17px}.profile-url-row .tv-link-control{flex-direction:column}}
+
+/* Streaming incident log export / clear controls */
+.incident-actions{gap:14px;flex-wrap:wrap}
+.incident-action-buttons{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.danger-outline{border-color:#73505b;color:#ffb3bd;background:#2b2029}
+.danger-outline:hover{color:#ffd1d6;border-color:#b36b78}
+.small-outline:disabled{opacity:.5;cursor:wait}
+.incident-action-status{font-size:12px;min-height:18px;color:var(--accent);margin:13px 3px 0}
+@media(max-width:740px){.incident-action-buttons{width:100%}.incident-action-buttons button{flex:1;white-space:nowrap}.incident-actions{align-items:flex-start}}

@@ -143,6 +143,86 @@ class GatewayTests(unittest.TestCase):
         self.assertNotIn('secret', json.dumps(status))
         self.assertEqual(status['last_upstream_failure'], 'MANIFEST_INVALID_HLS')
 
+    def test_manifest_404_is_backed_off_and_refreshes_provider_playlist(self):
+        secret = "https://provider.example/hidden/SECRET"
+        failure = urllib.error.HTTPError(secret, 404, "gone", None, None)
+        gw = g.Gateway(secret, poll=2, source_refresher=lambda: secret)
+        clock = [100.0]
+        with patch.object(g, "media_manifest", side_effect=failure) as fetch, \
+             patch.object(g.time, "monotonic", side_effect=lambda: clock[0]):
+            gw.cycle()
+            clock[0] = 101.0
+            gw.cycle()
+            clock[0] = 102.0
+            gw.cycle()  # no new HTTP request during backoff
+            clock[0] = 107.0
+            gw.cycle()
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual(gw.manifest_failure_streak, 3)
+        self.assertEqual(gw.consecutive_manifest_404, 3)
+        self.assertEqual(gw.source_refresh_attempts, 1)
+        self.assertNotIn("SECRET", json.dumps(json.loads(gw.status())))
+
+    def test_new_source_url_invalidates_overlapping_old_video_cache(self):
+        old_url = "https://source.example/old/SECRET"
+        new_url = "https://source.example/new/SECRET"
+        gw = g.Gateway(old_url, source_refresher=lambda: new_url, delay=30)
+        gw.cache[55] = (6, b"old-video")
+        gw.total_bytes = len(b"old-video")
+        gw.latest = 55
+        gw.last_published_seq = 55
+        manifest = ('#EXTM3U\n#EXT-X-TARGETDURATION:6\n'
+                    '#EXT-X-MEDIA-SEQUENCE:55\n'
+                    '#EXTINF:6,\n55.ts\n')
+        failure = urllib.error.HTTPError(old_url, 404, "expired", None, None)
+        with patch.object(g, "media_manifest", side_effect=[
+            failure, (manifest, new_url)]), \
+             patch.object(g, "fetch_segment", return_value=b"fresh-video") as download:
+            gw.cycle()
+            self.assertEqual(gw.segment(55), b"old-video")
+            self.assertEqual(gw._url, new_url)
+            gw.cycle()
+        self.assertEqual(download.call_count, 1)
+        self.assertEqual(gw.segment(55), b"fresh-video")
+        self.assertIsNone(gw.last_published_seq)
+        self.assertEqual(gw.source_changes, 1)
+        self.assertEqual(gw.manifest_failure_streak, 0)
+
+    def test_consecutive_manifest_502_rotates_source_and_resets_backoff(self):
+        old = "https://source.example/old"
+        new = "https://source.example/new"
+        gw = g.Gateway(old, source_refresher=lambda: new)
+        failure = urllib.error.HTTPError(old, 502, "bad gateway", None, None)
+        with patch.object(g, "media_manifest", side_effect=failure):
+            gw.cycle()
+            gw.cycle()
+        self.assertEqual(gw.source_changes, 1)
+        self.assertEqual(gw._url, new)
+        self.assertEqual(gw.manifest_failure_streak, 0)
+        self.assertEqual(gw.manifest_backoff_until, 0)
+
+    def test_repeated_segment_502_refreshes_source_and_resumes(self):
+        old = "https://provider.example/old-secret/stream.m3u8"
+        new = "https://provider.example/new-secret/stream.m3u8"
+        gw = g.Gateway(old, source_refresher=lambda: new, delay=30)
+        manifest = ('#EXTM3U\n#EXT-X-TARGETDURATION:6\n'
+                    '#EXT-X-MEDIA-SEQUENCE:10\n'
+                    '#EXTINF:6,\n10.ts\n#EXTINF:6,\n11.ts\n'
+                    '#EXTINF:6,\n12.ts\n')
+        failure = urllib.error.HTTPError(old, 502, "bad gateway", None, None)
+        with patch.object(g, "media_manifest", side_effect=[
+            (manifest, old), (manifest, new) ]), \
+             patch.object(g, "fetch_segment", side_effect=[
+                 failure, failure, b"new10", b"new11", b"new12"]) as download:
+            gw.cycle()
+            self.assertEqual(gw._url, new)
+            self.assertEqual(gw.source_changes, 1)
+            gw.cycle()
+        self.assertEqual(download.call_count, 5)
+        self.assertEqual(gw.segment(10), b"new10")
+        self.assertEqual(gw.segment_failure_streak, 0)
+        self.assertNotIn("secret", json.dumps(json.loads(gw.status())))
+
     def test_safe_errors_do_not_expose_access_key(self):
         error = urllib.error.URLError('http://secret.example/key/ABCDEF')
         self.assertEqual(g.safe_error(error), 'NETWORK_ERROR')

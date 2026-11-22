@@ -68,3 +68,39 @@ sudo journalctl -u iptv-gateway.service -n 30 --no-pager
 Do **not** paste full ExecStart lines or file contents: they may contain stream keys.
 
 Future enhancement: TV-player heartbeat support would allow exact on-screen watching duration; this release intentionally uses honest estimates based on HTTP activity.
+## Export and clear the error journal
+
+In **Ошибки и зависания**, use **Экспорт CSV** to download all matching
+events for the selected 24-hour, 7-day or 30-day period and selected event
+type, not just the 200 events shown in the table. The CSV contains UTC
+timestamps, channel names/IDs, event type, sanitized reason and duration;
+private provider URLs and TV access tokens are excluded. Excel/Sheets formula
+injection from untrusted channel names is escaped.
+
+**Очистить журнал** shows a destructive confirmation dialog, then deletes
+*all stored incidents* (not only the selected period) from the on-VPS SQLite
+database. It does not delete watch history, reset tokens or stop the collector.
+New issues will start appearing immediately. The endpoint requires an
+authenticated admin session, a confirmation phrase and a same-origin custom
+request header. Export before deleting if you need the evidence.
+
+## Resilient upstream recovery
+
+Repeated HLS manifest failures now use capped exponential backoff (5, 10,
+20, 40, 60 seconds after successive failures) rather than hammering a
+provider every two seconds. The gateway re-resolves the stream URL from the
+configured provider M3U on 404, or on repeated 500/502/503/504. Repeated
+segment 404/5xx errors also trigger source refresh instead of exhausting
+the entire stale segment window. After a changed HLS URL yields valid
+media metadata, the old segment cache is invalidated to avoid mixing
+two streams that reuse sequence numbers.
+
+These changes reduce provider request storms and improve recovery from
+rotated URLs. They cannot fix sustained source bandwidth/latency problems:
+if fresh provider segments arrive slower than their encoded play time,
+the stream may still buffer. New incidents will show whether 404/502
+frequency and stalls drop after deployment.
+
+Deploy after merging: pull latest changes and restart
+`iptv-gateway.service` and `iptv-admin.service`. It is not necessary to
+reinstall Caddy or reconfigure the remote M3U URL you've already saved.
