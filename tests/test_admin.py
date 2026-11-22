@@ -125,6 +125,77 @@ class AdminTests(unittest.TestCase):
         self.assertNotIn("SECRET_TOKEN", json.dumps(channels))
         self.assertEqual([c["group"] for c in channels], ["News", "Movies"])
 
+    def test_vps_and_iptv_metrics_require_admin_login_and_never_leak_private_urls(self):
+        sample = {
+            "vps": {"cpu_percent": 42.0, "cores": 2, "load_1m": 0.7,
+                    "memory": {"percent": 52.0, "used_bytes": 520, "total_bytes": 1000},
+                    "disk": {"percent": 33.0, "used_bytes": 330, "total_bytes": 1000},
+                    "rx_bytes_per_second": 1200, "tx_bytes_per_second": 3500},
+            "service": {
+                "gateway": {"cpu_percent": 15.5, "rss_bytes": 456789},
+                "admin": {"cpu_percent": 1.0, "rss_bytes": 123456}}
+        }
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            self.request("/admin/api/overview")
+        self.assertEqual(denied.exception.code, 401)
+        with patch.object(self.state.resource_sampler, "snapshot", return_value=sample):
+            self.login().close()
+            with self.request("/admin/api/overview") as response:
+                body = response.read().decode()
+                data = json.loads(body)
+        self.assertEqual(data["resources"]["vps"]["cpu_percent"], 42.0)
+        self.assertEqual(data["resources"]["service"]["gateway"]["rss_bytes"], 456789)
+        self.assertEqual(data["cached_mib"], 72.0)
+        self.assertEqual(data["stalled_streams"], 0)
+        self.assertNotIn("PRIVATE_SECRET_NEVER_EXPOSE", body)
+        self.assertNotIn("SECRET_TOKEN", body)
+        with self.request("/admin/") as response:
+            html = response.read().decode()
+        self.assertIn('id="vps-cpu"', html)
+        self.assertIn('id="service-cpu"', html)
+        self.assertIn('id="service-cabins"', html)
+
+    def test_gateway_status_aggregates_first_and_second_remote_cabinet(self):
+        first_token = self.state.profiles.get(1)["token"]
+        second_playlist = PLAYLIST.replace("Россия 24 HD", "Родительский")
+        with patch("iptv_profiles.download_playlist", return_value=second_playlist):
+            second, changed = self.state.profiles.update(
+                2, "Родители", "https://provider.example/M3U_SECRET")
+        self.assertTrue(changed)
+        token_status = {
+            first_token: {
+                "channels": 2, "max_streams": 3, "delay_seconds": 60,
+                "active_streams": 1, "catalog_requests": 5,
+                "streams": [{"id": "channel-1", "channel": "Теория",
+                             "ready": True, "cached_mib": 25}]},
+            second["token"]: {
+                "channels": 2, "max_streams": 1, "delay_seconds": 60,
+                "active_streams": 1, "catalog_requests": 1,
+                "streams": [{"id": "channel-2", "channel": "Детский",
+                             "ready": True, "cached_mib": 15}]},
+        }
+        class Response(io.BytesIO):
+            status = 200
+
+        def mocked_open(url, timeout):
+            token = url.split("/")[3]
+            self.assertEqual(timeout, 1.5)
+            self.assertIn(token, token_status)
+            return Response(json.dumps(token_status[token]).encode())
+
+        with patch("iptv_admin.urllib.request.urlopen", side_effect=mocked_open):
+            result = admin.AdminState.gateway_status(self.state)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["active_streams"], 2)
+        self.assertEqual(result["max_streams"], 4)
+        self.assertEqual(result["catalog_requests"], 6)
+        self.assertEqual([row["profile_name"] for row in result["streams"]],
+                         ["Мой ТВ", "Родители"])
+        self.assertEqual(len(result["cabins"]), 2)
+        self.assertNotIn("M3U_SECRET", json.dumps(result))
+        self.assertNotIn(first_token, json.dumps(result))
+        self.assertNotIn(second["token"], json.dumps(result))
+
     def test_tv_links_are_available_only_to_logged_in_admin(self):
         token = "private-playlist-token-for-test"
         self.state.gateway_token_file.write_text(token, encoding="ascii")
