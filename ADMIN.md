@@ -95,3 +95,10 @@ Version 1 intentionally has no start/stop/restart buttons, user management
 or channel editing. Those features require separate role checks and audit logs.
 
 Do not proxy `/admin/` over plain HTTP, and never bind port 8790 publicly.
+## Viewing history and incident journal
+
+The **Просмотры** and **Ошибки и зависания** pages need the gateway's
+opt-in SQLite recorder. The admin itself reads the database using the existing
+WorkingDirectory, so you only need to enable the recorder on the gateway.
+See [TELEMETRY.md](TELEMETRY.md) for a backup-safe systemd installer, the
+retention policy and how duration/freeze detection works.
