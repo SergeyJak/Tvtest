@@ -190,9 +190,17 @@
           <article class="panel table-panel">
             <div class="incident-table-top"><div><div class="eyebrow">EVENT LOG</div><h2>Журнал инцидентов</h2></div><span id="incident-total" class="count-chip">—</span></div>
             <div class="table-scroll"><table><thead><tr><th>Когда</th><th>Канал</th><th>Событие</th><th>Детали</th><th>Длительность</th></tr></thead><tbody id="incident-table"><tr><td colspan="5">Загрузка событий…</td></tr></tbody></table></div>
-            <div class="table-footer"><span>Показано до 200 последних событий за период</span><button id="incident-refresh" class="small-outline" type="button">Обновить журнал ↻</button></div>
+            <div class="table-footer incident-actions">
+              <span>Показано до 200 последних событий за период</span>
+              <div class="incident-action-buttons">
+                <button id="incident-export" class="small-outline" type="button">Экспорт CSV <span aria-hidden="true">↓</span></button>
+                <button id="incident-clear" class="small-outline danger-outline" type="button">Очистить журнал</button>
+                <button id="incident-refresh" class="small-outline" type="button">Обновить журнал ↻</button>
+              </div>
+            </div>
           </article>
-          <p class="section-footnote">События фиксируются с момента включения сбора на VPS. Секретные адреса потоков и IP зрителей в журнал не записываются.</p>
+          <p id="incident-action-status" class="incident-action-status" role="status" aria-live="polite"></p>
+          <p class="section-footnote">Экспорт включает все записи за выбранный период, не только 200 строк на экране. Очистка удаляет только журнал ошибок за всё время; история просмотров сохраняется. Новые события продолжат записываться.</p>
         </section>
 
         <section class="view" id="view-system" hidden>
