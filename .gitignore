@@ -18,3 +18,6 @@ __pycache__/
 # Generated or private guide files and channel alias overrides
 *.xml.gz
 epg-aliases.json
+
+# Private admin credential (never commit)
+.iptv_admin_password

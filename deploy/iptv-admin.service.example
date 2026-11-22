@@ -1,0 +1,20 @@
+[Unit]
+Description=HeySmart TV Admin Dashboard (read-only)
+After=network-online.target iptv-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=client_911_1
+Group=client_911_1
+WorkingDirectory=/home/client_911_1/Tvtest
+ExecStart=/usr/bin/python3 -u /home/client_911_1/Tvtest/iptv_admin.py --playlist /home/client_911_1/Tvtest/forgpt.m3u8 --epg-file /home/client_911_1/Tvtest/epg.xml.gz --token-file /home/client_911_1/Tvtest/.iptv_gateway_token --password-file /home/client_911_1/Tvtest/.iptv_admin_password --gateway-port 8787 --port 8790
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>HeySmart TV · Администрирование</title>
+  <link rel="stylesheet" href="/admin/style.css">
+  <script src="/admin/app.js" defer></script>
+</head>
+<body>
+  <section class="auth-screen" id="login-screen" hidden>
+    <div class="auth-glow"></div>
+    <form class="auth-card" id="login-form">
+      <div class="brandmark brandmark-large">H<span>·</span></div>
+      <span class="eyebrow">HEYSMART / CONTROL CENTER</span>
+      <h1>Телевидение под контролем</h1>
+      <p>Панель управления вашим IPTV-сервером. Для входа нужен отдельный пароль администратора.</p>
+      <label for="password">Пароль администратора</label>
+      <input id="password" type="password" required autocomplete="current-password" placeholder="Введите пароль" minlength="24">
+      <button class="primary-btn" type="submit" id="login-button">Войти в панель <span aria-hidden="true">↗</span></button>
+      <div class="form-message" id="login-error" role="alert"></div>
+      <div class="auth-footer">Доступ к трансляциям и пароль администратора разделены</div>
+    </form>
+  </section>
+
+  <div class="layout" id="app" hidden>
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brandmark">H<span>·</span></div>
+        <div><strong>HeySmart TV</strong><small>CONTROL CENTER</small></div>
+      </div>
+      <div class="side-label">РАБОЧЕЕ ПРОСТРАНСТВО</div>
+      <nav class="side-nav" aria-label="Навигация">
+        <button type="button" class="nav-button active" data-target="overview"><span class="nav-icon">◈</span> Обзор</button>
+        <button type="button" class="nav-button" data-target="channels"><span class="nav-icon">▤</span> Каналы</button>
+        <button type="button" class="nav-button" data-target="epg"><span class="nav-icon">▦</span> Телепрограмма</button>
+        <button type="button" class="nav-button" data-target="system"><span class="nav-icon">⌘</span> Диагностика</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="side-server"><span class="live-dot" id="side-dot"></span><div><strong id="side-state">Проверка соединения</strong><small>tv.heysmart.lv</small></div></div>
+        <button type="button" class="logout" id="logout-button">Выйти <span>↗</span></button>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div class="breadcrumbs">HEYSMART <span>/</span> TV <span>/</span> <strong id="crumb">ОБЗОР</strong></div>
+        <div class="top-actions">
+          <span class="updated" id="last-updated">Получаем данные…</span>
+          <button class="icon-button" type="button" id="refresh-button" title="Обновить показатели" aria-label="Обновить показатели">↻</button>
+          <span class="avatar" title="Администратор">S</span>
+        </div>
+      </header>
+
+      <div class="content">
+        <section class="view" id="view-overview">
+          <div class="view-heading"><div><div class="eyebrow">СИСТЕМА МОНИТОРИНГА</div><h1>Обзор сервера<span class="accent">.</span></h1><p>Работа IPTV, подключённые трансляции и состояние телепрограммы.</p></div><span class="status-pill" id="overall-status">Проверка…</span></div>
+
+          <div class="metrics">
+            <article class="metric"><div class="metric-top">Каналы <span>▤</span></div><div class="metric-number" id="metric-channels">—</div><div class="metric-caption">В текущем плейлисте</div></article>
+            <article class="metric"><div class="metric-top">Активные потоки <span>◉</span></div><div class="metric-number"><span id="metric-streams">—</span><span class="metric-suffix" id="metric-capacity"></span></div><div class="metric-caption">Трансляции в работе</div></article>
+            <article class="metric"><div class="metric-top">EPG покрытие <span>▦</span></div><div class="metric-number" id="metric-coverage">—</div><div class="metric-caption" id="metric-coverage-sub">Получаем телепрограмму</div></article>
+            <article class="metric"><div class="metric-top">Телепрограмма <span>≋</span></div><div class="metric-number" id="metric-programmes">—</div><div class="metric-caption">Передач в XMLTV</div></article>
+          </div>
+
+          <div class="dashboard-grid">
+            <article class="panel panel-main">
+              <div class="panel-heading"><div><div class="eyebrow">LIVE MONITOR</div><h2>Активные трансляции</h2></div><span class="live-label"><span class="live-dot"></span> LIVE</span></div>
+              <div id="streams-list" class="streams-list"><div class="empty-state">Загрузка трансляций…</div></div>
+            </article>
+            <article class="panel coverage-panel">
+              <div class="panel-heading"><div><div class="eyebrow">PROGRAM GUIDE</div><h2>Покрытие EPG</h2></div></div>
+              <div class="coverage-circle" id="coverage-circle"><div class="coverage-inner"><strong id="coverage-percent">—</strong><small>КАНАЛОВ</small></div></div>
+              <div class="legend"><div><span class="legend-dot good"></span> С телепрограммой <strong id="legend-covered">—</strong></div><div><span class="legend-dot muted"></span> Без телепрограммы <strong id="legend-missing">—</strong></div></div>
+              <button type="button" class="text-link" data-go="epg">Подробнее о покрытии <span>↗</span></button>
+            </article>
+          </div>
+
+          <div class="secondary-grid">
+            <article class="panel compact-panel"><div class="panel-heading"><div><div class="eyebrow">GATEWAY</div><h2>Состояние шлюза</h2></div></div><div class="line-stat"><span>Видеосервер</span><strong id="status-gateway">—</strong></div><div class="line-stat"><span>Максимум потоков</span><strong id="status-limit">—</strong></div><div class="line-stat"><span>Буферизация</span><strong id="status-delay">—</strong></div></article>
+            <article class="panel compact-panel"><div class="panel-heading"><div><div class="eyebrow">EPG FILE</div><h2>Обновление программы</h2></div></div><div class="line-stat"><span>Последняя сборка</span><strong id="status-epg-date">—</strong></div><div class="line-stat"><span>Размер XMLTV</span><strong id="status-epg-size">—</strong></div><div class="line-stat"><span>Обработка</span><strong id="status-epg-state">—</strong></div></article>
+          </div>
+        </section>
+
+        <section class="view" id="view-channels" hidden>
+          <div class="view-heading"><div><div class="eyebrow">CHANNEL DIRECTORY</div><h1>Все каналы<span class="accent">.</span></h1><p>Поиск, категории и наличие программы передач.</p></div><span class="count-chip" id="channels-total">— каналов</span></div>
+          <article class="panel table-panel">
+            <div class="filters">
+              <div class="search-wrap"><span aria-hidden="true">⌕</span><input id="channel-search" type="search" placeholder="Найти канал по названию" aria-label="Поиск канала"></div>
+              <select id="channel-group" aria-label="Группа каналов"><option value="">Все категории</option></select>
+              <select id="channel-filter" aria-label="Фильтр программы"><option value="all">Все каналы</option><option value="epg">С EPG</option><option value="missing">Без EPG</option><option value="active">Активные</option></select>
+            </div>
+            <div class="table-scroll"><table><thead><tr><th>Канал</th><th>Категория</th><th>Телепрограмма</th><th>Трансляция</th></tr></thead><tbody id="channels-table"></tbody></table></div>
+            <div class="table-footer"><span id="table-count">—</span><div class="pager"><button id="prev-page" type="button">← Назад</button><span id="page-info">1 / 1</span><button id="next-page" type="button">Вперёд →</button></div></div>
+          </article>
+        </section>
+
+        <section class="view" id="view-epg" hidden>
+          <div class="view-heading"><div><div class="eyebrow">ELECTRONIC PROGRAM GUIDE</div><h1>Телепрограмма<span class="accent">.</span></h1><p>Покрытие каталога и актуальность данных XMLTV.</p></div><span class="status-pill" id="epg-badge">Проверка…</span></div>
+          <div class="epg-layout">
+            <article class="panel epg-hero"><div class="eyebrow">COVERAGE</div><div class="epg-big" id="epg-big">—</div><p>Каналов с реальной программой передач</p><div class="coverage-bar"><div id="epg-progress"></div></div><div class="epg-numbers"><span id="epg-covered-total">— с EPG</span><span id="epg-uncovered-total">— без EPG</span></div></article>
+            <article class="panel compact-panel"><div class="eyebrow">SOURCE DETAILS</div><h2>Файл программы</h2><div class="line-stat"><span>Формат</span><strong>XMLTV · GZIP</strong></div><div class="line-stat"><span>Размер</span><strong id="epg-file-size">—</strong></div><div class="line-stat"><span>Передач</span><strong id="epg-programmes">—</strong></div><div class="line-stat"><span>Обновлён</span><strong id="epg-updated">—</strong></div><p class="note">EPG доступен телевизорам через защищённую ссылку в плейлисте.</p></article>
+          </div>
+          <article class="panel panel-groups"><div class="panel-heading"><div><div class="eyebrow">BREAKDOWN</div><h2>Покрытие по категориям</h2></div></div><div id="group-coverage" class="group-coverage"><div class="empty-state">Загрузка…</div></div></article>
+        </section>
+
+        <section class="view" id="view-system" hidden>
+          <div class="view-heading"><div><div class="eyebrow">SYSTEM HEALTH</div><h1>Диагностика<span class="accent">.</span></h1><p>Ключевые показатели сервера без доступа к приватным ссылкам IPTV.</p></div><span class="status-pill" id="system-badge">Проверка…</span></div>
+          <div class="secondary-grid">
+            <article class="panel compact-panel"><div class="panel-heading"><div><div class="eyebrow">STREAMING</div><h2>Буфер и подключения</h2></div></div><div class="line-stat"><span>Лимит трансляций</span><strong id="sys-capacity">—</strong></div><div class="line-stat"><span>Буфер HLS</span><strong id="sys-delay">—</strong></div><div class="line-stat"><span>Отказы по лимиту</span><strong id="sys-denials">—</strong></div><div class="line-stat"><span>Таймауты старта</span><strong id="sys-timeouts">—</strong></div></article>
+            <article class="panel compact-panel"><div class="panel-heading"><div><div class="eyebrow">SERVER</div><h2>Состояние</h2></div></div><div class="line-stat"><span>Шлюз</span><strong id="sys-online">—</strong></div><div class="line-stat"><span>Запросы каталога</span><strong id="sys-catalog">—</strong></div><div class="line-stat"><span>Время работы панели</span><strong id="sys-uptime">—</strong></div><div class="line-stat"><span>Версия панели</span><strong>1.0</strong></div></article>
+          </div>
+          <article class="panel"><div class="panel-heading"><div><div class="eyebrow">SECURITY</div><h2>Доступ и защита</h2></div></div><p class="security-copy">Админка работает отдельным сервисом. Пароль администратора не совпадает с токеном IPTV, а исходные адреса потоков не отправляются браузеру. Управляющие действия отключены в первой версии, чтобы исключить случайную остановку просмотра.</p></article>
+        </section>
+        <footer class="footer">HeySmart TV <span>●</span> Private infrastructure monitor <span id="footer-time"></span></footer>
+      </div>
+    </main>
+  </div>
+</body>
+</html>
