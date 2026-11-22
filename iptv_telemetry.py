@@ -149,6 +149,46 @@ def query_incidents(path: Path, days: int = 7, kind: str = "all") -> dict:
         return empty
 
 
+def export_incident_rows(path: Path, days: int = 7, kind: str = "all"):
+    """Iterate all matching incidents, not only 200 shown in the admin UI."""
+    if days not in (1, 7, 30) or (kind != "all" and kind not in KINDS):
+        raise ValueError("Unsupported incident filter")
+    if not path.is_file():
+        return
+    cutoff = int(time.time()) - days * 86400
+    where = "WHERE occurred_at >= ?"
+    params: list = [cutoff]
+    if kind != "all":
+        where += " AND kind = ?"
+        params.append(kind)
+    try:
+        with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True, timeout=5) as db:
+            db.row_factory = sqlite3.Row
+            for row in db.execute(
+                f"""SELECT occurred_at,channel_id,kind,detail,duration_seconds
+                    FROM incidents {where} ORDER BY occurred_at DESC, id DESC""", params
+            ):
+                yield dict(row)
+    except sqlite3.Error as exc:
+        raise OSError("Incident database unavailable") from None
+
+
+def clear_incidents(path: Path) -> int:
+    """Delete stored incidents only. Viewing sessions and privacy salt stay."""
+    if not path.is_file():
+        return 0
+    try:
+        with sqlite3.connect(path, timeout=5) as db:
+            db.execute("PRAGMA busy_timeout=5000")
+            db.execute("BEGIN IMMEDIATE")
+            count = db.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
+            db.execute("DELETE FROM incidents")
+            db.commit()
+            return count
+    except sqlite3.Error:
+        raise OSError("Incident database unavailable") from None
+
+
 class Telemetry:
     def __init__(self, path: Path):
         self.path = Path(path)
