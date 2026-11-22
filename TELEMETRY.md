@@ -9,7 +9,7 @@ Two new admin pages:
 
 These figures **do not prove a television was displaying video**. The gateway records successful HLS segment GET/206 requests (never playlist, HEAD or admin requests) and estimates elapsed wall-clock time between consecutive segment requests for the same anonymized client/channel. Very fast segment bursts do not add minutes. Each credited gap is capped at 30 seconds; gaps over 90 seconds start a new viewing session. Multiple viewers may add concurrent viewing time. A client identity is derived from a salted one-way hash of the client IP and User-Agent; no raw IP, UA, private source URLs or subscription tokens are stored.
 
-Stalls mean the upstream HLS sequence failed to advance beyond max(15 seconds, 3 target-segment durations). Stalls are reported once per stalled period, and a recovery event includes the total apparent outage. This is a source-side signal and **not proof of visible TV freezing**. Segments that download more slowly than their advertised duration are separately logged. HTTP 404 cache misses, streaming capacity errors and startup warmup timeouts are logged as client failures.
+Stalls mean upstream HLS sequences stopped advancing, or no new video segments were downloaded, beyond max(15 seconds, 3 target-segment durations). Stalls are reported once per stalled period, and a recovery event includes the total apparent outage. This is a source-side signal and **not proof of visible TV freezing**. Segments that download more slowly than their advertised duration are separately logged. HTTP 404 cache misses, streaming capacity errors and startup warmup timeouts are logged as client failures.
 
 History begins only once recording is enabled on the gateway. No historic data can be recovered from the previous in-memory status.
 
@@ -37,7 +37,7 @@ sudo python3 deploy/enable_telemetry.py
 The installer backs up the selected unit file to `.bak-telemetry`, keeps the existing EPG flag and playlist settings, verifies the effective ExecStart and rolls back automatically if validation/restart fails. It adds:
 
 ```text
---telemetry-db /home/client_911_1/Tvtest/ .iptv_state/telemetry.sqlite3
+--telemetry-db /home/client_911_1/Tvtest/.iptv_state/telemetry.sqlite3
 ```
 
 The existing `iptv-admin.service` discovers the same SQLite database by default because both services use the same WorkingDirectory. Restart it to load the new pages:
