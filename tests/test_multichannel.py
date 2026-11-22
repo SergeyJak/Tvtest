@@ -289,6 +289,31 @@ class MultiChannelTests(unittest.TestCase):
         other = self.manager.start(self.channels[1].id).gateway
         self.assertEqual(other.startup_reserve, 15)
 
+    def test_required_reserve_survives_deadline_and_source_rotation(self):
+        self.manager.require_startup_reserve = True
+        self.manager.delay = self.manager.startup_reserve = 30
+        cid = self.channels[0].id
+        path = f"/channel/{cid}/index.m3u8"
+        with patch.object(time, "monotonic", return_value=100.0) as clock:
+            gw = self.manager.start(cid).gateway
+            for rotation in (False, True):
+                if rotation:
+                    with patch.object(gw, "source_refresher", return_value="https://new.example/live"):
+                        self.assertTrue(gw.refresh_source())
+                manifest = "#EXTM3U\n" + "".join(f"#EXTINF:6,\n{i}.ts\n" for i in range(3))
+                with patch("iptv_gateway.media_manifest", return_value=(manifest, gw._url)), \
+                     patch("iptv_gateway.fetch_segment", return_value=b"video"):
+                    gw.cycle()
+                clock.return_value += 10
+                with self.assertRaises(urllib.error.HTTPError) as warming:
+                    self.request(path)
+                self.assertEqual(warming.exception.code, 503)
+                for i in range(3, 8):
+                    gw.cache[i] = (6, b"video")
+                gw.latest = 7
+                self.assertEqual(self.request(path)[0], 200)
+                self.assertEqual(json.loads(gw.status())["effective_buffer_delay_seconds"], 30)
+
     def test_client_segment_misses_show_cache_bounds_at_request_time(self):
         cid = self.channels[0].id
         gw = self.manager.start(cid).gateway

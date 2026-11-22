@@ -107,7 +107,7 @@ class MultiGateway:
                  max_streams: int = 3, idle_seconds: float = 90,
                  startup_wait: float = 18, switch_grace: float = 20,
                  startup_reserve: float = 30, telemetry: Telemetry | None = None,
-                 profile_slot: int = 1):
+                 profile_slot: int = 1, require_startup_reserve: bool = False):
         self.telemetry = telemetry
         self.profile_slot = profile_slot
         self.channels = {c.id: c for c in channels}
@@ -123,6 +123,7 @@ class MultiGateway:
         self.idle_seconds = idle_seconds
         self.startup_wait = startup_wait
         self.startup_reserve = min(startup_reserve, delay)
+        self.require_startup_reserve = require_startup_reserve
         self.switch_grace = switch_grace
         self.warmup_successes = 0
         self.warmup_timeouts = 0
@@ -158,6 +159,7 @@ class MultiGateway:
                           source_refresher=refresh,
                           startup_reserve=None if pinned else self.startup_reserve,
                           fast_start=not pinned,
+                          require_startup_reserve=self.require_startup_reserve,
                           on_event=(lambda kind, detail, duration: self.telemetry.incident(
                               self.telemetry_channel_id(channel.id), kind, detail, duration)) if self.telemetry else None)
         return ActiveStream(channel, gateway, self.upstream_slots, pinned)
@@ -575,10 +577,13 @@ def main(argv=None):
                    help="Per-active-channel cache limit in MiB")
     p.add_argument("--max-streams", type=int, default=3)
     p.add_argument("--idle-seconds", type=float, default=90)
-    p.add_argument("--startup-wait", type=float, default=18,
-                   help="Hold a cold channel's first manifest request up to N seconds")
+    p.add_argument("--startup-wait", type=float,
+                   help="Hold a cold channel's first manifest request up to N seconds "
+                        "(default 18s, plus the startup reserve when required)")
     p.add_argument("--startup-reserve", type=float, default=30,
-                   help="Preferred extra cached video during the first 3 seconds of a cold start (default 30s, capped at --delay)")
+                   help="Extra cached video requested at startup (default 30s, capped at --delay)")
+    p.add_argument("--require-startup-reserve", action="store_true",
+                   help="Wait for the startup reserve even after the 3-second fast-start deadline")
     p.add_argument("--switch-grace", type=float, default=20,
                    help="At stream limit, reclaim non-pinned channels idle for N seconds")
     p.add_argument("--prewarm", action="append", default=[],
@@ -594,9 +599,13 @@ def main(argv=None):
     p.add_argument("--profiles-dir", type=Path, default=Path(".iptv_profiles"),
                    help="Owner-only persisted three-TV-profile configuration")
     args = p.parse_args(argv)
+    if args.startup_wait is None:
+        args.startup_wait = 18
+        if args.require_startup_reserve:
+            args.startup_wait += min(args.startup_reserve, args.delay)
     if not (15 <= args.delay <= 120 and args.poll > 0 and args.timeout > 0
             and 32 <= args.cache_mib <= 2048 and 1 <= args.max_streams <= 8
-            and args.idle_seconds >= 15 and 0 <= args.startup_wait <= 60
+            and args.idle_seconds >= 15 and 0 <= args.startup_wait <= 180
             and 0 < args.startup_reserve <= 120
             and 10 <= args.switch_grace <= args.idle_seconds
             and 1 <= args.port <= 65535):
@@ -636,7 +645,7 @@ def main(argv=None):
                            args.timeout, args.poll, args.cache_mib,
                            args.max_streams, args.idle_seconds,
                            args.startup_wait, args.switch_grace, args.startup_reserve,
-                           telemetry=telemetry)
+                           telemetry=telemetry, require_startup_reserve=args.require_startup_reserve)
     try:
         token = load_or_create_token(args.token_file)
     except (OSError, UnicodeError, ValueError):
@@ -664,7 +673,7 @@ def main(argv=None):
              cache_mib=args.cache_mib, max_streams=args.max_streams,
              idle_seconds=args.idle_seconds, startup_wait=args.startup_wait,
              switch_grace=args.switch_grace, startup_reserve=args.startup_reserve,
-             telemetry=telemetry))
+             telemetry=telemetry, require_startup_reserve=args.require_startup_reserve))
     server = ThreadingHTTPServer((args.host, args.port),
                                  make_multi_handler(manager, token, public_base_url,
                                                     args.epg_file, profile_registry))

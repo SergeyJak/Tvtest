@@ -421,6 +421,16 @@ use `--delay 90 --startup-reserve 30`. During playback,
 `effective_buffer_delay_seconds` in `/status` shows the duration of
 uninterrupted cached video available beyond the playable window.
 
+By default an on-demand channel may start after three seconds with three
+segments. For a connection that slows down in the evening, add
+`--require-startup-reserve` to wait until the configured reserve is available.
+For example, `--delay 90 --startup-reserve 30 --require-startup-reserve`
+waits for 30 seconds of video beyond the initial three segments. Set both
+values to 90 to require 90 seconds. This also applies after a source URL
+rotation. The first manifest request waits up to 18 seconds plus the reserve
+in this mode. Set `--startup-wait` to override that HTTP wait. The player's
+own timeout can be shorter, especially with a large reserve.
+
 ## Security
 
 Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions or channel source links. The experimental gateway serves only on localhost by default; LAN exposure requires explicit --host 0.0.0.0 and a random access token.
