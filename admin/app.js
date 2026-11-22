@@ -440,6 +440,58 @@
     upstream_error:["Ошибка источника", "danger"], client_error:["Ошибка клиента", "warning"],
     startup_timeout:["Таймаут запуска", "warning"], segment_slow:["Медленный сегмент", "warning"]
   };
+  async function exportIncidents() {
+    const button = $("incident-export");
+    const days = $("incident-days").value;
+    const kind = $("incident-filter").value;
+    button.disabled = true;
+    text("incident-action-status", "Подготавливаем CSV…");
+    try {
+      const path = "incidents/export?days=" + encodeURIComponent(days) +
+                   "&kind=" + encodeURIComponent(kind);
+      const response = await fetch("/admin/api/" + path,
+                                   {credentials:"same-origin", cache:"no-store"});
+      if (response.status === 401) { showLogin(); return; }
+      if (!response.ok) throw new Error("export_failed");
+      const blob = await response.blob();
+      const link = document.createElement("a");
+      const downloadUrl = URL.createObjectURL(blob);
+      link.href = downloadUrl;
+      link.download = "tv-incidents-" + days + "d-" + kind + ".csv";
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+      text("incident-action-status", "CSV экспортирован. Можно сохранить его перед очисткой журнала.");
+    } catch (_error) {
+      text("incident-action-status", "Не удалось экспортировать журнал. Повтори попытку.");
+    } finally {
+      button.disabled = false;
+    }
+  }
+  async function clearIncidents() {
+    const confirmText = "Удалить ВСЕ накопленные ошибки и зависания без возможности восстановления?\n" +
+      "История просмотров останется. Рекомендуем сначала экспортировать CSV.";
+    if (!window.confirm(confirmText)) return;
+    const button = $("incident-clear");
+    button.disabled = true;
+    text("incident-action-status", "Очищаем журнал…");
+    try {
+      const data = await api("incidents/clear", {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"},
+        body: JSON.stringify({confirm:"DELETE_INCIDENTS"})
+      });
+      text("incident-action-status", "Удалено записей: " + n(data.deleted) +
+        ". Новые ошибки продолжат фиксироваться.");
+      await loadIncidents();
+    } catch (_error) {
+      text("incident-action-status", "Очистка не удалась. Данные сохранены.");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
   async function loadIncidents() {
     const days = $("incident-days").value;
     const kind = $("incident-filter").value;
@@ -518,6 +570,8 @@
   $("incident-days").addEventListener("change", loadIncidents);
   $("incident-filter").addEventListener("change", loadIncidents);
   $("incident-refresh").addEventListener("click", loadIncidents);
+  $("incident-export").addEventListener("click", exportIncidents);
+  $("incident-clear").addEventListener("click", clearIncidents);
   $("login-form").addEventListener("submit", async event => {
     event.preventDefault();
     text("login-error", "");
