@@ -126,7 +126,8 @@ class Gateway:
                  max_segment: int = 32 * 1024 * 1024,
                  source_refresher: Callable[[], str] | None = None,
                  refresh_cooldown: float = 20, startup_reserve: float | None = None,
-                 fast_start: bool = False):
+                 fast_start: bool = False,
+                 on_event: Callable[[str, str, float | None], None] | None = None):
         self._url = url
         self.source_refresher = source_refresher
         self.refresh_cooldown = refresh_cooldown
@@ -177,6 +178,33 @@ class Gateway:
         # live instead of waiting for an unattainable full 90-second backlog.
         self._recovery_mode = False
         self.stop = threading.Event()
+        self.on_event = on_event
+        self._stall_since: float | None = None
+
+    def _notify_event(self, kind: str, detail: str = "", duration: float | None = None):
+        if self.on_event:
+            try:
+                self.on_event(kind, detail, duration)
+            except Exception:
+                pass  # Telemetry must never break video delivery.
+
+    def check_stall(self):
+        """Report each loss of upstream sequence advancement once, then recovery."""
+        now = time.time()
+        event = None
+        with self.lock:
+            progress = self.last_progress
+            threshold = max(15.0, 3 * self.target)
+            if progress is not None and now - progress > threshold:
+                if self._stall_since is None:
+                    self._stall_since = progress
+                    event = ("stream_stalled", "UPSTREAM_NO_PROGRESS", round(now - progress, 1))
+            elif self._stall_since is not None:
+                elapsed = round(now - self._stall_since, 1)
+                self._stall_since = None
+                event = ("stream_recovered", "UPSTREAM_PROGRESS_RESTORED", elapsed)
+        if event:
+            self._notify_event(*event)
 
     def refresh_source(self) -> bool:
         """Try to resolve a fresh stream URL; never expose the subscription URL.
@@ -201,6 +229,7 @@ class Gateway:
             with self.lock:
                 self.source_refresh_errors += 1
                 self.source_refresh_error = safe_error(exc)
+            self._notify_event("upstream_error", "SOURCE_REFRESH_" + safe_error(exc))
             return False
         with self.lock:
             self.source_refresh_error = None
@@ -229,6 +258,7 @@ class Gateway:
                 'type': label,
                 'sequence': sequence,
             })
+        self._notify_event("upstream_error", label)
 
     def cycle(self):
         try:
@@ -266,7 +296,8 @@ class Gateway:
                     continue
                 duration = time.monotonic() - start
                 with self.lock:
-                    if duration >= segment.duration:
+                    is_slow = duration >= segment.duration
+                    if is_slow:
                         self.slow_segments += 1
                     if segment.sequence not in self.cache:
                         self.last_segment_download = time.time()
@@ -274,6 +305,8 @@ class Gateway:
                         self.cache = OrderedDict(sorted(self.cache.items()))
                         self.total_bytes += len(data)
                     self._evict()
+                if is_slow:
+                    self._notify_event("segment_slow", "SEGMENT_DOWNLOAD_SLOW", round(duration, 2))
         except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.IncompleteRead) as exc:
             self.record_upstream_failure('MANIFEST', exc)
             with self.lock:
@@ -297,6 +330,7 @@ class Gateway:
         while not self.stop.is_set():
             start = time.monotonic()
             self.cycle()
+            self.check_stall()
             self.stop.wait(max(0.2, self.poll - (time.monotonic() - start)))
 
     def _contiguous_tail(self) -> list[tuple[int, float]]:
