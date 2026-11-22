@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gzip
 import json
 import os
@@ -60,6 +61,15 @@ def merge(playlist: str, sources: list[bytes], aliases: dict[str, str] | None = 
     seen_programmes = set()
     source_errors = 0
 
+    # Resolve explicit aliases once, never once per programme. On large EPG
+    # feeds (hundreds of thousands of events) the previous O(events*channels)
+    # lookup could appear to hang.
+    by_alias_id = defaultdict(list)
+    for channel in channels:
+        mapped_id = aliases.get(channel.name)
+        if mapped_id:
+            by_alias_id[mapped_id].append(channel)
+
     for raw in sources:
         try:
             root = ET.fromstring(raw)
@@ -68,26 +78,25 @@ def merge(playlist: str, sources: list[bytes], aliases: dict[str, str] | None = 
         except (ET.ParseError, ValueError):
             source_errors += 1
             continue
-        guide_names = {}
+        source_matches = dict(by_alias_id)
         for node in root.findall("channel"):
             source_id = node.get("id", "")
+            if source_id in source_matches:
+                continue
             names = [source_id] + [
                 n.text or "" for n in node.findall("display-name")
             ]
-            guide_names[source_id] = names
+            for name in names:
+                candidates = by_name.get(normalize(name))
+                if candidates:
+                    source_matches[source_id] = candidates
+                    break
         for programme in root.findall("programme"):
             source_id = programme.get("channel", "")
-            names = guide_names.get(source_id, [source_id])
-            # Explicit aliases map our displayed channel name -> XMLTV ID.
-            explicit = [c for c in channels if aliases.get(c.name) == source_id]
-            if explicit:
-                candidates = explicit
-            else:
-                candidates = []
-                for name in names:
-                    candidates = by_name.get(normalize(name), [])
-                    if candidates:
-                        break
+            if source_id not in source_matches:
+                # XMLTV allows a programme to reference an unlisted channel.
+                source_matches[source_id] = by_name.get(normalize(source_id), [])
+            candidates = source_matches[source_id]
             if not candidates:
                 continue
             if not programme.get("start") or not programme.findtext("title"):
@@ -97,7 +106,7 @@ def merge(playlist: str, sources: list[bytes], aliases: dict[str, str] | None = 
                 if key in seen_programmes:
                     continue
                 seen_programmes.add(key)
-                clone = ET.fromstring(ET.tostring(programme, encoding="utf-8"))
+                clone = copy.deepcopy(programme)
                 clone.set("channel", channel.id)
                 programmes[channel.id].append(clone)
                 matched.add(channel.id)
