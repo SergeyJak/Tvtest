@@ -201,6 +201,28 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(gw.manifest_failure_streak, 0)
         self.assertEqual(gw.manifest_backoff_until, 0)
 
+    def test_repeated_segment_502_refreshes_source_and_resumes(self):
+        old = "https://provider.example/old-secret/stream.m3u8"
+        new = "https://provider.example/new-secret/stream.m3u8"
+        gw = g.Gateway(old, source_refresher=lambda: new, delay=30)
+        manifest = ('#EXTM3U\n#EXT-X-TARGETDURATION:6\n'
+                    '#EXT-X-MEDIA-SEQUENCE:10\n'
+                    '#EXTINF:6,\n10.ts\n#EXTINF:6,\n11.ts\n'
+                    '#EXTINF:6,\n12.ts\n')
+        failure = urllib.error.HTTPError(old, 502, "bad gateway", None, None)
+        with patch.object(g, "media_manifest", side_effect=[
+            (manifest, old), (manifest, new) ]), \
+             patch.object(g, "fetch_segment", side_effect=[
+                 failure, failure, b"new10", b"new11", b"new12"]) as download:
+            gw.cycle()
+            self.assertEqual(gw._url, new)
+            self.assertEqual(gw.source_changes, 1)
+            gw.cycle()
+        self.assertEqual(download.call_count, 5)
+        self.assertEqual(gw.segment(10), b"new10")
+        self.assertEqual(gw.segment_failure_streak, 0)
+        self.assertNotIn("secret", json.dumps(json.loads(gw.status())))
+
     def test_safe_errors_do_not_expose_access_key(self):
         error = urllib.error.URLError('http://secret.example/key/ABCDEF')
         self.assertEqual(g.safe_error(error), 'NETWORK_ERROR')
