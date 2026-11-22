@@ -25,3 +25,6 @@ epg-aliases.json
 # Private persisted TV history, SQLite WAL/SHM files, anonymization salt
 .iptv_telemetry.sqlite3*
 .iptv_telemetry.salt
+
+# Private TV telemetry directory, including DB, WAL, SHM, and identity salt
+.iptv_state/
