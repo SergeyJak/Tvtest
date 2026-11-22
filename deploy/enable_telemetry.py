@@ -15,7 +15,7 @@ from pathlib import Path
 
 UNIT = "iptv-gateway.service"
 FLAG = "--telemetry-db"
-DB_PATH = "/home/client_911_1/Tvtest/.iptv_telemetry.sqlite3"
+DB_PATH = "/home/client_911_1/Tvtest/.iptv_state/telemetry.sqlite3"
 
 
 def get_property(name: str) -> str:
