@@ -266,9 +266,9 @@ class MultiGateway:
             }, ensure_ascii=False).encode("utf-8")
 
     def playlist(self, token: str, host: str, *, filter_names: list[str] | None = None,
-                 public_base_url: str | None = None) -> bytes:
-        lines = ["#EXTM3U"]
+                 public_base_url: str | None = None, epg_enabled: bool = False) -> bytes:
         base_url = public_base_url or f"http://{host}"
+        lines = [f'#EXTM3U x-tvg-url="{base_url}/{token}/epg.xml.gz"' if epg_enabled else "#EXTM3U"]
         allowed = set(filter_names) if filter_names is not None else None
         for cid in self.order:
             c = self.channels[cid]
@@ -276,14 +276,15 @@ class MultiGateway:
                 continue
             name = c.name.replace("\r", " ").replace("\n", " ").replace('"', "")
             group = c.group.replace("\r", " ").replace("\n", " ").replace('"', "")
-            meta = f' group-title="{group}"' if group else ""
+            meta = f' tvg-id="{cid}"' + (f' group-title="{group}"' if group else "")
             lines.append(f'#EXTINF:-1{meta},{name}')
             lines.append(f'{base_url}/{token}/channel/{cid}/index.m3u8')
         return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def make_multi_handler(manager: MultiGateway, token: str,
-                       public_base_url: str | None = None):
+                       public_base_url: str | None = None,
+                       epg_file: Path | None = None):
     prefix = "/" + token
 
     class Handler(BaseHTTPRequestHandler):
@@ -316,6 +317,14 @@ def make_multi_handler(manager: MultiGateway, token: str,
             if not path.startswith(prefix + "/"):
                 return self.respond(404, b"Not found", "text/plain", head)
             route = path[len(prefix) + 1:].split("/")
+            if route == ["epg.xml.gz"] and epg_file is not None:
+                try:
+                    body = epg_file.read_bytes()
+                    if not body.startswith(b"\x1f\x8b"):
+                        return self.respond(503, b"Invalid EPG", "text/plain", head)
+                except OSError:
+                    return self.respond(503, b"EPG not generated yet", "text/plain", head)
+                return self.respond(200, body, "application/gzip", head)
             if route == ["status"]:
                 return self.respond(200, manager.status(), "application/json", head)
             if route == ["channels.m3u"]:
@@ -325,7 +334,8 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 with manager.lock:
                     manager.catalog_requests += 1
                 return self.respond(200, manager.playlist(token, host,
-                                                          public_base_url=public_base_url),
+                                                          public_base_url=public_base_url,
+                                                          epg_enabled=epg_file is not None),
                                     "audio/x-mpegurl", head)
             # Saved TV favorites may retain the old single-channel URLs
             # even after the catalog URL has been reloaded. Alias only to
@@ -456,6 +466,8 @@ def main(argv=None):
     p.add_argument("--filter", action="append", default=[],
                    help="Show only channels whose names contain this text; repeatable")
     p.add_argument("--token-file", type=Path, default=Path(".iptv_gateway_token"))
+    p.add_argument("--epg-file", type=Path, default=None,
+                   help="Generated private XMLTV gzip file served at /TOKEN/epg.xml.gz")
     p.add_argument("--playlist-url-env", default=None)
     args = p.parse_args(argv)
     if not (15 <= args.delay <= 120 and args.poll > 0 and args.timeout > 0
@@ -518,7 +530,7 @@ def main(argv=None):
     for cid in dict.fromkeys(prewarm):
         manager.start(cid, pinned=True)
     server = ThreadingHTTPServer((args.host, args.port),
-                                 make_multi_handler(manager, token, public_base_url))
+                                 make_multi_handler(manager, token, public_base_url, args.epg_file))
     server.daemon_threads = True
     sweep_thread = threading.Thread(target=manager.cleanup_loop, daemon=True)
     sweep_thread.start()
@@ -527,6 +539,8 @@ def main(argv=None):
     shown_base = public_base_url or f"http://{shown}:{args.port}"
     print(f"TV playlist URL: {shown_base}/{token}/channels.m3u")
     print(f"Status: {shown_base}/{token}/status")
+    if args.epg_file:
+        print(f"EPG URL: {shown_base}/{token}/epg.xml.gz")
     print("Cold channels take time to buffer; prewarm favorites. Ctrl+C to stop.")
     try:
         server.serve_forever(poll_interval=0.5)
