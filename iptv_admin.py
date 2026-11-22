@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from iptv_multi import channels_from_text
+from iptv_profiles import ProfileStore, ProfileError
 from iptv_telemetry import query_viewing, query_incidents
 
 ASSETS = Path(__file__).resolve().parent / "admin"
@@ -152,12 +153,18 @@ class EpgCache:
 class AdminState:
     def __init__(self, playlist: Path, epg: Path, gateway_port: int,
                  gateway_token_file: Path, password: str,
-                 telemetry_db: Path | None = None):
+                 telemetry_db: Path | None = None,
+                 profiles_dir: Path | None = None,
+                 public_base_url: str = "https://tv.heysmart.lv"):
         self.playlist = playlist
         self.epg = EpgCache(epg)
         self.gateway_port = gateway_port
         self.gateway_token_file = gateway_token_file
         self.password = password
+        self.public_base_url = public_base_url.rstrip("/")
+        self.profiles = ProfileStore(
+            profiles_dir or (Path(playlist).parent / ".iptv_profiles"),
+            playlist, epg, gateway_token_file)
         self.telemetry_db = Path(telemetry_db or ".iptv_state/telemetry.sqlite3")
         self.sessions: dict[str, float] = {}
         self.failed: dict[str, list[float]] = defaultdict(list)
@@ -289,6 +296,24 @@ class AdminState:
     def _channel_labels(self) -> dict:
         return {row["id"]: row["name"] for row in self.channels()}
 
+    def profiles_public(self) -> dict:
+        return {"profiles": self.profiles.public_profiles(self.public_base_url)}
+
+    def update_profile(self, slot: int, payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            raise ProfileError("Некорректные данные")
+        if set(payload) - {"name", "m3u_url", "epg_url"}:
+            raise ProfileError("Неизвестные параметры")
+        name = payload.get("name")
+        playlist = payload.get("m3u_url")
+        epg = payload.get("epg_url")
+        row, changed = self.profiles.update(slot, name, playlist, epg)
+        if changed:
+            from iptv_profile_jobs import start_generation
+            start_generation(self.profiles, slot)
+        # Never echo submitted private URLs to a browser, even on success.
+        return self.profiles_public()
+
     def viewing_history(self, days: int = 7) -> dict:
         data = query_viewing(self.telemetry_db, days)
         names = self._channel_labels()
@@ -383,7 +408,8 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                             "/admin/api/session", "/admin/api/login",
                             "/admin/api/logout", "/admin/api/overview",
                             "/admin/api/channels", "/admin/api/tv-links", "/admin/api/history",
-                            "/admin/api/incidents"):
+                            "/admin/api/incidents", "/admin/api/profiles") and not re.fullmatch(
+                                r"/admin/api/profiles/[123]", path):
                 return self.respond(404, b"Not found", "text/plain", head=head)
             if path in ("/admin/", "/admin/app.js", "/admin/style.css"):
                 if self.command not in ("GET", "HEAD"):
@@ -420,6 +446,18 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
             current = self.cookie()
             if not state.authenticated(current):
                 return self.respond(401, b'{"error":"unauthorized"}', head=head)
+            if re.fullmatch(r"/admin/api/profiles/[123]", path) and self.command == "POST":
+                try:
+                    size = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < size <= 4096:
+                        raise ProfileError("Некорректный размер данных")
+                    payload = json.loads(self.rfile.read(size))
+                    result = state.update_profile(int(path[-1]), payload)
+                except (ProfileError, ValueError, json.JSONDecodeError) as exc:
+                    # ProfileError messages contain no private provider data.
+                    message = str(exc) if isinstance(exc, ProfileError) else "Некорректные данные"
+                    return self.respond(400, json.dumps({"error": message}, ensure_ascii=False).encode("utf-8"), head=head)
+                return self.respond(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), head=head)
             if path == "/admin/api/logout" and self.command == "POST":
                 state.logout(current)
                 return self.respond(200, b'{"ok":true}', head=head,
@@ -442,7 +480,9 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                     return self.respond(400, b'{"error":"invalid_filter"}', head=head)
                 return self.respond(200, json.dumps(data, ensure_ascii=False,
                                                     separators=(",", ":")).encode("utf-8"), head=head)
-            if path == "/admin/api/tv-links":
+            if path == "/admin/api/profiles":
+                data = state.profiles_public()
+            elif path == "/admin/api/tv-links":
                 # This route runs after the admin session check above.
                 data = state.tv_links()
             elif path == "/admin/api/overview":
@@ -462,6 +502,7 @@ def main():
     p.add_argument("--playlist", type=Path, default=Path("forgpt.m3u8"))
     p.add_argument("--epg-file", type=Path, default=Path("epg.xml.gz"))
     p.add_argument("--token-file", type=Path, default=Path(".iptv_gateway_token"))
+    p.add_argument("--profiles-dir", type=Path, default=Path(".iptv_profiles"))
     p.add_argument("--telemetry-db", type=Path, default=Path(".iptv_state/telemetry.sqlite3"))
     p.add_argument("--password-file", type=Path, default=Path(".iptv_admin_password"))
     p.add_argument("--gateway-port", type=int, default=8787)
@@ -476,7 +517,7 @@ def main():
         p.error("Invalid port")
     password = read_or_create_password(args.password_file)
     state = AdminState(args.playlist, args.epg_file, args.gateway_port,
-                       args.token_file, password, args.telemetry_db)
+                       args.token_file, password, args.telemetry_db, args.profiles_dir)
     server = ThreadingHTTPServer((args.host, args.port),
                                  make_admin_handler(state,
                                                     secure_cookies=not args.local_http))
