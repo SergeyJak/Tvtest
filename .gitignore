@@ -14,3 +14,7 @@ __pycache__/
 # Local JetBrains / IntelliJ IDEA project metadata.
 .idea/
 *.iml
+
+# Generated or private guide files and channel alias overrides
+*.xml.gz
+epg-aliases.json
