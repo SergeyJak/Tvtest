@@ -166,27 +166,17 @@ def main():
     if not sources:
         parser.error("Specify --source or --from-playlist-header")
 
-    raw_sources = []
-    failures = 0
-    for index, source in enumerate(sources, start=1):
-        print(f"Downloading/reading EPG {index}/{len(sources)}...", flush=True)
-        try:
-            data = read_source(source)
-            raw_sources.append(data)
-            print(f"EPG {index} loaded: {len(data) // 1048576} MiB uncompressed", flush=True)
-        except (OSError, ValueError, EOFError, gzip.BadGzipFile) as err:
-            failures += 1
-            print(f"Skipping unavailable EPG source: {type(err).__name__}", flush=True)
-    if not raw_sources:
-        parser.error("No readable EPG sources; existing output left intact")
-    print("Matching channels and merging listings...", flush=True)
-    xml, report = merge(playlist_text, raw_sources, aliases)
-    report["unavailable_sources"] = failures
-    if not report["programmes"]:
-        parser.error("No matching EPG programmes; existing output left intact")
-    data = gzip.compress(xml, mtime=0) if args.output.name.endswith(".gz") else xml
-    atomic_write(args.output, data)
+    from iptv_epg_stream import build_epg
+
+    try:
+        report = build_epg(playlist_text, sources, args.output, aliases)
+    except (OSError, ValueError, EOFError, ET.ParseError) as exc:
+        # Never print source URLs: provider credentials may be in their query strings.
+        parser.error(f"EPG generation failed ({type(exc).__name__}); existing output untouched")
     print(json.dumps(report, ensure_ascii=False))
+    print(f"Coverage: {report['channels_with_epg']}/{report['channels_total']} "
+          f"({report['channels_with_epg'] / max(1, report['channels_total']):.1%})")
+
 
 
 if __name__ == "__main__":
