@@ -33,12 +33,20 @@ class ProfileRegistry:
         # Check the small config file, not the 2MB channel snapshots or EPG.
         try:
             stat = self.store.path.stat()
-            key = (stat.st_mtime_ns, stat.st_size)
+            key = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
         except OSError:
             return
         with self.lock:
             if self.closed or key == self.last_mtime:
                 return
+            self._reload_routes()
+            self.last_mtime = key
+
+    def _reload_routes(self):
+        from iptv_multi import MultiGateway, channels_from_text
+
+        # The writer replaces the snapshot and profiles.json under this lock.
+        with self.store._locked():
             rows = self.store.all()
             routes = {}
             live_slots = set()
@@ -49,6 +57,10 @@ class ProfileRegistry:
                     continue
                 if not self.store.configured(row):
                     continue
+                snapshot = self.store.media_path(row)
+                channels = channels_from_text(snapshot.read_text(encoding="utf-8-sig"))
+                if not channels:
+                    continue
                 live_slots.add(slot)
                 if slot == 1 and not self.legacy_detached:
                     # The original manager may be pinned/prewarmed. Release it
@@ -58,12 +70,11 @@ class ProfileRegistry:
                 cached = self.managers.get(slot)
                 if cached and cached[0] == row["revision"]:
                     manager = cached[1]
+                    # A scheduled refresh may rotate URLs without changing
+                    # channel IDs. New workers use the updated catalog.
+                    with manager.lock:
+                        manager.channels = {channel.id: channel for channel in channels}
                 else:
-                    from iptv_multi import MultiGateway, channels_from_text
-                    snapshot = self.store.media_path(row)
-                    channels = channels_from_text(snapshot.read_text(encoding="utf-8-sig"))
-                    if not channels:
-                        continue
                     opts = dict(self.options)
                     # Keep original primary capacity after switching its M3U
                     # from the local file to a provider URL. A one-stream cap
@@ -86,7 +97,6 @@ class ProfileRegistry:
                 if slot not in live_slots:
                     self.managers.pop(slot)[1].close()
             self.routes = routes
-            self.last_mtime = key
 
     def resolve(self, token: str):
         self._reload()

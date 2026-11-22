@@ -127,7 +127,8 @@ class Gateway:
                  source_refresher: Callable[[], str] | None = None,
                  refresh_cooldown: float = 20, startup_reserve: float | None = None,
                  fast_start: bool = False,
-                 on_event: Callable[[str, str, float | None], None] | None = None):
+                 on_event: Callable[[str, str, float | None], None] | None = None,
+                 require_startup_reserve: bool = False):
         self._url = url
         self.source_refresher = source_refresher
         self.refresh_cooldown = refresh_cooldown
@@ -144,7 +145,8 @@ class Gateway:
         self._pending_source_reset = False
         self.delay, self.timeout, self.poll = delay, timeout, poll
         self.startup_reserve = delay if startup_reserve is None else min(startup_reserve, delay)
-        self._fast_start_at = time.monotonic() + 3.0 if fast_start else None
+        self.require_startup_reserve = require_startup_reserve
+        self._fast_start_at = time.monotonic() + 3.0 if fast_start and not require_startup_reserve else None
         self.max_bytes, self.max_segment = max_bytes, max_segment
         self.lock = threading.RLock()
         self.cache: OrderedDict[int, tuple[float, bytes]] = OrderedDict()
@@ -300,7 +302,9 @@ class Gateway:
                     self._last_published_at = None
                     self._recovery_mode = False
                     self._pending_source_reset = False
-                    self._fast_start_at = time.monotonic() + 3.0
+                    if not self.require_startup_reserve:
+                        self._fast_start_at = time.monotonic() + 3.0
+                    self.segment_failure_streak = 0
                 self.manifest_failure_streak = 0
                 self.manifest_backoff_until = 0.0
                 if self.latest is not None and listed[-1].sequence < self.latest - 10:
@@ -317,7 +321,11 @@ class Gateway:
                 self.last_update = time.time()
                 self.last_error = None
                 self.consecutive_manifest_404 = 0
-            for segment in listed:
+            pending = deque(listed)
+            from_live_edge = self.segment_failure_streak >= 3
+            consecutive_misses = 0
+            while pending:
+                segment = pending.pop() if from_live_edge else pending.popleft()
                 if self.stop.is_set():
                     return
                 with self.lock:
@@ -338,9 +346,15 @@ class Gateway:
                     if failures >= 2 and code in (404, 500, 502, 503, 504):
                         if self.refresh_source():
                             break  # Retry using the freshly resolved HLS URL.
-                    if failures >= 3:
+                    # The CDN can expire the front of a sliding window while
+                    # its newest segments still play. Give those a turn.
+                    consecutive_misses += 1
+                    if consecutive_misses >= 3:
                         break  # Avoid a long queue of dead segment downloads.
+                    if consecutive_misses == 2:
+                        from_live_edge = True
                     continue
+                consecutive_misses = 0
                 duration = time.monotonic() - start
                 with self.lock:
                     self.segment_failure_streak = 0

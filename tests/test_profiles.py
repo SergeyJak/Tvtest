@@ -131,6 +131,20 @@ class ThreeCabinetTests(unittest.TestCase):
         with self.request(original_token, "channels.m3u") as response:
             self.assertIn("Channel A", response.read().decode())
 
+    def test_scheduled_url_rotation_updates_new_workers_and_keeps_active_viewers(self):
+        with patch("iptv_profiles.download_playlist", return_value=PLAYLIST):
+            row, _ = self.store.update(1, "TV", "https://example.test/catalog")
+        manager = self.registry.resolve(row["token"])[0]
+        first, second = manager.order
+        active = manager.start(first)
+        rotated = PLAYLIST.replace("PRIVATE_CHANNEL", "ROTATED_CHANNEL")
+        with patch("iptv_profile_jobs.download_playlist", return_value=rotated):
+            generate_for_slot(self.store, 1, refresh_m3u=True)
+        updated = self.registry.resolve(row["token"])[0]
+        self.assertIs(updated.start(first), active)
+        self.assertFalse(active.gateway.stop.is_set())
+        self.assertEqual(updated.start(second).gateway._url, channels_from_text(rotated)[1].url)
+
     def test_rename_is_instant_and_does_not_restart_workers(self):
         with patch("iptv_profiles.download_playlist", return_value=OTHER):
             row, _ = self.store.update(2, "Old", "https://example.org/m3u")

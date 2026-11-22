@@ -237,6 +237,36 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(gw.segment_failure_streak, 0)
         self.assertNotIn("secret", json.dumps(json.loads(gw.status())))
 
+    def test_sliding_window_with_expired_prefix_still_publishes_live_segments(self):
+        base = "https://provider.example/live.m3u8"
+        gw = g.Gateway(base, delay=0, source_refresher=lambda: base)
+        for first in range(100, 106):
+            manifest = (f"#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:{first}\n" +
+                        "".join(f"#EXTINF:6,\n{i}.ts\n" for i in range(first, first + 6)))
+
+            def download(url, timeout, max_bytes):
+                sequence = int(url.rsplit("/", 1)[1].split(".")[0])
+                if sequence < first + 3:
+                    raise urllib.error.HTTPError(url, 404, "expired", None, None)
+                return b"fresh"
+
+            with patch.object(g, "media_manifest", return_value=(manifest, base)), \
+                 patch.object(g, "fetch_segment", side_effect=download):
+                gw.cycle()
+            self.assertEqual(gw.published()[-1][0], first + 5)
+
+    def test_fully_expired_window_limits_downloads_per_poll(self):
+        base = "https://provider.example/live.m3u8"
+        gw = g.Gateway(base)
+        manifest = "#EXTM3U\n" + "".join(f"#EXTINF:6,\n{i}.ts\n" for i in range(20))
+        failure = urllib.error.HTTPError(base, 404, "expired", None, None)
+        with patch.object(g, "media_manifest", return_value=(manifest, base)), \
+             patch.object(g, "fetch_segment", side_effect=failure) as download:
+            for _ in range(3):
+                download.reset_mock()
+                gw.cycle()
+                self.assertEqual(download.call_count, 3)
+
     def test_safe_errors_do_not_expose_access_key(self):
         error = urllib.error.URLError('http://secret.example/key/ABCDEF')
         self.assertEqual(g.safe_error(error), 'NETWORK_ERROR')
