@@ -454,3 +454,7 @@ it is not direct proof of on-screen playback. Incident records include provider
 errors, cache misses, startup timeouts, slow downloads, stream stalls and recovery.
 The gateway stores records asynchronously in a private SQLite database when
 `--telemetry-db` is enabled. See [TELEMETRY.md](TELEMETRY.md) for safe installation.
+
+## Three independent IPTV cabinets
+
+The admin panel now manages **three named TV cabinets** with independent source M3U URLs, random TV playback tokens and individual EPG XMLTV. The original first cabinet retains its existing playlist and token until reconfigured; remote M3U URLs are stored privately on the VPS, not in GitHub or public HTML. See [PROFILES.md](PROFILES.md) for the UI, secure setup and daily refresh timer.

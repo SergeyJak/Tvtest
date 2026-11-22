@@ -106,8 +106,10 @@ class MultiGateway:
                  timeout: float = 12, poll: float = 2, cache_mib: int = 128,
                  max_streams: int = 3, idle_seconds: float = 90,
                  startup_wait: float = 18, switch_grace: float = 20,
-                 startup_reserve: float = 30, telemetry: Telemetry | None = None):
+                 startup_reserve: float = 30, telemetry: Telemetry | None = None,
+                 profile_slot: int = 1):
         self.telemetry = telemetry
+        self.profile_slot = profile_slot
         self.channels = {c.id: c for c in channels}
         self.order = [c.id for c in channels]
         self.path = playlist_path
@@ -137,6 +139,11 @@ class MultiGateway:
         self.legacy_manifest_requests = 0
         self.legacy_segment_requests = 0
 
+    def telemetry_channel_id(self, cid: str) -> str:
+        # Keep existing profile-1 history stable. Distinguish otherwise
+        # identical channels watched through separate subscription cabinets.
+        return cid if self.profile_slot == 1 else f"p{self.profile_slot}:{cid}"
+
     def _new_stream(self, channel: Channel, pinned: bool) -> ActiveStream:
         def refresh() -> str:
             text = private_playlist_text(self.path, self.private_url, self.timeout)
@@ -152,7 +159,7 @@ class MultiGateway:
                           startup_reserve=None if pinned else self.startup_reserve,
                           fast_start=not pinned,
                           on_event=(lambda kind, detail, duration: self.telemetry.incident(
-                              channel.id, kind, detail, duration)) if self.telemetry else None)
+                              self.telemetry_channel_id(channel.id), kind, detail, duration)) if self.telemetry else None)
         return ActiveStream(channel, gateway, self.upstream_slots, pinned)
 
     def start(self, cid: str, *, pinned: bool = False) -> ActiveStream | None:
@@ -297,11 +304,13 @@ class MultiGateway:
 
 def make_multi_handler(manager: MultiGateway, token: str,
                        public_base_url: str | None = None,
-                       epg_file: Path | None = None):
-    prefix = "/" + token
+                       epg_file: Path | None = None,
+                       profile_registry=None):
+    configured_epg_file = epg_file
 
     class Handler(BaseHTTPRequestHandler):
         def viewer_identity(self):
+            manager = self._request_manager
             if manager.telemetry is None:
                 return ""
             ip = self.client_address[0]
@@ -317,12 +326,14 @@ def make_multi_handler(manager: MultiGateway, token: str,
             return manager.telemetry.viewer(ip, self.headers.get("User-Agent", ""))
 
         def track_client_failure(self, cid, reason, status):
+            manager = self._request_manager
             if manager.telemetry is not None and not self._head:
-                manager.telemetry.incident(cid, "client_error", f"HTTP_{status}_{reason}")
+                manager.telemetry.incident(manager.telemetry_channel_id(cid), "client_error", f"HTTP_{status}_{reason}")
 
         def track_view(self, cid):
+            manager = self._request_manager
             if manager.telemetry is not None and not self._head:
-                manager.telemetry.observe_segment(cid, self.viewer_identity())
+                manager.telemetry.observe_segment(manager.telemetry_channel_id(cid), self.viewer_identity())
 
         def log_message(self, *_args):
             pass  # No token, viewer IP, or upstream URLs in logs.
@@ -348,7 +359,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
-        def serve_epg(self, head: bool):
+        def serve_epg(self, head: bool, epg_file: Path):
             """Conditional and streaming EPG delivery without reading the 43 MB
             gzip into memory for every HEAD/GET request.
             """
@@ -411,44 +422,54 @@ def make_multi_handler(manager: MultiGateway, token: str,
         def serve(self, head: bool):
             self._head = head
             path = urllib.parse.urlsplit(self.path).path
+            requested_token = path.split("/", 2)[1] if path.startswith("/") else ""
+            if profile_registry is None:
+                resolved = (manager, token, configured_epg_file) if requested_token == token else None
+            else:
+                resolved = profile_registry.resolve(requested_token)
+            if resolved is None:
+                return self.respond(404, b"Not found", "text/plain", head)
+            request_manager, active_token, active_epg_file = resolved
+            self._request_manager = request_manager
+            prefix = "/" + active_token
             if not path.startswith(prefix + "/"):
                 return self.respond(404, b"Not found", "text/plain", head)
             route = path[len(prefix) + 1:].split("/")
-            if route == ["epg.xml.gz"] and epg_file is not None:
-                return self.serve_epg(head)
+            if route == ["epg.xml.gz"] and active_epg_file is not None:
+                return self.serve_epg(head, active_epg_file)
             if route == ["status"]:
-                return self.respond(200, manager.status(), "application/json", head)
+                return self.respond(200, request_manager.status(), "application/json", head)
             if route == ["channels.m3u"]:
                 host = self.headers.get("Host", "")
                 if not re.fullmatch(r"[A-Za-z0-9.:\-\[\]]{1,255}", host):
                     return self.respond(400, b"Invalid host", "text/plain", head)
-                with manager.lock:
-                    manager.catalog_requests += 1
-                return self.respond(200, manager.playlist(token, host,
+                with request_manager.lock:
+                    request_manager.catalog_requests += 1
+                return self.respond(200, request_manager.playlist(active_token, host,
                                                           public_base_url=public_base_url,
-                                                          epg_enabled=epg_file is not None),
+                                                          epg_enabled=active_epg_file is not None),
                                     "audio/x-mpegurl", head)
             # Saved TV favorites may retain the old single-channel URLs
             # even after the catalog URL has been reloaded. Alias only to
             # the explicit first --prewarm channel, not any guessed source.
-            with manager.lock:
-                legacy_id = manager.legacy_channel_id
+            with request_manager.lock:
+                legacy_id = request_manager.legacy_channel_id
             if legacy_id is not None and route == ["index.m3u8"]:
-                with manager.lock:
-                    manager.legacy_manifest_requests += 1
+                with request_manager.lock:
+                    request_manager.legacy_manifest_requests += 1
                 route = ["channel", legacy_id, "index.m3u8"]
             elif (legacy_id is not None and len(route) == 2
                   and route[0] == "segment" and route[1].endswith(".ts")):
-                with manager.lock:
-                    manager.legacy_segment_requests += 1
+                with request_manager.lock:
+                    request_manager.legacy_segment_requests += 1
                 route = ["channel", legacy_id, "segment", route[1]]
             if len(route) < 3 or route[0] != "channel":
                 return self.respond(404, b"Not found", "text/plain", head)
             cid, resource = route[1], route[2]
-            if cid not in manager.channels:
+            if cid not in request_manager.channels:
                 return self.respond(404, b"Unknown channel", "text/plain", head)
             if len(route) == 3 and resource == "index.m3u8":
-                stream = manager.start(cid)
+                stream = request_manager.start(cid)
                 if stream is None:
                     self.track_client_failure(cid, "STREAM_LIMIT", 503)
                     return self.respond(503, b"Too many active streams",
@@ -457,41 +478,41 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 # selecting a cold channel. Many TV players never retry it.
                 # Keep this *one* manifest request open briefly while the
                 # worker fills its first delayed HLS window.
-                with manager.lock:
+                with request_manager.lock:
                     stream.pending_requests += 1
                 try:
-                    raw = stream.gateway.playlist(token)
+                    raw = stream.gateway.playlist(active_token)
                     waited = False
-                    deadline = time.monotonic() + manager.startup_wait
-                    while raw is None and not manager.stop.is_set():
+                    deadline = time.monotonic() + request_manager.startup_wait
+                    while raw is None and not request_manager.stop.is_set():
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             break
                         waited = True
                         if stream.gateway.stop.wait(min(0.25, remaining)):
                             break
-                        raw = stream.gateway.playlist(token)
-                    with manager.lock:
+                        raw = stream.gateway.playlist(active_token)
+                    with request_manager.lock:
                         if waited:
                             if raw is not None:
-                                manager.warmup_successes += 1
+                                request_manager.warmup_successes += 1
                             else:
-                                manager.warmup_timeouts += 1
+                                request_manager.warmup_timeouts += 1
                 finally:
-                    with manager.lock:
+                    with request_manager.lock:
                         stream.pending_requests -= 1
                         stream.accessed = time.monotonic()
                 if raw is None:
                     self.track_client_failure(cid, "MANIFEST_WARMUP", 503)
-                    if manager.telemetry is not None and not head:
-                        manager.telemetry.incident(cid, "startup_timeout", "MANIFEST_WARMUP_TIMEOUT")
+                    if request_manager.telemetry is not None and not head:
+                        request_manager.telemetry.incident(manager.telemetry_channel_id(cid), "startup_timeout", "MANIFEST_WARMUP_TIMEOUT")
                     stream.gateway.record_client("manifest", 503)
                     return self.respond(503, b"Buffer warming up; reselect channel",
                                         "text/plain", head, {"Retry-After": "2"})
                 # The legacy single-channel gateway outputs /TOKEN/segment/...
                 # Inject this channel's stable ID without touching source URLs.
-                before = f"/{token}/segment/".encode()
-                after = f"/{token}/channel/{cid}/segment/".encode()
+                before = f"/{active_token}/segment/".encode()
+                after = f"/{active_token}/channel/{cid}/segment/".encode()
                 stream.gateway.record_client("manifest", 200)
                 return self.respond(200, raw.replace(before, after),
                                     "application/vnd.apple.mpegurl", head)
@@ -501,7 +522,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 except ValueError:
                     return self.respond(404, b"Invalid segment", "text/plain", head)
                 # An expired stream is not restarted on a stale segment URL.
-                stream = manager.active_stream(cid)
+                stream = request_manager.active_stream(cid)
                 if stream is None:
                     self.track_client_failure(cid, "STREAM_EXPIRED", 404)
                     return self.respond(404, b"Stream expired", "text/plain", head)
@@ -570,6 +591,8 @@ def main(argv=None):
     p.add_argument("--epg-file", type=Path, default=None,
                    help="Generated private XMLTV gzip file served at /TOKEN/epg.xml.gz")
     p.add_argument("--playlist-url-env", default=None)
+    p.add_argument("--profiles-dir", type=Path, default=Path(".iptv_profiles"),
+                   help="Owner-only persisted three-TV-profile configuration")
     args = p.parse_args(argv)
     if not (15 <= args.delay <= 120 and args.poll > 0 and args.timeout > 0
             and 32 <= args.cache_mib <= 2048 and 1 <= args.max_streams <= 8
@@ -632,8 +655,19 @@ def main(argv=None):
         manager.legacy_channel_id = prewarm[0]
     for cid in dict.fromkeys(prewarm):
         manager.start(cid, pinned=True)
+    from iptv_profiles import ProfileStore
+    from iptv_profile_gateway import ProfileRegistry
+    store = ProfileStore(args.profiles_dir, args.playlist, args.epg_file, args.token_file)
+    profile_registry = ProfileRegistry(
+        store, manager, token, args.epg_file,
+        dict(delay=args.delay, timeout=args.timeout, poll=args.poll,
+             cache_mib=args.cache_mib, max_streams=args.max_streams,
+             idle_seconds=args.idle_seconds, startup_wait=args.startup_wait,
+             switch_grace=args.switch_grace, startup_reserve=args.startup_reserve,
+             telemetry=telemetry))
     server = ThreadingHTTPServer((args.host, args.port),
-                                 make_multi_handler(manager, token, public_base_url, args.epg_file))
+                                 make_multi_handler(manager, token, public_base_url,
+                                                    args.epg_file, profile_registry))
     server.daemon_threads = True
     sweep_thread = threading.Thread(target=manager.cleanup_loop, daemon=True)
     sweep_thread.start()
@@ -650,6 +684,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
+        profile_registry.close()
         manager.close()
         if telemetry is not None:
             telemetry.close()
