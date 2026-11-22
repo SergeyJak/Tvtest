@@ -146,23 +146,41 @@ def atomic_write(path: Path, data: bytes):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--playlist", type=Path, required=True)
-    parser.add_argument("--source", action="append", required=True,
+    parser.add_argument("--source", action="append", default=[],
                         help="XMLTV URL or file; repeat for multiple guides, first wins on duplicates")
+    parser.add_argument("--from-playlist-header", action="store_true",
+                        help="Read x-tvg-url/url-tvg from the private playlist header")
     parser.add_argument("--aliases", type=Path, help='JSON: {"Our channel name": "XMLTV channel id"}')
     parser.add_argument("--output", type=Path, default=Path("epg.xml.gz"))
     args = parser.parse_args()
+    playlist_text = args.playlist.read_text(encoding="utf-8-sig")
     aliases = json.loads(args.aliases.read_text(encoding="utf-8")) if args.aliases else {}
+    sources = list(args.source)
+    if args.from_playlist_header:
+        first_line = playlist_text.splitlines()[0]
+        match = re.search(r"""(?:x-tvg-url|url-tvg)\s*=\s*(["'])(.*?)\1""",
+                          first_line, re.I)
+        if not match:
+            parser.error("No EPG URL in playlist header")
+        sources.extend(value.strip() for value in match.group(2).split(",") if value.strip())
+    if not sources:
+        parser.error("Specify --source or --from-playlist-header")
+
     raw_sources = []
     failures = 0
-    for source in args.source:
+    for index, source in enumerate(sources, start=1):
+        print(f"Downloading/reading EPG {index}/{len(sources)}...", flush=True)
         try:
-            raw_sources.append(read_source(source))
+            data = read_source(source)
+            raw_sources.append(data)
+            print(f"EPG {index} loaded: {len(data) // 1048576} MiB uncompressed", flush=True)
         except (OSError, ValueError, EOFError, gzip.BadGzipFile) as err:
             failures += 1
-            print(f"Skipping unavailable EPG source: {type(err).__name__}")
+            print(f"Skipping unavailable EPG source: {type(err).__name__}", flush=True)
     if not raw_sources:
         parser.error("No readable EPG sources; existing output left intact")
-    xml, report = merge(args.playlist.read_text(encoding="utf-8-sig"), raw_sources, aliases)
+    print("Matching channels and merging listings...", flush=True)
+    xml, report = merge(playlist_text, raw_sources, aliases)
     report["unavailable_sources"] = failures
     if not report["programmes"]:
         parser.error("No matching EPG programmes; existing output left intact")
