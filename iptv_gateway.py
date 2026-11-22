@@ -139,6 +139,7 @@ class Gateway:
         self.source_refresh_error = None
         self.consecutive_manifest_404 = 0
         self.manifest_failure_streak = 0
+        self.segment_failure_streak = 0
         self.manifest_backoff_until = 0.0
         self._pending_source_reset = False
         self.delay, self.timeout, self.poll = delay, timeout, poll
@@ -328,8 +329,21 @@ class Gateway:
                     data = fetch_segment(segment.url, self.timeout, self.max_segment)
                 except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.IncompleteRead) as exc:
                     self.record_upstream_failure('SEGMENT', exc, segment.sequence)
+                    with self.lock:
+                        self.segment_failure_streak += 1
+                        failures = self.segment_failure_streak
+                    code = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+                    # A valid manifest with expired segment URLs can also
+                    # indicate the provider has rotated the channel stream.
+                    if failures >= 2 and code in (404, 500, 502, 503, 504):
+                        if self.refresh_source():
+                            break  # Retry using the freshly resolved HLS URL.
+                    if failures >= 3:
+                        break  # Avoid a long queue of dead segment downloads.
                     continue
                 duration = time.monotonic() - start
+                with self.lock:
+                    self.segment_failure_streak = 0
                 with self.lock:
                     is_slow = duration >= segment.duration
                     if is_slow:
@@ -604,6 +618,7 @@ class Gateway:
                         recent_upstream_failures=list(self.recent_upstream_failures),
                         consecutive_manifest_404=self.consecutive_manifest_404,
                         manifest_failure_streak=self.manifest_failure_streak,
+                        segment_failure_streak=self.segment_failure_streak,
                         manifest_retry_in_seconds=round(
                             max(0.0, self.manifest_backoff_until - time.monotonic()), 1),
                         source_refresh_attempts=self.source_refresh_attempts,
