@@ -255,7 +255,7 @@
       const data = await api("history?days=" + encodeURIComponent(days));
       text("history-total-time", duration(data.total_seconds));
       text("history-sessions", n(data.total_sessions));
-      text("history-channels", n(data.channels.length));
+      text("history-channels", n(data.unique_channels));
       text("history-recording", data.recording_active ? "Включена" : "Выключена");
       $("history-notice").textContent = data.recording_active
         ? "Учёт включён. Длительность приблизительная: учитываются успешные запросы HLS-сегментов, а не состояние экрана телевизора."
