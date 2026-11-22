@@ -128,3 +128,39 @@ This does not modify Caddy, systemd units, EPG generation, or your private playl
 ## Three editable cabinets, each with their own M3U and EPG
 
 The admin's **Кабинеты ТВ** page now lets the administrator rename three independent TV profiles, set each profile's upstream M3U URL (optional XMLTV URL) and copy its unique TV links. The old main profile starts from the existing local file and preserves the original token. All provider source URLs stay in an owner-only VPS directory and are never returned in admin APIs. Profiles route dynamically through the existing public HTTPS domain, so Caddy configuration is unchanged. See [PROFILES.md](PROFILES.md) for installation and the daily guide-refresh timer.
+
+## Нагрузка VPS и IPTV в админке
+
+Страница **Обзор** автоматически обновляет показатели каждые 15 секунд.
+В двух отдельных панелях видны:
+
+- **VPS:** использование CPU, RAM и диска; load average за минуту и число
+  CPU; входящая и исходящая скорость сети (без loopback-трафика).
+- **IPTV:** CPU и RSS-память процесса `iptv-gateway.service`, память/CPU
+  административного процесса, объём кешированных сегментов, число потоков
+  с зависанием, а также активные и доступные потоки для каждого
+  настроенного ТВ-кабинета.
+
+Те же ключевые проценты и RSS продублированы в **Диагностике**. Метрики
+доступны только после входа в админку через существующий защищённый
+`/admin/api/overview`. Отдельных веб-эндпоинтов для мониторинга без
+авторизации нет.
+
+CPU (%) и сеть (байт/с) рассчитываются **между двумя опросами**, поэтому
+после первого открытия страницы показывается «—». CPU процесса показывает
+проценты **от одного ядра** и может быть выше 100% на многоядерной VPS.
+RAM процесса показывает RSS и не включает весь файловый кеш Linux.
+При недоступном `systemctl show iptv-gateway.service` показания CPU/RAM
+шлюза будут «—», но статистика VPS и ТВ-кабинетов продолжит работать.
+Сервис `iptv-admin.service` может читать эти данные без root.
+Система использует Linux `/proc` и `statvfs`, без сторонних библиотек,
+отправки метрик наружу или доступа к приватным URL провайдера.
+
+Ранее после настройки удалённого M3U панель могла видеть только
+остановленный **legacy**-менеджер первого кабинета. Теперь показатели
+потоков агрегируются по всем активным настроенным кабинетам, включая
+основной с удалённым M3U, через локальный gateway.
+
+После мержа выполни
+`cd ~/Tvtest && git pull --ff-only && sudo systemctl restart iptv-admin.service`.
+Перезапуск `iptv-gateway.service` для новых панелей не требуется.
