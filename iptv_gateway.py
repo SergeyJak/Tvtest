@@ -368,7 +368,9 @@ class Gateway:
                 )
                 streak = self.manifest_failure_streak
                 if streak >= 2:
-                    delay = min(60.0, 5.0 * (2 ** min(streak - 2, 4)))
+                    # Keep recovery responsive for live viewers. Long 20-60s
+                    # backoffs amplified brief provider outages into freezes.
+                    delay = min(6.0, 2.0 * (2 ** min(streak - 2, 2)))
                     self.manifest_backoff_until = time.monotonic() + delay
             # When 404 or repeated 5xx indicates a rotated/expired HLS URL,
             # resolve a fresh channel URL from the newly configured provider M3U.
