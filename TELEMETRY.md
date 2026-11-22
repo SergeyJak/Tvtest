@@ -37,7 +37,7 @@ sudo python3 deploy/enable_telemetry.py
 The installer backs up the selected unit file to `.bak-telemetry`, keeps the existing EPG flag and playlist settings, verifies the effective ExecStart and rolls back automatically if validation/restart fails. It adds:
 
 ```text
---telemetry-db /home/client_911_1/Tvtest/.iptv_telemetry.sqlite3
+--telemetry-db /home/client_911_1/Tvtest/ .iptv_state/telemetry.sqlite3
 ```
 
 The existing `iptv-admin.service` discovers the same SQLite database by default because both services use the same WorkingDirectory. Restart it to load the new pages:
@@ -51,7 +51,7 @@ Open https://tv.heysmart.lv/admin/ and refresh the browser. The two new tabs app
 
 ## Data storage
 
-- A dedicated SQLite WAL database and 32-byte private identity salt in `~/Tvtest`, excluded by `.gitignore`.
+- A dedicated SQLite WAL database and 32-byte private identity salt in owner-only `~/Tvtest/.iptv_state/`, excluded by `.gitignore`.
 - Video delivery is never synchronously blocked by SQLite. The bounded telemetry queue drops events if overfilled; missing events can result in under-counting.
 - The most recent 30 days of incidents and sessions are retained; a further maximum of 100,000 incident rows applies. No data from before enabling the recorder.
 - Admin API routes are session-protected: `/admin/api/history?days=7` and `/admin/api/incidents?days=7&kind=stream_stalled`.
@@ -61,7 +61,7 @@ Open https://tv.heysmart.lv/admin/ and refresh the browser. The two new tabs app
 
 ```bash
 systemctl show -P ExecStart iptv-gateway.service | grep -o -- '--telemetry-db' || true
-ls -lh ~/Tvtest/.iptv_telemetry.sqlite3*
+ls -lh ~/Tvtest/.iptv_state/telemetry.sqlite3*
 sudo journalctl -u iptv-gateway.service -n 30 --no-pager
 ```
 
