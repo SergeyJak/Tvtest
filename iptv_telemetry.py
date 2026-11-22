@@ -80,7 +80,7 @@ def query_viewing(path: Path, days: int = 7) -> dict:
     if days not in (1, 7, 30):
         raise ValueError("Unsupported time range")
     empty = {"tracking_available": False, "days": days, "total_seconds": 0,
-             "total_sessions": 0, "channels": [], "sessions": []}
+             "total_sessions": 0, "unique_channels": 0, "channels": [], "sessions": []}
     if not path.is_file():
         return empty
     cutoff = int(time.time()) - days * 86400
@@ -102,11 +102,13 @@ def query_viewing(path: Path, days: int = 7) -> dict:
                 ORDER BY last_seen DESC LIMIT 100
             """, (cutoff,))]
             count = db.execute("""
-                SELECT COALESCE(SUM(estimated_seconds), 0), COUNT(*)
+                SELECT COALESCE(SUM(estimated_seconds), 0), COUNT(*),
+                       COUNT(DISTINCT channel_id)
                 FROM viewing_sessions WHERE last_seen >= ?
             """, (cutoff,)).fetchone()
             return {"tracking_available": True, "days": days,
                     "total_seconds": int(count[0]), "total_sessions": int(count[1]),
+                    "unique_channels": int(count[2]),
                     "channels": by_channel, "sessions": sessions}
     except sqlite3.Error:
         return empty
@@ -128,13 +130,18 @@ def query_incidents(path: Path, days: int = 7, kind: str = "all") -> dict:
     try:
         with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True, timeout=3) as db:
             db.row_factory = sqlite3.Row
+            # Summary cards describe the entire selected period, independently
+            # of the event-kind table filter.
             summary = {row["kind"]: row["count"] for row in db.execute(
-                f"SELECT kind, COUNT(*) AS count FROM incidents {where} GROUP BY kind", values)}
+                "SELECT kind, COUNT(*) AS count FROM incidents "
+                "WHERE occurred_at >= ? GROUP BY kind", (cutoff,))}
+            filtered_total = db.execute(
+                f"SELECT COUNT(*) FROM incidents {where}", values).fetchone()[0]
             events = [dict(row) for row in db.execute(
                 f"""SELECT occurred_at, channel_id, kind, detail, duration_seconds
                     FROM incidents {where} ORDER BY occurred_at DESC, id DESC LIMIT 200""", values)]
             return {"tracking_available": True, "days": days, "kind": kind,
-                    "total": sum(summary.values()), "summary": summary, "events": events}
+                    "total": filtered_total, "summary": summary, "events": events}
     except sqlite3.Error:
         return empty
 
