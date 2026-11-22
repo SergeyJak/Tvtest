@@ -28,3 +28,6 @@ epg-aliases.json
 
 # Private TV telemetry directory, including DB, WAL, SHM, and identity salt
 .iptv_state/
+
+# Three-TV-cabinet provider M3U/EPG credentials, snapshots and secret tokens
+.iptv_profiles/
