@@ -458,3 +458,11 @@ The gateway stores records asynchronously in a private SQLite database when
 ## Three independent IPTV cabinets
 
 The admin panel now manages **three named TV cabinets** with independent source M3U URLs, random TV playback tokens and individual EPG XMLTV. The original first cabinet retains its existing playlist and token until reconfigured; remote M3U URLs are stored privately on the VPS, not in GitHub or public HTML. See [PROFILES.md](PROFILES.md) for the UI, secure setup and daily refresh timer.
+
+## Live stream recovery and CSV incident export
+
+The gateway backs off repeated 404/5xx manifest errors, refreshes outdated
+provider HLS URLs and avoids mixing stale video segments after URL rotation.
+The admin's **Ошибки и зависания** page can export all filtered events
+as CSV and clear the incident table after confirmation without altering
+viewing history. See [TELEMETRY.md](TELEMETRY.md).
