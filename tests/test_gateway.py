@@ -163,6 +163,20 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(gw.source_refresh_attempts, 1)
         self.assertNotIn("SECRET", json.dumps(json.loads(gw.status())))
 
+    def test_live_manifest_failures_never_wait_longer_than_six_seconds(self):
+        secret = "https://provider.example/private/ACCESSKEY"
+        failure = urllib.error.HTTPError(secret, 404, "expired", None, None)
+        gw = g.Gateway(secret, poll=2, source_refresher=lambda: secret)
+        clock = [100.0]
+        with patch.object(g, "media_manifest", side_effect=failure) as fetch, \
+             patch.object(g.time, "monotonic", side_effect=lambda: clock[0]):
+            for _ in range(12):
+                gw.cycle()
+                self.assertLessEqual(gw.manifest_backoff_until - clock[0], 6.0)
+                clock[0] = max(clock[0] + 2, gw.manifest_backoff_until)
+        self.assertGreaterEqual(fetch.call_count, 5)
+        self.assertNotIn("ACCESSKEY", json.dumps(json.loads(gw.status())))
+
     def test_new_source_url_invalidates_overlapping_old_video_cache(self):
         old_url = "https://source.example/old/SECRET"
         new_url = "https://source.example/new/SECRET"
