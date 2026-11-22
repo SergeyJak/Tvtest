@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import iptv_admin as admin
+from iptv_telemetry import Telemetry
 
 
 PLAYLIST = """#EXTM3U x-tvg-url="https://provider.test/secret/xmltv.xml.gz"
@@ -39,7 +40,8 @@ class AdminTests(unittest.TestCase):
         self.epg.write_bytes(gzip.compress(GUIDE.format(id=first.id).encode()))
         self.pwd = "a-private-password-of-sufficient-length"
         self.state = admin.AdminState(self.playlist, self.epg, 8787,
-                                      root / "private_token", self.pwd)
+                                      root / "private_token", self.pwd,
+                                      root / "usage.sqlite3")
         self._status = {
             "channels": 2, "active_streams": 1, "max_streams": 3,
             "delay_seconds": 90, "catalog_requests": 12,
@@ -120,6 +122,39 @@ class AdminTests(unittest.TestCase):
         self.assertEqual([c["active"] for c in channels], [True, False])
         self.assertNotIn("SECRET_TOKEN", json.dumps(channels))
         self.assertEqual([c["group"] for c in channels], ["News", "Movies"])
+
+    def test_new_private_history_and_incident_endpoints(self):
+        # The two pages require the same independent admin session.
+        for path in ("/admin/api/history?days=7", "/admin/api/incidents?days=7"):
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request(path)
+            self.assertEqual(error.exception.code, 401)
+        store = Telemetry(self.state.telemetry_db)
+        try:
+            cid = admin.channels_from_text(PLAYLIST)[0].id
+            timestamp = time.time() - 30
+            store.observe_segment(cid, store.viewer("192.0.2.4", "LG"), timestamp)
+            store.observe_segment(cid, store.viewer("192.0.2.4", "LG"), timestamp + 12)
+            store.incident(cid, "stream_stalled", "UPSTREAM_NO_PROGRESS",
+                           duration_seconds=31)
+            store.flush()
+            self.login().close()
+            with self.request("/admin/api/history?days=7") as response:
+                data = json.load(response)
+            self.assertTrue(data["tracking_available"])
+            self.assertEqual(data["total_sessions"], 1)
+            self.assertEqual(data["total_seconds"], 12)
+            self.assertEqual(data["channels"][0]["channel_name"], "Россия 24 HD")
+            self.assertNotIn("192.0.2.4", json.dumps(data))
+            with self.request("/admin/api/incidents?kind=stream_stalled&days=7") as response:
+                incidents = json.load(response)
+            self.assertEqual(incidents["total"], 1)
+            self.assertEqual(incidents["events"][0]["channel_name"], "Россия 24 HD")
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request("/admin/api/history?days=500")
+            self.assertEqual(error.exception.code, 400)
+        finally:
+            store.close()
 
     def test_logout_revokes_session(self):
         self.login().close()

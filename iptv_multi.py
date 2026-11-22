@@ -8,6 +8,7 @@ internet-facing family streaming server.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import hashlib
 import http.client
 import json
@@ -24,6 +25,7 @@ from iptv_gateway import (
     Gateway, load_or_create_token, private_playlist_text, safe_error,
 )
 from iptv_healthcheck import entries_from_m3u
+from iptv_telemetry import Telemetry
 
 
 @dataclass(frozen=True)
@@ -101,7 +103,8 @@ class MultiGateway:
                  timeout: float = 12, poll: float = 2, cache_mib: int = 128,
                  max_streams: int = 3, idle_seconds: float = 90,
                  startup_wait: float = 18, switch_grace: float = 20,
-                 startup_reserve: float = 30):
+                 startup_reserve: float = 30, telemetry: Telemetry | None = None):
+        self.telemetry = telemetry
         self.channels = {c.id: c for c in channels}
         self.order = [c.id for c in channels]
         self.path = playlist_path
@@ -144,7 +147,9 @@ class MultiGateway:
                           poll=self.poll, max_bytes=self.cache_mib * 1048576,
                           source_refresher=refresh,
                           startup_reserve=None if pinned else self.startup_reserve,
-                          fast_start=not pinned)
+                          fast_start=not pinned,
+                          on_event=(lambda kind, detail, duration: self.telemetry.incident(
+                              channel.id, kind, detail, duration)) if self.telemetry else None)
         return ActiveStream(channel, gateway, self.upstream_slots, pinned)
 
     def start(self, cid: str, *, pinned: bool = False) -> ActiveStream | None:
@@ -248,6 +253,8 @@ class MultiGateway:
                     "seconds_since_access": round(time.monotonic() - stream.accessed, 1),
                 })
             return json.dumps({
+                "telemetry_enabled": self.telemetry is not None,
+                "telemetry_dropped": self.telemetry.dropped if self.telemetry else 0,
                 "channels": len(self.channels),
                 "active_streams": len(self.active),
                 "max_streams": self.max_streams,
@@ -288,6 +295,29 @@ def make_multi_handler(manager: MultiGateway, token: str,
     prefix = "/" + token
 
     class Handler(BaseHTTPRequestHandler):
+        def viewer_identity(self):
+            if manager.telemetry is None:
+                return ""
+            ip = self.client_address[0]
+            # Only trust proxy headers when the actual TCP peer is localhost.
+            # Never keep original IP or user-agent in SQLite.
+            if ip in ("127.0.0.1", "::1"):
+                forwarded = self.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                try:
+                    if forwarded:
+                        ip = str(ipaddress.ip_address(forwarded))
+                except ValueError:
+                    pass
+            return manager.telemetry.viewer(ip, self.headers.get("User-Agent", ""))
+
+        def track_client_failure(self, cid, reason, status):
+            if manager.telemetry is not None and not self._head:
+                manager.telemetry.incident(cid, "client_error", f"HTTP_{status}_{reason}")
+
+        def track_view(self, cid):
+            if manager.telemetry is not None and not self._head:
+                manager.telemetry.observe_segment(cid, self.viewer_identity())
+
         def log_message(self, *_args):
             pass  # No token, viewer IP, or upstream URLs in logs.
 
@@ -313,6 +343,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                     pass
 
         def serve(self, head: bool):
+            self._head = head
             path = urllib.parse.urlsplit(self.path).path
             if not path.startswith(prefix + "/"):
                 return self.respond(404, b"Not found", "text/plain", head)
@@ -359,6 +390,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
             if len(route) == 3 and resource == "index.m3u8":
                 stream = manager.start(cid)
                 if stream is None:
+                    self.track_client_failure(cid, "STREAM_LIMIT", 503)
                     return self.respond(503, b"Too many active streams",
                                         "text/plain", head, {"Retry-After": "10"})
                 # The old implementation immediately returned 503 when
@@ -390,6 +422,9 @@ def make_multi_handler(manager: MultiGateway, token: str,
                         stream.pending_requests -= 1
                         stream.accessed = time.monotonic()
                 if raw is None:
+                    self.track_client_failure(cid, "MANIFEST_WARMUP", 503)
+                    if manager.telemetry is not None and not head:
+                        manager.telemetry.incident(cid, "startup_timeout", "MANIFEST_WARMUP_TIMEOUT")
                     stream.gateway.record_client("manifest", 503)
                     return self.respond(503, b"Buffer warming up; reselect channel",
                                         "text/plain", head, {"Retry-After": "2"})
@@ -408,9 +443,11 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 # An expired stream is not restarted on a stale segment URL.
                 stream = manager.active_stream(cid)
                 if stream is None:
+                    self.track_client_failure(cid, "STREAM_EXPIRED", 404)
                     return self.respond(404, b"Stream expired", "text/plain", head)
                 data = stream.gateway.segment(seq, record_miss=True)
                 if data is None:
+                    self.track_client_failure(cid, "SEGMENT_CACHE_MISS", 404)
                     return self.respond(404, b"Segment not in cache", "text/plain", head)
                 extra = {"Accept-Ranges": "bytes"}
                 requested_range = self.headers.get("Range")
@@ -431,9 +468,11 @@ def make_multi_handler(manager: MultiGateway, token: str,
                     last = min(last, len(data) - 1)
                     extra["Content-Range"] = f"bytes {first}-{last}/{len(data)}"
                     stream.gateway.record_client("segment", 206)
+                    self.track_view(cid)
                     return self.respond(206, data[first:last + 1], "video/mp2t",
                                         head, extra)
                 stream.gateway.record_client("segment", 200)
+                self.track_view(cid)
                 return self.respond(200, data, "video/mp2t", head, extra)
             return self.respond(404, b"Not found", "text/plain", head)
 
@@ -466,6 +505,8 @@ def main(argv=None):
     p.add_argument("--filter", action="append", default=[],
                    help="Show only channels whose names contain this text; repeatable")
     p.add_argument("--token-file", type=Path, default=Path(".iptv_gateway_token"))
+    p.add_argument("--telemetry-db", type=Path, default=None,
+                   help="Opt-in SQLite viewing estimates and incident history; stored outside GitHub")
     p.add_argument("--epg-file", type=Path, default=None,
                    help="Generated private XMLTV gzip file served at /TOKEN/epg.xml.gz")
     p.add_argument("--playlist-url-env", default=None)
@@ -507,10 +548,12 @@ def main(argv=None):
         p.error("No channels found")
     if len({c.id for c in channels}) != len(channels):
         p.error("Channel ID collision")
+    telemetry = Telemetry(args.telemetry_db) if args.telemetry_db else None
     manager = MultiGateway(channels, args.playlist, private_url, args.delay,
                            args.timeout, args.poll, args.cache_mib,
                            args.max_streams, args.idle_seconds,
-                           args.startup_wait, args.switch_grace, args.startup_reserve)
+                           args.startup_wait, args.switch_grace, args.startup_reserve,
+                           telemetry=telemetry)
     try:
         token = load_or_create_token(args.token_file)
     except (OSError, UnicodeError, ValueError):
@@ -548,6 +591,8 @@ def main(argv=None):
         pass
     finally:
         manager.close()
+        if telemetry is not None:
+            telemetry.close()
         server.server_close()
     return 0
 

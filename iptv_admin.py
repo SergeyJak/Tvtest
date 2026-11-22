@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from iptv_multi import channels_from_text
+from iptv_telemetry import query_viewing, query_incidents
 
 ASSETS = Path(__file__).resolve().parent / "admin"
 SESSION_SECONDS = 8 * 3600
@@ -150,12 +151,14 @@ class EpgCache:
 
 class AdminState:
     def __init__(self, playlist: Path, epg: Path, gateway_port: int,
-                 gateway_token_file: Path, password: str):
+                 gateway_token_file: Path, password: str,
+                 telemetry_db: Path | None = None):
         self.playlist = playlist
         self.epg = EpgCache(epg)
         self.gateway_port = gateway_port
         self.gateway_token_file = gateway_token_file
         self.password = password
+        self.telemetry_db = Path(telemetry_db or ".iptv_state/telemetry.sqlite3")
         self.sessions: dict[str, float] = {}
         self.failed: dict[str, list[float]] = defaultdict(list)
         self.lock = threading.Lock()
@@ -263,6 +266,27 @@ class AdminState:
             },
         }
 
+    def _channel_labels(self) -> dict:
+        return {row["id"]: row["name"] for row in self.channels()}
+
+    def viewing_history(self, days: int = 7) -> dict:
+        data = query_viewing(self.telemetry_db, days)
+        names = self._channel_labels()
+        for row in data["channels"] + data["sessions"]:
+            row["channel_name"] = names.get(row["channel_id"], "Неизвестный канал")
+        state = self.gateway_status()
+        data["recording_active"] = bool(state and state.get("telemetry_enabled"))
+        return data
+
+    def incident_history(self, days: int = 7, kind: str = "all") -> dict:
+        data = query_incidents(self.telemetry_db, days, kind)
+        names = self._channel_labels()
+        for row in data["events"]:
+            row["channel_name"] = names.get(row["channel_id"], "Неизвестный канал")
+        state = self.gateway_status()
+        data["recording_active"] = bool(state and state.get("telemetry_enabled"))
+        return data
+
     def channel_response(self) -> dict:
         guide = self.epg.snapshot()
         active_status = self.gateway_status()
@@ -338,7 +362,8 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
             if path not in ("/admin/", "/admin/app.js", "/admin/style.css",
                             "/admin/api/session", "/admin/api/login",
                             "/admin/api/logout", "/admin/api/overview",
-                            "/admin/api/channels"):
+                            "/admin/api/channels", "/admin/api/history",
+                            "/admin/api/incidents"):
                 return self.respond(404, b"Not found", "text/plain", head=head)
             if path in ("/admin/", "/admin/app.js", "/admin/style.css"):
                 if self.command not in ("GET", "HEAD"):
@@ -383,6 +408,20 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                 return self.respond(405, b"", head=head)
             if path == "/admin/api/session":
                 return self.respond(200, b'{"ok":true}', head=head)
+            if path in ("/admin/api/history", "/admin/api/incidents"):
+                from urllib.parse import parse_qs
+                qs = parse_qs(urlsplit(self.path).query)
+                try:
+                    days = int(qs.get("days", ["7"])[0])
+                    if days not in (1, 7, 30):
+                        raise ValueError()
+                    kind = qs.get("kind", ["all"])[0]
+                    data = (state.viewing_history(days) if path.endswith("/history")
+                            else state.incident_history(days, kind))
+                except (ValueError, TypeError):
+                    return self.respond(400, b'{"error":"invalid_filter"}', head=head)
+                return self.respond(200, json.dumps(data, ensure_ascii=False,
+                                                    separators=(",", ":")).encode("utf-8"), head=head)
             if path == "/admin/api/overview":
                 data = state.overview()
             elif path == "/admin/api/channels":
@@ -400,6 +439,7 @@ def main():
     p.add_argument("--playlist", type=Path, default=Path("forgpt.m3u8"))
     p.add_argument("--epg-file", type=Path, default=Path("epg.xml.gz"))
     p.add_argument("--token-file", type=Path, default=Path(".iptv_gateway_token"))
+    p.add_argument("--telemetry-db", type=Path, default=Path(".iptv_state/telemetry.sqlite3"))
     p.add_argument("--password-file", type=Path, default=Path(".iptv_admin_password"))
     p.add_argument("--gateway-port", type=int, default=8787)
     p.add_argument("--port", type=int, default=8790)
@@ -413,7 +453,7 @@ def main():
         p.error("Invalid port")
     password = read_or_create_password(args.password_file)
     state = AdminState(args.playlist, args.epg_file, args.gateway_port,
-                       args.token_file, password)
+                       args.token_file, password, args.telemetry_db)
     server = ThreadingHTTPServer((args.host, args.port),
                                  make_admin_handler(state,
                                                     secure_cookies=not args.local_http))

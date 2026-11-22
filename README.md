@@ -445,3 +445,12 @@ the TV playlist token is not shared with the browser. The admin server binds to
 loopback only and requires the existing HTTPS reverse proxy for public access.
 
 See [ADMIN.md](ADMIN.md) for the systemd service, Caddy/Nginx routing and setup.
+
+## Viewing history and streaming incident log
+
+The administration interface has **Просмотры** and **Ошибки и зависания** pages.
+History uses anonymized HLS segment requests to estimate watching time by channel;
+it is not direct proof of on-screen playback. Incident records include provider
+errors, cache misses, startup timeouts, slow downloads, stream stalls and recovery.
+The gateway stores records asynchronously in a private SQLite database when
+`--telemetry-db` is enabled. See [TELEMETRY.md](TELEMETRY.md) for safe installation.

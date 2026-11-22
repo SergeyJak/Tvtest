@@ -35,6 +35,8 @@
         <button type="button" class="nav-button active" data-target="overview"><span class="nav-icon">◈</span> Обзор</button>
         <button type="button" class="nav-button" data-target="channels"><span class="nav-icon">▤</span> Каналы</button>
         <button type="button" class="nav-button" data-target="epg"><span class="nav-icon">▦</span> Телепрограмма</button>
+        <button type="button" class="nav-button" data-target="history"><span class="nav-icon">◷</span> Просмотры</button>
+        <button type="button" class="nav-button" data-target="incidents"><span class="nav-icon">⚠</span> Ошибки и зависания</button>
         <button type="button" class="nav-button" data-target="system"><span class="nav-icon">⌘</span> Диагностика</button>
       </nav>
       <div class="sidebar-bottom">
@@ -103,6 +105,61 @@
             <article class="panel compact-panel"><div class="eyebrow">SOURCE DETAILS</div><h2>Файл программы</h2><div class="line-stat"><span>Формат</span><strong>XMLTV · GZIP</strong></div><div class="line-stat"><span>Размер</span><strong id="epg-file-size">—</strong></div><div class="line-stat"><span>Передач</span><strong id="epg-programmes">—</strong></div><div class="line-stat"><span>Обновлён</span><strong id="epg-updated">—</strong></div><p class="note">EPG доступен телевизорам через защищённую ссылку в плейлисте.</p></article>
           </div>
           <article class="panel panel-groups"><div class="panel-heading"><div><div class="eyebrow">BREAKDOWN</div><h2>Покрытие по категориям</h2></div></div><div id="group-coverage" class="group-coverage"><div class="empty-state">Загрузка…</div></div></article>
+        </section>
+
+        <section class="view" id="view-history" hidden>
+          <div class="view-heading">
+            <div><div class="eyebrow">VIEWING ANALYTICS</div><h1>История просмотров<span class="accent">.</span></h1><p>Какие каналы запрашивались и приблизительное время просмотра.</p></div>
+            <select id="history-days" aria-label="Период истории просмотров"><option value="1">За 24 часа</option><option value="7" selected>За 7 дней</option><option value="30">За 30 дней</option></select>
+          </div>
+          <div class="notice" id="history-notice">Сведения основаны на запросах HLS-сегментов. Время приблизительное и может отличаться от фактического просмотра.</div>
+          <div class="metrics history-metrics">
+            <article class="metric"><div class="metric-top">Общее время <span>◷</span></div><div class="metric-number" id="history-total-time">—</div><div class="metric-caption">Оценка по сетевой активности</div></article>
+            <article class="metric"><div class="metric-top">Сессии <span>◉</span></div><div class="metric-number" id="history-sessions">—</div><div class="metric-caption">Непрерывные интервалы активности</div></article>
+            <article class="metric"><div class="metric-top">Каналы <span>▤</span></div><div class="metric-number" id="history-channels">—</div><div class="metric-caption">За выбранный период</div></article>
+            <article class="metric"><div class="metric-top">Запись данных <span>●</span></div><div class="metric-number metric-word" id="history-recording">—</div><div class="metric-caption">Текущий сбор событий шлюза</div></article>
+          </div>
+          <div class="dashboard-grid">
+            <article class="panel panel-main">
+              <div class="panel-heading"><div><div class="eyebrow">TOP CHANNELS</div><h2>По времени просмотра</h2></div></div>
+              <div id="history-ranking" class="history-ranking"><div class="empty-state">Загрузка истории…</div></div>
+            </article>
+            <article class="panel">
+              <div class="panel-heading"><div><div class="eyebrow">RECENT ACTIVITY</div><h2>Последние подключения</h2></div></div>
+              <div id="history-recent" class="history-recent"><div class="empty-state">Загрузка истории…</div></div>
+            </article>
+          </div>
+          <p class="section-footnote">Время рассчитывается по запросам видеофрагментов, с паузами и ограничением интервала между запросами. Данные не восстанавливаются задним числом и автоматически удаляются спустя 30 дней.</p>
+        </section>
+
+        <section class="view" id="view-incidents" hidden>
+          <div class="view-heading">
+            <div><div class="eyebrow">STREAMING INCIDENTS</div><h1>Ошибки и зависания<span class="accent">.</span></h1><p>Хронология сетевых ошибок, проблем буфера и остановок потока.</p></div>
+            <div class="period-controls">
+              <select id="incident-days" aria-label="Период ошибок"><option value="1">За 24 часа</option><option value="7" selected>За 7 дней</option><option value="30">За 30 дней</option></select>
+              <select id="incident-filter" aria-label="Тип события">
+                <option value="all">Все события</option><option value="stream_stalled">Зависания</option>
+                <option value="stream_recovered">Восстановления</option>
+                <option value="upstream_error">Ошибки источника</option>
+                <option value="client_error">Ошибки проигрывателя</option>
+                <option value="startup_timeout">Таймауты запуска</option>
+                <option value="segment_slow">Медленные сегменты</option>
+              </select>
+            </div>
+          </div>
+          <div class="notice" id="incident-notice">Обнаружение зависания означает, что источник перестал выдавать новые HLS-сегменты. Это не всегда подтверждает, что изображение замерло на телевизоре.</div>
+          <div class="metrics">
+            <article class="metric"><div class="metric-top">Зависания <span>⊗</span></div><div class="metric-number" id="incident-stalls">—</div><div class="metric-caption">Отсутствие новых сегментов</div></article>
+            <article class="metric"><div class="metric-top">Ошибки источника <span>⚠</span></div><div class="metric-number" id="incident-upstream">—</div><div class="metric-caption">HTTP и сеть провайдера</div></article>
+            <article class="metric"><div class="metric-top">Ошибки клиента <span>⌁</span></div><div class="metric-number" id="incident-client">—</div><div class="metric-caption">404 и 503</div></article>
+            <article class="metric"><div class="metric-top">Медленные загрузки <span>◴</span></div><div class="metric-number" id="incident-slow">—</div><div class="metric-caption">Сегменты медленнее их длительности</div></article>
+          </div>
+          <article class="panel table-panel">
+            <div class="incident-table-top"><div><div class="eyebrow">EVENT LOG</div><h2>Журнал инцидентов</h2></div><span id="incident-total" class="count-chip">—</span></div>
+            <div class="table-scroll"><table><thead><tr><th>Когда</th><th>Канал</th><th>Событие</th><th>Детали</th><th>Длительность</th></tr></thead><tbody id="incident-table"><tr><td colspan="5">Загрузка событий…</td></tr></tbody></table></div>
+            <div class="table-footer"><span>Показано до 200 последних событий за период</span><button id="incident-refresh" class="small-outline" type="button">Обновить журнал ↻</button></div>
+          </article>
+          <p class="section-footnote">События фиксируются с момента включения сбора на VPS. Секретные адреса потоков и IP зрителей в журнал не записываются.</p>
         </section>
 
         <section class="view" id="view-system" hidden>
