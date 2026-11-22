@@ -217,6 +217,28 @@ class AdminTests(unittest.TestCase):
             self.request("/admin/api/profiles/4", data=payload, json_body=True)
         self.assertEqual(err.exception.code, 404)
 
+    def test_admin_can_save_remote_m3u_and_receives_private_playback_link(self):
+        playlist = ('#EXTM3U\n'
+                    '#EXTINF:-1 group-title="Тест",Другой канал\n'
+                    'https://upstream.example/private/STREAM_CREDENTIAL\n')
+        provider_url = "https://m3u.example/playlist?login=PRIVATE_123"
+        body = json.dumps({"name": "ТВ родителей", "m3u_url": provider_url}).encode()
+        with patch("iptv_profiles.download_playlist", return_value=playlist), \\
+             patch("iptv_profile_jobs.start_generation"):
+            self.login().close()
+            with self.request("/admin/api/profiles/2", data=body, json_body=True) as response:
+                response_text = response.read().decode()
+        data = json.loads(response_text)["profiles"]
+        self.assertTrue(data[1]["configured"])
+        self.assertEqual(data[1]["name"], "ТВ родителей")
+        self.assertIn("/channels.m3u", data[1]["m3u"])
+        self.assertNotEqual(data[1]["m3u"], data[0]["m3u"])
+        self.assertEqual(data[1]["source_host"], "m3u.example")
+        self.assertNotIn("PRIVATE_123", response_text)
+        self.assertNotIn("STREAM_CREDENTIAL", response_text)
+        self.assertNotIn("source_url", response_text)
+        self.assertIn("Другой канал", self.state.profiles.snapshot_path(2).read_text())
+
     def test_profile_save_requires_login(self):
         payload = json.dumps({"name": "My TV"}).encode()
         with self.assertRaises(urllib.error.HTTPError) as result:
