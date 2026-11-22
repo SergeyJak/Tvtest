@@ -345,7 +345,6 @@ class Gateway:
         except (urllib.error.URLError, TimeoutError, OSError, ValueError, http.client.IncompleteRead) as exc:
             self.record_upstream_failure('MANIFEST', exc)
             code = exc.code if isinstance(exc, urllib.error.HTTPError) else None
-            transient_http = code in (404, 429, 500, 502, 503, 504)
             # Retry transport failures too; invalid HLS parsing should not
             # cause a tight loop of requests to a broken endpoint.
             with self.lock:
@@ -604,6 +603,9 @@ class Gateway:
                         error_breakdown=dict(self.error_breakdown),
                         recent_upstream_failures=list(self.recent_upstream_failures),
                         consecutive_manifest_404=self.consecutive_manifest_404,
+                        manifest_failure_streak=self.manifest_failure_streak,
+                        manifest_retry_in_seconds=round(
+                            max(0.0, self.manifest_backoff_until - time.monotonic()), 1),
                         source_refresh_attempts=self.source_refresh_attempts,
                         source_refresh_errors=self.source_refresh_errors,
                         source_refresh_error=self.source_refresh_error,
