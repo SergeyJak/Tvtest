@@ -119,6 +119,7 @@ class AdminTests(unittest.TestCase):
         self.assertEqual([c["epg"] for c in channels], [True, False])
         self.assertEqual([c["active"] for c in channels], [True, False])
         self.assertNotIn("SECRET_TOKEN", json.dumps(channels))
+        self.assertEqual([c["group"] for c in channels], ["News", "Movies"])
 
     def test_logout_revokes_session(self):
         self.login().close()
