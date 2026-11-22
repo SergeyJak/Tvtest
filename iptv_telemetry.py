@@ -51,11 +51,14 @@ KINDS = {"upstream_error", "segment_slow", "stream_stalled",
 
 
 def prepare_database(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.parent.stat().st_mode & 0o077:
+        raise ValueError("Telemetry directory must not be accessible by other users")
     with sqlite3.connect(path, timeout=5) as db:
         db.executescript(SCHEMA)
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA busy_timeout=3000")
+    os.chmod(path, 0o600)
 
 
 def _read_or_create_secret(path: Path) -> bytes:
