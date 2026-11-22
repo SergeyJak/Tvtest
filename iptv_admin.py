@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only HeySmart TV administration, isolated from the streaming gateway.
+"""HeySmart TV administration with authenticated profile management.
 
 Binds to loopback only. Publish /admin/ through an existing HTTPS reverse proxy.
 A separate random password (not the TV playlist token) protects all data APIs.
@@ -498,7 +498,7 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Private read-only TV administration")
+    p = argparse.ArgumentParser(description="Private TV administration and three profile management")
     p.add_argument("--playlist", type=Path, default=Path("forgpt.m3u8"))
     p.add_argument("--epg-file", type=Path, default=Path("epg.xml.gz"))
     p.add_argument("--token-file", type=Path, default=Path(".iptv_gateway_token"))
