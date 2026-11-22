@@ -16,6 +16,7 @@ from unittest.mock import patch
 from iptv_multi import MultiGateway, channels_from_text, make_multi_handler
 from iptv_profiles import ProfileStore, ProfileError
 from iptv_profile_gateway import ProfileRegistry
+from iptv_profile_jobs import generate_for_slot
 
 
 PLAYLIST = """#EXTM3U
@@ -154,6 +155,30 @@ class ThreeCabinetTests(unittest.TestCase):
                 self.store.update(2, "Untrusted", "https://example.org/private")
         self.assertEqual(self.store.get(2)["source_url"], "")
         self.assertFalse(self.store.snapshot_path(2).exists())
+
+    def test_epg_is_generated_for_the_correct_cabinet_only(self):
+        xml = (b'<tv><channel id="guide-c">'
+               b'<display-name>Channel C</display-name></channel>'
+               b'<programme channel="guide-c" start="20261122110000 +0000" '
+               b'stop="20261122120000 +0000">'
+               b'<title>Sample programme</title></programme></tv>')
+        epg_source = Path(self.temp.name) / "provider-epg.xml.gz"
+        epg_source.write_bytes(gzip.compress(xml))
+        with patch("iptv_profiles.download_playlist", return_value=OTHER), \
+             patch("iptv_profiles.validate_source_url", side_effect=lambda value: value):
+            row, _ = self.store.update(
+                2, "EPG Source", "https://provider.example/m3u",
+                str(epg_source))
+        with patch("iptv_profile_jobs.validate_source_url", side_effect=lambda value: value):
+            status = generate_for_slot(self.store, 2)
+        self.assertEqual(status, "updated")
+        with gzip.open(self.store.epg_path(2), "rb") as source:
+            result = source.read().decode()
+        self.assertIn("Sample programme", result)
+        self.assertIn(channels_from_text(OTHER)[0].id, result)
+        self.assertNotIn(channels_from_text(PLAYLIST)[0].id, result)
+        self.assertTrue(self.store.legacy_epg.is_file())
+        self.assertEqual(self.registry.resolve(row["token"])[2], self.store.epg_path(2))
 
     def test_first_profile_switches_source_without_changing_url(self):
         before = self.store.public_profiles("https://tv.example.test")[0]["m3u"]
