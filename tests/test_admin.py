@@ -190,7 +190,7 @@ class AdminTests(unittest.TestCase):
         self.assertEqual(result["max_streams"], 4)
         self.assertEqual(result["catalog_requests"], 6)
         self.assertEqual([row["profile_name"] for row in result["streams"]],
-                         ["Мой ТВ", "Родители"])
+                         ["Основной", "Родители"])
         self.assertEqual(len(result["cabins"]), 2)
         self.assertNotIn("M3U_SECRET", json.dumps(result))
         self.assertNotIn(first_token, json.dumps(result))
