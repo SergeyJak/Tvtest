@@ -93,8 +93,7 @@ def merge(playlist: str, sources: list[bytes], aliases: dict[str, str] | None = 
             if not programme.get("start") or not programme.findtext("title"):
                 continue
             for channel in candidates:
-                key = (channel.id, programme.get("start"), programme.get("stop"),
-                       programme.findtext("title"))
+                key = (channel.id, programme.get("start"))
                 if key in seen_programmes:
                     continue
                 seen_programmes.add(key)
