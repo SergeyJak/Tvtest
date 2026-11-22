@@ -97,6 +97,24 @@ class TelemetryStorageTests(unittest.TestCase):
         self.assertEqual(events[0][2], 41)
         self.assertEqual(events[1][2], 49)
 
+    def test_segment_download_freeze_even_when_playlist_progresses(self):
+        events = []
+        gw = iptv_gateway.Gateway("https://source.invalid",
+                                  on_event=lambda kind, label, seconds:
+                                  events.append((kind, label, seconds)))
+        gw.last_progress = 139  # playlist still changing
+        gw.last_segment_download = 101  # but video data no longer downloads
+        gw.target = 10
+        with patch.object(iptv_gateway.time, "time", return_value=141):
+            gw.check_stall()
+        self.assertEqual(events[0][0], "stream_stalled")
+        self.assertEqual(events[0][1], "NO_DOWNLOADED_SEGMENTS")
+        gw.last_segment_download = 145
+        gw.last_progress = 145
+        with patch.object(iptv_gateway.time, "time", return_value=146):
+            gw.check_stall()
+        self.assertEqual(events[1][0], "stream_recovered")
+
     def test_safe_failure_callback(self):
         failures = []
         gw = iptv_gateway.Gateway("https://source.invalid",
