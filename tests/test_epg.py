@@ -15,10 +15,10 @@ https://example.test/stream2
 https://example.test/stream3
 """
 
-GUIDE = b"""<?xml version="1.0" encoding="utf-8"?>
+GUIDE = """<?xml version="1.0" encoding="utf-8"?>
 <tv><channel id="russia24"><display-name>Россия 24</display-name></channel>
 <programme channel="russia24" start="20261122080000 +0000" stop="20261122090000 +0000">
-<title>Новости</title></programme></tv>"""
+<title>Новости</title></programme></tv>""".encode("utf-8")
 
 
 class EpGTests(unittest.TestCase):
@@ -35,8 +35,7 @@ class EpGTests(unittest.TestCase):
         self.assertNotIn(ids[2], [e.get("id") for e in root.findall("channel")])
 
     def test_first_source_wins_conflicting_programme(self):
-        competing = GUIDE.replace(b"Новости", b"Other") if False else GUIDE.replace(
-            "Новости".encode(), "Другая передача".encode())
+        competing = GUIDE.replace("Новости".encode(), "Другая передача".encode())
         xml, report = merge(PLAYLIST, [GUIDE, competing])
         self.assertEqual(report["programmes"], 2)
         self.assertEqual(ET.fromstring(xml).findtext("programme/title"), "Новости")
