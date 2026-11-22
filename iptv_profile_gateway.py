@@ -67,6 +67,7 @@ class ProfileRegistry:
                     opts = dict(self.options)
                     opts["max_streams"] = 1
                     opts["telemetry"] = self.options.get("telemetry")
+                    opts["profile_slot"] = slot
                     manager = MultiGateway(channels, snapshot, row["source_url"], **opts)
                     self.managers[slot] = (row["revision"], manager)
                     thread = threading.Thread(target=manager.cleanup_loop,
