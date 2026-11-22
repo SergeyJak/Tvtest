@@ -297,11 +297,12 @@ class MultiGateway:
 
 def make_multi_handler(manager: MultiGateway, token: str,
                        public_base_url: str | None = None,
-                       epg_file: Path | None = None):
-    prefix = "/" + token
+                       epg_file: Path | None = None,
+                       profile_registry=None):
 
     class Handler(BaseHTTPRequestHandler):
         def viewer_identity(self):
+            manager = self._request_manager
             if manager.telemetry is None:
                 return ""
             ip = self.client_address[0]
@@ -317,10 +318,12 @@ def make_multi_handler(manager: MultiGateway, token: str,
             return manager.telemetry.viewer(ip, self.headers.get("User-Agent", ""))
 
         def track_client_failure(self, cid, reason, status):
+            manager = self._request_manager
             if manager.telemetry is not None and not self._head:
                 manager.telemetry.incident(cid, "client_error", f"HTTP_{status}_{reason}")
 
         def track_view(self, cid):
+            manager = self._request_manager
             if manager.telemetry is not None and not self._head:
                 manager.telemetry.observe_segment(cid, self.viewer_identity())
 
@@ -348,7 +351,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
-        def serve_epg(self, head: bool):
+        def serve_epg(self, head: bool, epg_file: Path):
             """Conditional and streaming EPG delivery without reading the 43 MB
             gzip into memory for every HEAD/GET request.
             """
@@ -411,11 +414,22 @@ def make_multi_handler(manager: MultiGateway, token: str,
         def serve(self, head: bool):
             self._head = head
             path = urllib.parse.urlsplit(self.path).path
+            requested_token = path.split("/", 2)[1] if path.startswith("/") else ""
+            if profile_registry is None:
+                resolved = (manager, token, epg_file) if requested_token == token else None
+            else:
+                resolved = profile_registry.resolve(requested_token)
+            if resolved is None:
+                return self.respond(404, b"Not found", "text/plain", head)
+            manager, active_token, epg_file = resolved
+            self._request_manager = manager
+            token = active_token
+            prefix = "/" + token
             if not path.startswith(prefix + "/"):
                 return self.respond(404, b"Not found", "text/plain", head)
             route = path[len(prefix) + 1:].split("/")
             if route == ["epg.xml.gz"] and epg_file is not None:
-                return self.serve_epg(head)
+                return self.serve_epg(head, epg_file)
             if route == ["status"]:
                 return self.respond(200, manager.status(), "application/json", head)
             if route == ["channels.m3u"]:
@@ -570,6 +584,8 @@ def main(argv=None):
     p.add_argument("--epg-file", type=Path, default=None,
                    help="Generated private XMLTV gzip file served at /TOKEN/epg.xml.gz")
     p.add_argument("--playlist-url-env", default=None)
+    p.add_argument("--profiles-dir", type=Path, default=Path(".iptv_profiles"),
+                   help="Owner-only persisted three-TV-profile configuration")
     args = p.parse_args(argv)
     if not (15 <= args.delay <= 120 and args.poll > 0 and args.timeout > 0
             and 32 <= args.cache_mib <= 2048 and 1 <= args.max_streams <= 8
@@ -632,8 +648,19 @@ def main(argv=None):
         manager.legacy_channel_id = prewarm[0]
     for cid in dict.fromkeys(prewarm):
         manager.start(cid, pinned=True)
+    from iptv_profiles import ProfileStore
+    from iptv_profile_gateway import ProfileRegistry
+    store = ProfileStore(args.profiles_dir, args.playlist, args.epg_file, args.token_file)
+    profile_registry = ProfileRegistry(
+        store, manager, token, args.epg_file,
+        dict(delay=args.delay, timeout=args.timeout, poll=args.poll,
+             cache_mib=args.cache_mib, max_streams=args.max_streams,
+             idle_seconds=args.idle_seconds, startup_wait=args.startup_wait,
+             switch_grace=args.switch_grace, startup_reserve=args.startup_reserve,
+             telemetry=telemetry))
     server = ThreadingHTTPServer((args.host, args.port),
-                                 make_multi_handler(manager, token, public_base_url, args.epg_file))
+                                 make_multi_handler(manager, token, public_base_url,
+                                                    args.epg_file, profile_registry))
     server.daemon_threads = True
     sweep_thread = threading.Thread(target=manager.cleanup_loop, daemon=True)
     sweep_thread.start()
@@ -650,6 +677,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
+        profile_registry.close()
         manager.close()
         if telemetry is not None:
             telemetry.close()
