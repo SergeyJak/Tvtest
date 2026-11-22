@@ -186,6 +186,7 @@ class ThreeCabinetTests(unittest.TestCase):
             row, changed = self.store.update(1, "Мой ТВ",
                 "https://example.test/new_playlist")
         self.assertTrue(changed)
+        self.assertEqual(self.registry.resolve(row["token"])[0].max_streams, 2)
         with self.request(row["token"], "channels.m3u") as response:
             body = response.read().decode()
         self.assertIn("Channel C", body)

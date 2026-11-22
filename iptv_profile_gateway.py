@@ -65,7 +65,10 @@ class ProfileRegistry:
                     if not channels:
                         continue
                     opts = dict(self.options)
-                    opts["max_streams"] = 1
+                    # Keep original primary capacity after switching its M3U
+                    # from the local file to a provider URL. A one-stream cap
+                    # can block channel changes until the old stream expires.
+                    opts["max_streams"] = self.options["max_streams"] if slot == 1 else 1
                     opts["telemetry"] = self.options.get("telemetry")
                     opts["profile_slot"] = slot
                     manager = MultiGateway(channels, snapshot, row["source_url"], **opts)
