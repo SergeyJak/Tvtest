@@ -40,6 +40,14 @@ class EpGTests(unittest.TestCase):
         self.assertEqual(report["programmes"], 2)
         self.assertEqual(ET.fromstring(xml).findtext("programme/title"), "Новости")
 
+    def test_explicit_alias_matches_unrelated_xmltv_id(self):
+        guide = b"""<tv><channel id="channel-123"><display-name>Unrelated</display-name></channel>
+<programme channel="channel-123" start="20261122080000 +0000"><title>News</title></programme></tv>"""
+        xml, report = merge(PLAYLIST, [guide], {"ТВ 3": "channel-123"})
+        self.assertEqual(report["channels_with_epg"], 1)
+        self.assertEqual(report["programmes"], 1)
+        self.assertEqual(ET.fromstring(xml).findtext("programme/title"), "News")
+
     def test_m3u_guide_url_and_matching_ids(self):
         channels = channels_from_text(PLAYLIST)
         manager = MultiGateway(channels, __import__("pathlib").Path("not-used"))
