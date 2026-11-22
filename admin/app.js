@@ -5,7 +5,7 @@
   const app = $("app");
   const loginScreen = $("login-screen");
   const state = {overview: null, channels: [], epgStatus: "", page: 0, size: 50, lastCatalog: 0, view: "overview", busy: false};
-  const views = {overview:"ОБЗОР", channels:"КАНАЛЫ", epg:"ТЕЛЕПРОГРАММА", tv:"ПОДКЛЮЧЕНИЕ ТВ", history:"ПРОСМОТРЫ", incidents:"ОШИБКИ И ЗАВИСАНИЯ", system:"ДИАГНОСТИКА"};
+  const views = {overview:"ОБЗОР", channels:"КАНАЛЫ", epg:"ТЕЛЕПРОГРАММА", tv:"КАБИНЕТЫ ТВ", history:"ПРОСМОТРЫ", incidents:"ОШИБКИ И ЗАВИСАНИЯ", system:"ДИАГНОСТИКА"};
 
   function text(id, value) {
     const node = $(id);
@@ -32,15 +32,14 @@
     text("crumb", views[name]);
     if (name === "channels") renderChannels();
     if (name === "epg") renderGroups();
-    if (name === "tv") loadTvLinks();
+    if (name === "tv") loadTvProfiles();
     if (name === "history") loadHistory();
     if (name === "incidents") loadIncidents();
   }
   function showLogin() {
     state.overview = null;
     state.channels = [];
-    for (const id of ["tv-m3u-url", "tv-epg-url"]) $(id).value = "";
-    for (const id of ["tv-copy-m3u", "tv-copy-epg"]) $(id).disabled = true;
+    $("profiles-container").replaceChildren();
     app.hidden = true;
     loginScreen.hidden = false;
     $("password").value = "";
@@ -53,7 +52,7 @@
   async function api(path, options) {
     const response = await fetch("/admin/api/" + path, Object.assign({credentials:"same-origin", cache:"no-store"}, options || {}));
     if (response.status === 401 && path !== "login") { showLogin(); throw new Error("Требуется вход"); }
-    if (!response.ok) throw new Error("HTTP " + response.status);
+    if (!response.ok) { const details = await response.json().catch(() => ({})); throw new Error(details.error && /[а-яА-Я]/.test(details.error) ? details.error : "HTTP " + response.status); }
     return response.json();
   }
   function badge(id, value, isBad) {
@@ -250,25 +249,119 @@
       day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit"
     });
   }
-  async function loadTvLinks() {
-    const m3u = $("tv-m3u-url");
-    const epg = $("tv-epg-url");
-    const m3uCopy = $("tv-copy-m3u");
-    const epgCopy = $("tv-copy-epg");
-    m3uCopy.disabled = true;
-    epgCopy.disabled = true;
-    text("tv-link-status", "");
+  function profileField(card, id, title, value, placeholder, readonly, type) {
+    const container = element("div", "profile-field");
+    const label = element("label", "", title);
+    label.htmlFor = id;
+    container.append(label);
+    const input = element("input", "");
+    input.id = id;
+    input.type = type || "text";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.readOnly = !!readonly;
+    input.value = value || "";
+    input.placeholder = placeholder || "";
+    if (id.endsWith("-name")) { input.maxLength = 50; input.required = true; }
+    container.append(input);
+    card.append(container);
+    return input;
+  }
+  function renderTvProfiles(profiles) {
+    const container = $("profiles-container");
+    container.replaceChildren();
+    profiles.forEach(profile => {
+      const slot = profile.slot;
+      const card = element("article", "panel tv-profile-card");
+      const header = element("div", "profile-card-head");
+      const left = element("div", "");
+      left.append(element("div", "eyebrow", "КАБИНЕТ " + slot));
+      left.append(element("h2", "", profile.name));
+      header.append(left);
+      const badge = element("span", "profile-state " + (profile.configured ? "ready" : ""),
+                            profile.configured ? "● Настроен" : "○ Не настроен");
+      header.append(badge);
+      card.append(header);
+      const detail = profile.legacy ? "Работает с существующим локальным M3U"
+        : profile.source_host ? "Источник: " + profile.source_host
+        : "Вставь M3U от своего провайдера";
+      card.append(element("p", "profile-source", detail));
+      const form = element("form", "profile-edit-form");
+      profileField(form, "profile-" + slot + "-name", "Название кабинета", profile.name, "Название", false);
+      profileField(form, "profile-" + slot + "-source", "Новая ссылка на M3U", "",
+                   profile.configured ? "Оставь пустым, чтобы сохранить текущий источник" : "https://provider.example/playlist.m3u", false, "url");
+      profileField(form, "profile-" + slot + "-epg-source", "Отдельный EPG URL (необязательно)", "",
+                   "Если в M3U нет XMLTV или хочешь указать другой", false, "url");
+      const save = element("button", "primary-btn profile-save-btn", "Сохранить кабинет ↗");
+      save.type = "submit";
+      form.append(save);
+      const feedback = element("div", "profile-feedback");
+      feedback.id = "profile-" + slot + "-feedback";
+      feedback.setAttribute("role", "status");
+      form.append(feedback);
+      form.addEventListener("submit", event => { event.preventDefault(); saveTvProfile(slot, save); });
+      card.append(form);
+
+      const urls = element("div", "profile-links");
+      const linkHeader = element("div", "eyebrow", "ССЫЛКИ ДЛЯ ТЕЛЕВИЗОРА");
+      urls.append(linkHeader);
+      [["m3u", "M3U · каналы", profile.m3u],
+       ["epg", "XMLTV · программа", profile.epg]].forEach(([kind, label, value]) => {
+        const group = element("div", "profile-url-row");
+        const id = "profile-" + slot + "-" + kind + "-url";
+        const title = element("label", "", label);
+        title.htmlFor = id;
+        group.append(title);
+        const inner = element("div", "tv-link-control");
+        const input = element("input", "");
+        input.id = id; input.readOnly = true; input.spellcheck = false;
+        input.value = value || "";
+        input.placeholder = kind === "epg" && profile.epg_status === "pending"
+          ? "EPG подготавливается" : kind === "epg" ? "EPG не найден" : "Сначала добавь M3U";
+        inner.append(input);
+        const button = element("button", "copy-link-btn", "Копировать");
+        button.type = "button"; button.dataset.copy = id; button.disabled = !value;
+        inner.append(button);
+        group.append(inner);
+        urls.append(group);
+      });
+      const epgLabels = {ready: "EPG готов", pending: "EPG подготавливается",
+                         unavailable: "Нет источника EPG"};
+      urls.append(element("div", "profile-epg-hint", epgLabels[profile.epg_status] || ""));
+      card.append(urls);
+      container.append(card);
+    });
+  }
+  async function loadTvProfiles() {
     try {
-      const data = await api("tv-links");
-      if (!data.available || !data.m3u || !data.epg) throw new Error("No TV links");
-      m3u.value = data.m3u;
-      epg.value = data.epg;
-      m3uCopy.disabled = false;
-      epgCopy.disabled = false;
+      const data = await api("profiles");
+      renderTvProfiles(data.profiles || []);
     } catch (_error) {
-      m3u.value = "";
-      epg.value = "";
-      if (!app.hidden) text("tv-link-status", "Не удалось загрузить ссылки. Проверь файл токена на VPS.");
+      if (!app.hidden) $("profiles-container").replaceChildren(
+        element("div", "empty-state", "Не удалось загрузить кабинеты ТВ."));
+    }
+  }
+  async function saveTvProfile(slot, button) {
+    const name = $("profile-" + slot + "-name").value.trim();
+    const source = $("profile-" + slot + "-source").value.trim();
+    const epg = $("profile-" + slot + "-epg-source").value.trim();
+    const body = {name};
+    if (source) body.m3u_url = source;
+    if (epg) body.epg_url = epg;
+    button.disabled = true;
+    text("profile-" + slot + "-feedback", "Проверяем и сохраняем настройки…");
+    try {
+      const result = await api("profiles/" + slot, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body)
+      });
+      // Clear source URL from editable controls, then redraw from sanitized
+      // data; the provider's private query strings are never displayed again.
+      renderTvProfiles(result.profiles);
+      text("profile-" + slot + "-feedback", "Сохранено. Скопируй ссылку M3U для телевизора.");
+    } catch (error) {
+      text("profile-" + slot + "-feedback", error.message || "Не удалось сохранить профиль.");
+      button.disabled = false;
     }
   }
   async function copyTvLink(button) {
@@ -284,13 +377,13 @@
         if (!document.execCommand("copy")) throw new Error("copy unavailable");
       }
       button.textContent = "Скопировано ✓";
-      text("tv-link-status", "Ссылка скопирована. Вставь её в настройки IPTV-плеера.");
+      text("profiles-page-message", "Ссылка скопирована. Вставь её в настройки плеера.");
     } catch (_error) {
       input.focus();
       input.select();
-      text("tv-link-status", "Выдели адрес и скопируй вручную.");
+      text("profiles-page-message", "Выдели адрес и скопируй вручную.");
     }
-    setTimeout(() => { button.textContent = original; }, 1800);
+    setTimeout(() => { if (button.isConnected) button.textContent = original; }, 1800);
   }
 
   async function loadHistory() {
@@ -417,7 +510,10 @@
   $("prev-page").addEventListener("click", () => { state.page--; renderChannels(); });
   $("next-page").addEventListener("click", () => { state.page++; renderChannels(); });
   $("refresh-button").addEventListener("click", () => refresh(true));
-  document.querySelectorAll("[data-copy]").forEach(button => button.addEventListener("click", () => copyTvLink(button)));
+  $("profiles-container").addEventListener("click", event => {
+    const button = event.target.closest("button[data-copy]");
+    if (button) copyTvLink(button);
+  });
   $("history-days").addEventListener("change", loadHistory);
   $("incident-days").addEventListener("change", loadIncidents);
   $("incident-filter").addEventListener("change", loadIncidents);
