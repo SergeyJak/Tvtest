@@ -106,8 +106,10 @@ class MultiGateway:
                  timeout: float = 12, poll: float = 2, cache_mib: int = 128,
                  max_streams: int = 3, idle_seconds: float = 90,
                  startup_wait: float = 18, switch_grace: float = 20,
-                 startup_reserve: float = 30, telemetry: Telemetry | None = None):
+                 startup_reserve: float = 30, telemetry: Telemetry | None = None,
+                 profile_slot: int = 1):
         self.telemetry = telemetry
+        self.profile_slot = profile_slot
         self.channels = {c.id: c for c in channels}
         self.order = [c.id for c in channels]
         self.path = playlist_path
@@ -137,6 +139,11 @@ class MultiGateway:
         self.legacy_manifest_requests = 0
         self.legacy_segment_requests = 0
 
+    def telemetry_channel_id(self, cid: str) -> str:
+        # Keep existing profile-1 history stable. Distinguish otherwise
+        # identical channels watched through separate subscription cabinets.
+        return cid if self.profile_slot == 1 else f"p{self.profile_slot}:{cid}"
+
     def _new_stream(self, channel: Channel, pinned: bool) -> ActiveStream:
         def refresh() -> str:
             text = private_playlist_text(self.path, self.private_url, self.timeout)
@@ -152,7 +159,7 @@ class MultiGateway:
                           startup_reserve=None if pinned else self.startup_reserve,
                           fast_start=not pinned,
                           on_event=(lambda kind, detail, duration: self.telemetry.incident(
-                              channel.id, kind, detail, duration)) if self.telemetry else None)
+                              self.telemetry_channel_id(channel.id), kind, detail, duration)) if self.telemetry else None)
         return ActiveStream(channel, gateway, self.upstream_slots, pinned)
 
     def start(self, cid: str, *, pinned: bool = False) -> ActiveStream | None:
@@ -321,12 +328,12 @@ def make_multi_handler(manager: MultiGateway, token: str,
         def track_client_failure(self, cid, reason, status):
             manager = self._request_manager
             if manager.telemetry is not None and not self._head:
-                manager.telemetry.incident(cid, "client_error", f"HTTP_{status}_{reason}")
+                manager.telemetry.incident(manager.telemetry_channel_id(cid), "client_error", f"HTTP_{status}_{reason}")
 
         def track_view(self, cid):
             manager = self._request_manager
             if manager.telemetry is not None and not self._head:
-                manager.telemetry.observe_segment(cid, self.viewer_identity())
+                manager.telemetry.observe_segment(manager.telemetry_channel_id(cid), self.viewer_identity())
 
         def log_message(self, *_args):
             pass  # No token, viewer IP, or upstream URLs in logs.
@@ -498,7 +505,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 if raw is None:
                     self.track_client_failure(cid, "MANIFEST_WARMUP", 503)
                     if request_manager.telemetry is not None and not head:
-                        request_manager.telemetry.incident(cid, "startup_timeout", "MANIFEST_WARMUP_TIMEOUT")
+                        request_manager.telemetry.incident(manager.telemetry_channel_id(cid), "startup_timeout", "MANIFEST_WARMUP_TIMEOUT")
                     stream.gateway.record_client("manifest", 503)
                     return self.respond(503, b"Buffer warming up; reselect channel",
                                         "text/plain", head, {"Retry-After": "2"})
