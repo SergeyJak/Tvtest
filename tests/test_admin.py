@@ -150,10 +150,20 @@ class AdminTests(unittest.TestCase):
             self.request("/admin/api/tv-links")
         self.assertEqual(error.exception.code, 401)
 
-    def test_tv_links_fail_closed_without_private_token(self):
+    def test_default_tv_token_is_bootstrapped_for_first_cabinet(self):
         self.login().close()
         with self.request("/admin/api/tv-links") as response:
-            self.assertEqual(json.load(response), {"available": False})
+            data = json.load(response)
+        self.assertTrue(data["available"])
+        self.assertIn("/channels.m3u", data["m3u"])
+        with self.request("/admin/api/profiles") as response:
+            profiles = json.load(response)["profiles"]
+        self.assertEqual(len(profiles), 3)
+        self.assertTrue(profiles[0]["configured"])
+        self.assertFalse(profiles[1]["configured"])
+        self.assertFalse(profiles[2]["configured"])
+        self.assertEqual(profiles[0]["m3u"], data["m3u"])
+        self.assertNotEqual(profiles[0]["m3u"], profiles[1]["m3u"])
 
     def test_new_private_history_and_incident_endpoints(self):
         # The two pages require the same independent admin session.
@@ -187,6 +197,31 @@ class AdminTests(unittest.TestCase):
             self.assertEqual(error.exception.code, 400)
         finally:
             store.close()
+
+    def test_profiles_api_renames_and_hides_provider_playlist_source(self):
+        self.login().close()
+        with self.request("/admin/api/profiles") as response:
+            original = json.load(response)["profiles"]
+        primary_url = original[0]["m3u"]
+        payload = json.dumps({"name": "Родителям"}).encode()
+        with self.request("/admin/api/profiles/1", data=payload, json_body=True) as response:
+            rows = json.load(response)["profiles"]
+        self.assertEqual(rows[0]["name"], "Родителям")
+        self.assertEqual(rows[0]["m3u"], primary_url)
+        self.assertEqual(rows[1]["name"], "Профиль 2")
+        for row in rows:
+            self.assertNotIn("source_url", row)
+            self.assertNotIn("epg_url", row)
+            self.assertNotIn("token", row)
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            self.request("/admin/api/profiles/4", data=payload, json_body=True)
+        self.assertEqual(err.exception.code, 404)
+
+    def test_profile_save_requires_login(self):
+        payload = json.dumps({"name": "My TV"}).encode()
+        with self.assertRaises(urllib.error.HTTPError) as result:
+            self.request("/admin/api/profiles/2", data=payload, json_body=True)
+        self.assertEqual(result.exception.code, 401)
 
     def test_logout_revokes_session(self):
         self.login().close()
