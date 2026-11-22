@@ -84,6 +84,24 @@
             <article class="panel compact-panel"><div class="panel-heading"><div><div class="eyebrow">GATEWAY</div><h2>Состояние шлюза</h2></div></div><div class="line-stat"><span>Видеосервер</span><strong id="status-gateway">—</strong></div><div class="line-stat"><span>Максимум потоков</span><strong id="status-limit">—</strong></div><div class="line-stat"><span>Буферизация</span><strong id="status-delay">—</strong></div></article>
             <article class="panel compact-panel"><div class="panel-heading"><div><div class="eyebrow">EPG FILE</div><h2>Обновление программы</h2></div></div><div class="line-stat"><span>Последняя сборка</span><strong id="status-epg-date">—</strong></div><div class="line-stat"><span>Размер XMLTV</span><strong id="status-epg-size">—</strong></div><div class="line-stat"><span>Обработка</span><strong id="status-epg-state">—</strong></div></article>
           </div>
+
+          <div class="resource-grid" aria-label="Нагрузка VPS и IPTV">
+            <article class="panel resource-panel">
+              <div class="panel-heading"><div><div class="eyebrow">VPS / HARDWARE</div><h2>Ресурсы сервера</h2></div><span class="resource-refresh">Обновление каждые 15 с</span></div>
+              <div class="resource-meter"><div class="resource-label"><span>CPU</span><strong id="vps-cpu">Сбор данных…</strong></div><div class="resource-track"><div class="resource-fill" id="vps-cpu-bar"></div></div></div>
+              <div class="resource-meter"><div class="resource-label"><span>RAM</span><strong id="vps-ram">—</strong></div><div class="resource-track"><div class="resource-fill" id="vps-ram-bar"></div></div><div class="resource-note" id="vps-ram-detail">—</div></div>
+              <div class="resource-meter"><div class="resource-label"><span>Диск</span><strong id="vps-disk">—</strong></div><div class="resource-track"><div class="resource-fill" id="vps-disk-bar"></div></div><div class="resource-note" id="vps-disk-detail">—</div></div>
+              <div class="resource-foot"><span>Load 1 мин: <strong id="vps-load">—</strong></span><span>Сеть ↓ <strong id="vps-rx">—</strong> / ↑ <strong id="vps-tx">—</strong></span></div>
+            </article>
+            <article class="panel resource-panel">
+              <div class="panel-heading"><div><div class="eyebrow">IPTV / PROCESS</div><h2>Нагрузка ТВ-сервиса</h2></div><span class="resource-refresh" id="service-health">Проверка…</span></div>
+              <div class="resource-meter"><div class="resource-label"><span>CPU шлюза</span><strong id="service-cpu">Сбор данных…</strong></div><div class="resource-track"><div class="resource-fill" id="service-cpu-bar"></div></div></div>
+              <div class="resource-meter"><div class="resource-label"><span>RAM шлюза</span><strong id="service-ram">—</strong></div><div class="resource-track"><div class="resource-fill" id="service-ram-bar"></div></div><div class="resource-note">Доля от общей памяти VPS</div></div>
+              <div class="resource-foot"><span>Кэш трансляций: <strong id="service-cache">—</strong></span><span>Потоки с зависанием: <strong id="service-stalled">—</strong></span></div>
+              <div class="resource-foot"><span>RAM админки: <strong id="service-admin-ram">—</strong></span><span>CPU админки: <strong id="service-admin-cpu">—</strong></span></div>
+              <div class="resource-cabins" id="service-cabins" aria-label="Использование кабинетов"></div>
+            </article>
+          </div>
         </section>
 
         <section class="view" id="view-channels" hidden>
@@ -207,7 +225,7 @@
           <div class="view-heading"><div><div class="eyebrow">SYSTEM HEALTH</div><h1>Диагностика<span class="accent">.</span></h1><p>Ключевые показатели сервера без доступа к приватным ссылкам IPTV.</p></div><span class="status-pill" id="system-badge">Проверка…</span></div>
           <div class="secondary-grid">
             <article class="panel compact-panel"><div class="panel-heading"><div><div class="eyebrow">STREAMING</div><h2>Буфер и подключения</h2></div></div><div class="line-stat"><span>Лимит трансляций</span><strong id="sys-capacity">—</strong></div><div class="line-stat"><span>Буфер HLS</span><strong id="sys-delay">—</strong></div><div class="line-stat"><span>Отказы по лимиту</span><strong id="sys-denials">—</strong></div><div class="line-stat"><span>Таймауты старта</span><strong id="sys-timeouts">—</strong></div></article>
-            <article class="panel compact-panel"><div class="panel-heading"><div><div class="eyebrow">SERVER</div><h2>Состояние</h2></div></div><div class="line-stat"><span>Шлюз</span><strong id="sys-online">—</strong></div><div class="line-stat"><span>Запросы каталога</span><strong id="sys-catalog">—</strong></div><div class="line-stat"><span>Время работы панели</span><strong id="sys-uptime">—</strong></div><div class="line-stat"><span>Версия панели</span><strong>1.0</strong></div></article>
+            <article class="panel compact-panel"><div class="panel-heading"><div><div class="eyebrow">SERVER</div><h2>Состояние</h2></div></div><div class="line-stat"><span>Шлюз</span><strong id="sys-online">—</strong></div><div class="line-stat"><span>Запросы каталога</span><strong id="sys-catalog">—</strong></div><div class="line-stat"><span>Время работы панели</span><strong id="sys-uptime">—</strong></div><div class="line-stat"><span>Версия панели</span><strong>1.0</strong></div><div class="line-stat"><span>CPU VPS</span><strong id="sys-vps-cpu">—</strong></div><div class="line-stat"><span>RAM VPS</span><strong id="sys-vps-ram">—</strong></div><div class="line-stat"><span>Диск VPS</span><strong id="sys-vps-disk">—</strong></div><div class="line-stat"><span>CPU шлюза</span><strong id="sys-service-cpu">—</strong></div><div class="line-stat"><span>RAM шлюза</span><strong id="sys-service-ram">—</strong></div></article>
           </div>
           <article class="panel"><div class="panel-heading"><div><div class="eyebrow">SECURITY</div><h2>Доступ и защита</h2></div></div><p class="security-copy">Админка работает отдельным сервисом. Пароль администратора не совпадает с токеном IPTV, а исходные адреса потоков не отправляются браузеру. Кабинеты разрешено перенастраивать после входа, но кнопок произвольной остановки трансляций нет.</p></article>
         </section>
