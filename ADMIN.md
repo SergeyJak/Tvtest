@@ -124,3 +124,7 @@ sudo systemctl is-active iptv-gateway.service iptv-admin.service
 ```
 
 This does not modify Caddy, systemd units, EPG generation, or your private playlist. Restarting the gateway briefly interrupts live TV streams. The current guide is preserved.
+
+## Three editable cabinets, each with their own M3U and EPG
+
+The admin's **Кабинеты ТВ** page now lets the administrator rename three independent TV profiles, set each profile's upstream M3U URL (optional XMLTV URL) and copy its unique TV links. The old main profile starts from the existing local file and preserves the original token. All provider source URLs stay in an owner-only VPS directory and are never returned in admin APIs. Profiles route dynamically through the existing public HTTPS domain, so Caddy configuration is unchanged. See [PROFILES.md](PROFILES.md) for installation and the daily guide-refresh timer.
