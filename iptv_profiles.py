@@ -95,7 +95,7 @@ def download_playlist(url: str, timeout: float = 18) -> str:
     return contents
 
 
-def extract_epg_source(playlist: str) -> str | None:
+def extract_epg_source(playlist: str, *, validate: bool = True) -> str | None:
     header = playlist.splitlines()[0] if playlist.splitlines() else ""
     match = EPG_PATTERN.search(header)
     if not match:
@@ -103,6 +103,9 @@ def extract_epg_source(playlist: str) -> str | None:
     source = match.group(2).split(",")[0].strip()
     if not source:
         return None
+    if not validate:
+        parsed = urllib.parse.urlsplit(source)
+        return source if parsed.scheme in ("http", "https") and parsed.hostname else None
     try:
         return validate_source_url(source)
     except ProfileError:
@@ -144,6 +147,9 @@ class ProfileStore:
 
     def epg_path(self, slot: int) -> Path:
         return self.directory / f"profile-{slot}.epg.xml.gz"
+
+    def epg_error_path(self, slot: int) -> Path:
+        return self.directory / f"profile-{slot}.epg-error"
 
     @contextlib.contextmanager
     def _locked(self):
@@ -208,7 +214,7 @@ class ProfileStore:
         if row["epg_url"]:
             return row["epg_url"]
         try:
-            return extract_epg_source(self.snapshot_path(row["slot"]).read_text(encoding="utf-8-sig"))
+            return extract_epg_source(self.snapshot_path(row["slot"]).read_text(encoding="utf-8-sig"), validate=False)
         except OSError:
             return None
 
@@ -232,6 +238,7 @@ class ProfileStore:
                 "source_host": preview,
                 "updated_at": row.get("updated_at"),
                 "epg_status": "ready" if available_epg else
+                              "error" if self.epg_error_path(slot).exists() else
                               "pending" if configured and has_epg_source else "unavailable",
                 "m3u": base + "/channels.m3u" if configured else None,
                 "epg": base + "/epg.xml.gz" if configured and has_epg_source else None,
@@ -281,6 +288,7 @@ class ProfileStore:
                 row["revision"] += 1
                 # Never serve the old account's TV guide after switching sources.
                 self.epg_path(slot).unlink(missing_ok=True)
+                self.epg_error_path(slot).unlink(missing_ok=True)
             elif new_epg is not None:
                 row["epg_url"] = new_epg
                 row["revision"] += 1
