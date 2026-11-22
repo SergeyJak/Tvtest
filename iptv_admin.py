@@ -294,7 +294,19 @@ class AdminState:
         }
 
     def _channel_labels(self) -> dict:
-        return {row["id"]: row["name"] for row in self.channels()}
+        labels = {row["id"]: row["name"] for row in self.channels()}
+        for profile in self.profiles.all()[1:]:
+            if not self.profiles.configured(profile):
+                continue
+            try:
+                catalog = channels_from_text(
+                    self.profiles.media_path(profile).read_text(encoding="utf-8-sig"))
+                for channel in catalog:
+                    labels[f"p{profile['slot']}:{channel.id}"] = (
+                        f"{profile['name']} · {channel.name}")
+            except OSError:
+                continue
+        return labels
 
     def profiles_public(self) -> dict:
         return {"profiles": self.profiles.public_profiles(self.public_base_url)}
