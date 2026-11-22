@@ -194,11 +194,20 @@ class Gateway:
         event = None
         with self.lock:
             progress = self.last_progress
+            downloaded = self.last_segment_download
             threshold = max(15.0, 3 * self.target)
-            if progress is not None and now - progress > threshold:
+            upstream_stale = progress is not None and now - progress > threshold
+            download_stale = downloaded is not None and now - downloaded > threshold
+            if upstream_stale or download_stale:
                 if self._stall_since is None:
-                    self._stall_since = progress
-                    event = ("stream_stalled", "UPSTREAM_NO_PROGRESS", round(now - progress, 1))
+                    stalled_since = min(
+                        value for value, stale in ((progress, upstream_stale),
+                                                   (downloaded, download_stale)) if stale
+                    )
+                    self._stall_since = stalled_since
+                    reason = ("NO_DOWNLOADED_SEGMENTS" if download_stale
+                              else "UPSTREAM_NO_PROGRESS")
+                    event = ("stream_stalled", reason, round(now - stalled_since, 1))
             elif self._stall_since is not None:
                 elapsed = round(now - self._stall_since, 1)
                 self._stall_since = None
