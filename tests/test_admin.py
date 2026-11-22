@@ -223,8 +223,8 @@ class AdminTests(unittest.TestCase):
                     'https://upstream.example/private/STREAM_CREDENTIAL\n')
         provider_url = "https://m3u.example/playlist?login=PRIVATE_123"
         body = json.dumps({"name": "ТВ родителей", "m3u_url": provider_url}).encode()
-        with patch("iptv_profiles.download_playlist", return_value=playlist), \\
-             patch("iptv_profile_jobs.start_generation"):
+        with (patch("iptv_profiles.download_playlist", return_value=playlist),
+              patch("iptv_profile_jobs.start_generation")):
             self.login().close()
             with self.request("/admin/api/profiles/2", data=body, json_body=True) as response:
                 response_text = response.read().decode()
