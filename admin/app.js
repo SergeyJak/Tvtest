@@ -5,7 +5,7 @@
   const app = $("app");
   const loginScreen = $("login-screen");
   const state = {overview: null, channels: [], epgStatus: "", page: 0, size: 50, lastCatalog: 0, view: "overview", busy: false};
-  const views = {overview:"ОБЗОР", channels:"КАНАЛЫ", epg:"ТЕЛЕПРОГРАММА", history:"ПРОСМОТРЫ", incidents:"ОШИБКИ И ЗАВИСАНИЯ", system:"ДИАГНОСТИКА"};
+  const views = {overview:"ОБЗОР", channels:"КАНАЛЫ", epg:"ТЕЛЕПРОГРАММА", tv:"ПОДКЛЮЧЕНИЕ ТВ", history:"ПРОСМОТРЫ", incidents:"ОШИБКИ И ЗАВИСАНИЯ", system:"ДИАГНОСТИКА"};
 
   function text(id, value) {
     const node = $(id);
@@ -32,12 +32,15 @@
     text("crumb", views[name]);
     if (name === "channels") renderChannels();
     if (name === "epg") renderGroups();
+    if (name === "tv") loadTvLinks();
     if (name === "history") loadHistory();
     if (name === "incidents") loadIncidents();
   }
   function showLogin() {
     state.overview = null;
     state.channels = [];
+    for (const id of ["tv-m3u-url", "tv-epg-url"]) $(id).value = "";
+    for (const id of ["tv-copy-m3u", "tv-copy-epg"]) $(id).disabled = true;
     app.hidden = true;
     loginScreen.hidden = false;
     $("password").value = "";
@@ -247,6 +250,49 @@
       day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit"
     });
   }
+  async function loadTvLinks() {
+    const m3u = $("tv-m3u-url");
+    const epg = $("tv-epg-url");
+    const m3uCopy = $("tv-copy-m3u");
+    const epgCopy = $("tv-copy-epg");
+    m3uCopy.disabled = true;
+    epgCopy.disabled = true;
+    text("tv-link-status", "");
+    try {
+      const data = await api("tv-links");
+      if (!data.available || !data.m3u || !data.epg) throw new Error("No TV links");
+      m3u.value = data.m3u;
+      epg.value = data.epg;
+      m3uCopy.disabled = false;
+      epgCopy.disabled = false;
+    } catch (_error) {
+      m3u.value = "";
+      epg.value = "";
+      if (!app.hidden) text("tv-link-status", "Не удалось загрузить ссылки. Проверь файл токена на VPS.");
+    }
+  }
+  async function copyTvLink(button) {
+    const input = $(button.dataset.copy);
+    if (!input || !input.value || button.disabled) return;
+    const original = button.textContent;
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(input.value);
+      } else {
+        input.focus();
+        input.select();
+        if (!document.execCommand("copy")) throw new Error("copy unavailable");
+      }
+      button.textContent = "Скопировано ✓";
+      text("tv-link-status", "Ссылка скопирована. Вставь её в настройки IPTV-плеера.");
+    } catch (_error) {
+      input.focus();
+      input.select();
+      text("tv-link-status", "Выдели адрес и скопируй вручную.");
+    }
+    setTimeout(() => { button.textContent = original; }, 1800);
+  }
+
   async function loadHistory() {
     const days = $("history-days").value;
     const ranking = $("history-ranking");
@@ -371,6 +417,7 @@
   $("prev-page").addEventListener("click", () => { state.page--; renderChannels(); });
   $("next-page").addEventListener("click", () => { state.page++; renderChannels(); });
   $("refresh-button").addEventListener("click", () => refresh(true));
+  document.querySelectorAll("[data-copy]").forEach(button => button.addEventListener("click", () => copyTvLink(button)));
   $("history-days").addEventListener("change", loadHistory);
   $("incident-days").addEventListener("change", loadIncidents);
   $("incident-filter").addEventListener("change", loadIncidents);
