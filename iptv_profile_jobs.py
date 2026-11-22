@@ -79,7 +79,12 @@ def run_update(store: ProfileStore, slots: list[int], *, refresh_m3u: bool = Fal
             except Exception:
                 # Keep old guide when sources are temporarily down; never
                 # include URLs, upstream HTTP exceptions or credentials in logs.
+                from iptv_profiles import atomic_private_write
+                atomic_private_write(store.epg_error_path(slot), "EPG_GENERATION_FAILED\n")
                 results[slot] = "failed"
+            else:
+                if results[slot] == "updated":
+                    store.epg_error_path(slot).unlink(missing_ok=True)
     return results
 
 
