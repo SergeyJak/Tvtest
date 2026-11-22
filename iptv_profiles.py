@@ -262,9 +262,13 @@ class ProfileStore:
             if not channels or len({item.id for item in channels}) != len(channels):
                 raise ProfileError("M3U не содержит корректных уникальных каналов")
             if new_epg is None:
-                new_epg = extract_epg_source(playlist)
+                # Follow the current M3U header on every scheduled refresh,
+                # instead of freezing a provider's rotating EPG URL.
+                extract_epg_source(playlist)
+            else:
+                new_epg = validate_source_url(new_epg)
         elif new_epg is not None:
-            validate_source_url(new_epg)
+            new_epg = validate_source_url(new_epg)
         with self._locked():
             data = self._read()
             row = data["profiles"][slot - 1]
