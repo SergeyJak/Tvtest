@@ -434,3 +434,14 @@ See **[ROADMAP.md](ROADMAP.md)** for the phased plan: harden the current single-
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+
+## HeySmart TV administration UI
+
+A separate, read-only web dashboard is available in `iptv_admin.py`.
+It shows gateway health, active streams, EPG coverage, and a searchable channel
+catalog with categories. Admin sessions use a **dedicated private password**;
+the TV playlist token is not shared with the browser. The admin server binds to
+loopback only and requires the existing HTTPS reverse proxy for public access.
+
+See [ADMIN.md](ADMIN.md) for the systemd service, Caddy/Nginx routing and setup.
