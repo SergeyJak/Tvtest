@@ -35,7 +35,7 @@
         <button type="button" class="nav-button active" data-target="overview"><span class="nav-icon">◈</span> Обзор</button>
         <button type="button" class="nav-button" data-target="channels"><span class="nav-icon">▤</span> Каналы</button>
         <button type="button" class="nav-button" data-target="epg"><span class="nav-icon">▦</span> Телепрограмма</button>
-        <button type="button" class="nav-button" data-target="tv"><span class="nav-icon">▧</span> Подключение ТВ</button>
+        <button type="button" class="nav-button" data-target="tv"><span class="nav-icon">▧</span> Кабинеты ТВ</button>
         <button type="button" class="nav-button" data-target="history"><span class="nav-icon">◷</span> Просмотры</button>
         <button type="button" class="nav-button" data-target="incidents"><span class="nav-icon">⚠</span> Ошибки и зависания</button>
         <button type="button" class="nav-button" data-target="system"><span class="nav-icon">⌘</span> Диагностика</button>
@@ -103,7 +103,7 @@
           <div class="view-heading"><div><div class="eyebrow">ELECTRONIC PROGRAM GUIDE</div><h1>Телепрограмма<span class="accent">.</span></h1><p>Покрытие каталога и актуальность данных XMLTV.</p></div><span class="status-pill" id="epg-badge">Проверка…</span></div>
           <div class="epg-layout">
             <article class="panel epg-hero"><div class="eyebrow">COVERAGE</div><div class="epg-big" id="epg-big">—</div><p>Каналов с реальной программой передач</p><div class="coverage-bar"><div id="epg-progress"></div></div><div class="epg-numbers"><span id="epg-covered-total">— с EPG</span><span id="epg-uncovered-total">— без EPG</span></div></article>
-            <article class="panel compact-panel"><div class="eyebrow">SOURCE DETAILS</div><h2>Файл программы</h2><div class="line-stat"><span>Формат</span><strong>XMLTV · GZIP</strong></div><div class="line-stat"><span>Размер</span><strong id="epg-file-size">—</strong></div><div class="line-stat"><span>Передач</span><strong id="epg-programmes">—</strong></div><div class="line-stat"><span>Обновлён</span><strong id="epg-updated">—</strong></div><p class="note">EPG доступен телевизорам через защищённую ссылку в плейлисте.</p><button type="button" class="text-link" data-go="tv">Ссылки M3U и EPG <span>↗</span></button></article>
+            <article class="panel compact-panel"><div class="eyebrow">SOURCE DETAILS</div><h2>Файл программы</h2><div class="line-stat"><span>Формат</span><strong>XMLTV · GZIP</strong></div><div class="line-stat"><span>Размер</span><strong id="epg-file-size">—</strong></div><div class="line-stat"><span>Передач</span><strong id="epg-programmes">—</strong></div><div class="line-stat"><span>Обновлён</span><strong id="epg-updated">—</strong></div><p class="note">EPG доступен телевизорам через защищённую ссылку в плейлисте.</p><button type="button" class="text-link" data-go="tv">Кабинеты и ссылки M3U/EPG <span>↗</span></button></article>
           </div>
           <article class="panel panel-groups"><div class="panel-heading"><div><div class="eyebrow">BREAKDOWN</div><h2>Покрытие по категориям</h2></div></div><div id="group-coverage" class="group-coverage"><div class="empty-state">Загрузка…</div></div></article>
         </section>
@@ -111,45 +111,32 @@
 
         <section class="view" id="view-tv" hidden>
           <div class="view-heading">
-            <div><div class="eyebrow">TV CONNECTIONS</div><h1>Подключение ТВ<span class="accent">.</span></h1><p>Две готовые ссылки для любого IPTV-плеера.</p></div>
-            <span class="status-pill">HTTPS · Защищено</span>
+            <div>
+              <div class="eyebrow">THREE INDEPENDENT TV PROFILES</div>
+              <h1>Кабинеты ТВ<span class="accent">.</span></h1>
+              <p>Три собственных M3U-источника, три названия и отдельные ссылки для телевизоров.</p>
+            </div>
+            <span class="status-pill">3 профиля</span>
           </div>
-          <div class="tv-intro panel">
-            <div class="eyebrow">КАК ПОДКЛЮЧИТЬ</div>
-            <h2>Один плейлист. Одна телепрограмма.</h2>
-            <p>Добавь M3U в IPTV-плеер. Если приложение не загрузило программу передач автоматически, открой настройки EPG/XMLTV и вставь вторую ссылку.</p>
-            <div class="tv-connection-steps"><span>1 · Плейлист M3U</span><span>2 · XMLTV EPG при необходимости</span><span>3 · Обновить программу в плеере</span></div>
+          <div class="notice">
+            <strong>Как пользоваться:</strong> переименуй кабинет, вставь ссылку M3U от своего IPTV-провайдера и сохрани.
+            На карточке появится персональная ссылка для телевизора. При наличии XMLTV ссылка EPG генерируется отдельно.
+            Текущий плейлист и адрес первого кабинета сохранены.
           </div>
-          <div class="tv-link-grid">
-            <article class="panel tv-link-card">
-              <div class="tv-link-icon">▤</div>
-              <div class="eyebrow">IPTV PLAYLIST</div>
-              <h2>Список каналов · M3U</h2>
-              <p>Основная ссылка для добавления IPTV-плейлиста в телевизор или приложение.</p>
-              <label for="tv-m3u-url">URL плейлиста</label>
-              <div class="tv-link-control">
-                <input id="tv-m3u-url" type="text" readonly spellcheck="false" autocomplete="off" aria-label="Адрес M3U плейлиста" value="Загрузка адреса…">
-                <button type="button" id="tv-copy-m3u" class="copy-link-btn" data-copy="tv-m3u-url" disabled>Копировать</button>
-              </div>
-            </article>
-            <article class="panel tv-link-card">
-              <div class="tv-link-icon epg-icon">▦</div>
-              <div class="eyebrow">ELECTRONIC PROGRAM GUIDE</div>
-              <h2>Телепрограмма · XMLTV</h2>
-              <p>Используй отдельно, когда IPTV-плеер не импортирует EPG из плейлиста.</p>
-              <label for="tv-epg-url">URL EPG / XMLTV</label>
-              <div class="tv-link-control">
-                <input id="tv-epg-url" type="text" readonly spellcheck="false" autocomplete="off" aria-label="Адрес EPG XMLTV" value="Загрузка адреса…">
-                <button type="button" id="tv-copy-epg" class="copy-link-btn" data-copy="tv-epg-url" disabled>Копировать</button>
-              </div>
-            </article>
+          <div id="profiles-container" class="profiles-grid">
+            <div class="empty-state">Загружаем профили…</div>
           </div>
-          <p id="tv-link-status" class="tv-link-status" role="status" aria-live="polite"></p>
-          <div class="notice tv-secret-note"><strong>Ссылки содержат ключ доступа к телевидению.</strong> Передавай их только тем, кому разрешён просмотр. Не публикуй адреса в чатах или социальных сетях.</div>
+          <p id="profiles-page-message" class="tv-link-status" aria-live="polite"></p>
+          <div class="notice tv-secret-note">
+            <strong>Не публикуй ссылки.</strong> Каждая ссылка для телевизора содержит персональный ключ доступа.
+            Исходный M3U-адрес провайдера хранится только на VPS и не выводится обратно в браузер.
+          </div>
           <article class="panel tv-cache-info">
-            <div class="eyebrow">SMART EPG DELIVERY</div>
-            <h2>Экономия трафика</h2>
-            <p>Сервер отдаёт сжатую телепрограмму и поддерживает ETag / Last-Modified. Совместимый плеер при повторной проверке может получить ответ <code>304 Not Modified</code> без повторного скачивания файла.</p>
+            <div class="eyebrow">EPG / XMLTV</div>
+            <h2>Программа передач для каждого кабинета</h2>
+            <p>EPG берётся из заголовка загруженного M3U или из отдельного XMLTV URL, указанного в карточке.
+            Для каждого кабинета создаётся свой XMLTV с правильными идентификаторами каналов.
+            Если приложение не подтянуло EPG автоматически, вставь его ссылку в настройках плеера.</p>
           </article>
         </section>
 
