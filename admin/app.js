@@ -4,7 +4,7 @@
   const fmt = new Intl.NumberFormat("ru-RU");
   const app = $("app");
   const loginScreen = $("login-screen");
-  const state = {overview: null, channels: [], epgStatus: "", page: 0, size: 50, lastCatalog: 0, view: "overview", busy: false};
+  const state = {overview: null, channels: [], epgStatus: "", page: 0, size: 50, lastCatalog: 0, view: "overview", busy: false, cdnHome: null};
   const views = {overview:"ОБЗОР", cdn:"CDN-МОНИТОР", channels:"КАНАЛЫ", epg:"ТЕЛЕПРОГРАММА", tv:"КАБИНЕТЫ ТВ", history:"ПРОСМОТРЫ", incidents:"ОШИБКИ И ЗАВИСАНИЯ", system:"ДИАГНОСТИКА"};
 
   function text(id, value) {
@@ -151,7 +151,8 @@
     const pilots = Array.isArray(rows) ? rows : [];
     card.hidden = pilots.length === 0;
     if (!pilots.length) return;
-    const current = pilots[0];
+    const current = pilots.find(item => Number(item.home_cabinet) === state.cdnHome) ||
+      pilots.find(item => item.seconds_since_last_probe < 35) || pilots[0];
     text("cdn-selected", current.selected_cabinet ? "Кабинет " + current.selected_cabinet : "Накопление буфера");
     text("cdn-switches", n(current.switches || 0));
     const target = $("cdn-sources");
@@ -170,11 +171,12 @@
       target.append(row);
     });
   }
-  function renderCdnDiagnostics(data) {
+  function renderCdnDiagnostics(data, active, home) {
     const target = $("cdn-monitor-diagnostic");
     target.replaceChildren();
-    const diag = data.multi_cdn_diagnostics;
-    const live = Array.isArray(data.multi_cdn) && data.multi_cdn.length > 0;
+    const diag = (data.multi_cdn_diagnostics_by_cabin || {})[String(home)] ||
+      (home === 1 ? data.multi_cdn_diagnostics : null);
+    const live = !!active;
     const tvStreams = Array.isArray(data.streams) ? data.streams : [];
     const similarStreams = tvStreams.filter(stream => {
       const label = String(stream.name || "").toLocaleLowerCase("ru-RU");
@@ -196,23 +198,19 @@
       detail = "На VPS существует .iptv_profiles/multicdn.disabled.";
       state = "warn";
     } else if (!diag.primary_channel_found) {
-      message = "«VF Теория большого взрыва» не найден в каталоге первого кабинета.";
+      message = "«VF Теория большого взрыва» не найден в каталоге выбранного кабинета.";
       detail = diag.possible_names?.length
         ? "Похожие названия: " + diag.possible_names.join(", ") + ". Нужно сверить название пилотного канала."
-        : "Проверь M3U основного кабинета и наличие точного названия VF Теория большого взрыва.";
+        : "Проверь M3U этого кабинета и наличие точного названия VF Теория большого взрыва.";
       state = "warn";
     } else if (!live) {
-      const other = similarStreams.find(stream => Number(stream.profile_slot) !== 1);
-      const primary = similarStreams.find(stream => Number(stream.profile_slot) === 1);
-      if (other) {
-        message = "Похоже, канал открыт через кабинет " + n(other.profile_slot) + ", а пилот работает только в основном.";
-        detail = "Включи «VF Теория большого взрыва» из M3U первого кабинета, чтобы проверить переключение трёх CDN.";
-      } else if (primary) {
-        message = "Основной канал запущен, но Multi-CDN пока не активировался.";
-        detail = "Проверь, что телевизор открывает актуальную ссылку /channel/.../index.m3u8 и шлюз обновлён.";
+      const own = similarStreams.find(stream => Number(stream.profile_slot) === home);
+      if (own) {
+        message = "Канал запущен, но Multi-CDN ещё не активировался для этого кабинета.";
+        detail = "Проверь, что плеер открывает актуальную ссылку /channel/.../index.m3u8.";
       } else {
-        message = "Монитор ждёт запрос пилотного канала из первого кабинета.";
-        detail = "При просмотре другого канала или через другой кабинет эти показатели не заполняются.";
+        message = "Этот телевизор ещё не запрашивал пилотный канал.";
+        detail = "Включи «VF Теория большого взрыва» через ссылку M3U выбранного кабинета.";
       }
     } else if (diag.cabins.filter(item => item.channel_found).length < 2) {
       message = "Пилот запущен, но резервный канал найден менее чем в двух кабинетах.";
@@ -243,9 +241,31 @@
   }
 
   function renderCdnMonitor(data) {
-    renderCdnDiagnostics(data);
-    const active = Array.isArray(data.multi_cdn) && data.multi_cdn.length
-      ? data.multi_cdn[0] : null;
+    const rows = Array.isArray(data.multi_cdn) ? data.multi_cdn : [];
+    const available = rows.find(item =>
+      item.seconds_since_last_probe == null || item.seconds_since_last_probe < 35);
+    if (![1, 2, 3].includes(state.cdnHome)) {
+      state.cdnHome = available ? Number(available.home_cabinet) : 1;
+    }
+    const namesForSelector = new Map((data.cabins || []).map(cabin =>
+      [Number(cabin.slot), cabin.name || "Кабинет " + cabin.slot]));
+    const switcher = $("cdn-cabin-switch");
+    switcher.replaceChildren();
+    [1, 2, 3].forEach(slot => {
+      const button = element("button", "cdn-cabin-button" +
+        (state.cdnHome === slot ? " active" : ""),
+        namesForSelector.get(slot) || "Кабинет " + slot);
+      button.type = "button";
+      button.dataset.slot = String(slot);
+      button.setAttribute("aria-pressed", String(state.cdnHome === slot));
+      const report = rows.find(item => Number(item.home_cabinet) === slot);
+      if (report && report.seconds_since_last_probe < 35) {
+        button.append(element("span", "cdn-cabin-online", " ●"));
+      }
+      switcher.append(button);
+    });
+    const active = rows.find(item => Number(item.home_cabinet) === state.cdnHome) || null;
+    renderCdnDiagnostics(data, active, state.cdnHome);
     const streamLive = !!data.gateway_online && !!active
       && (active.seconds_since_last_probe === null
           || active.seconds_since_last_probe === undefined
@@ -267,7 +287,7 @@
       selectedName ? "● Источник выбран" : "○ Прогрев",
       !data.gateway_online || delayed);
     text("cdn-monitor-selected", streamLive ? (selectedName || "Прогрев") : "—");
-    text("cdn-monitor-selected-sub", !active ? "Включи VF в основном кабинете" :
+    text("cdn-monitor-selected-sub", !active ? "Включи VF в выбранном кабинете" :
       !streamLive ? "Нет текущего просмотра" : "Источник сегментов для телевизора");
     text("cdn-monitor-progress", streamLive && progress != null ? duration(progress) : "—");
     text("cdn-monitor-cache", active && Number.isFinite(Number(active.cached_video_seconds))
@@ -863,6 +883,15 @@
   ["channel-search", "channel-group", "channel-filter"].forEach(id => $(id).addEventListener("input", () => { state.page = 0; renderChannels(); }));
   $("prev-page").addEventListener("click", () => { state.page--; renderChannels(); });
   $("next-page").addEventListener("click", () => { state.page++; renderChannels(); });
+  $("cdn-cabin-switch").addEventListener("click", event => {
+    const button = event.target.closest("button[data-slot]");
+    if (!button) return;
+    state.cdnHome = Number(button.dataset.slot);
+    if (state.overview) {
+      renderCdnMonitor(state.overview);
+      renderMultiCdn(state.overview.multi_cdn);
+    }
+  });
   $("refresh-button").addEventListener("click", () => refresh(true));
   $("profiles-container").addEventListener("click", event => {
     const button = event.target.closest("button[data-copy]");
