@@ -195,9 +195,9 @@ class FailoverMux:
             stalled = now - self.last_progress >= PUBLISH_STALL_SECONDS
             can_switch = current is None or now - self.last_switch >= SWITCH_COOLDOWN
             if can_switch and (not fresh or stalled):
-                reason = ("PUBLISH_STALL" if stalled else
-                          "SOURCE_RESTARTED" if current is None and selected is not None else
-                          "SOURCE_UNAVAILABLE")
+                reason = ("SOURCE_RESTARTED" if current is None and selected is not None else
+                          "SOURCE_UNAVAILABLE" if not fresh else
+                          "PUBLISH_STALL")
                 for slot in self._alternates(sources):
                     if self._publish_from(slot, sources[slot], now, reason=reason):
                         break
