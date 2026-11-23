@@ -45,6 +45,54 @@ class MultiCdnTests(unittest.TestCase):
         self.assertFalse(is_pilot("VF Теория большого взрыва 2"))
         self.assertFalse(is_pilot("VF Кинокомедия HD"))
 
+    def test_each_cabin_prefers_its_own_cdn_even_if_backup_has_more_buffer(self):
+        for home_slot in (1, 2, 3):
+            mux = FailoverMux(home_slot=home_slot)
+            sources = [(slot, FakeStream("CDN-" + str(slot))) for slot in (1, 2, 3)]
+            sources[(home_slot % 3)][1].gateway.status = lambda: json.dumps({
+                "ready": True, "upstream_stalled": False,
+                "seconds_since_segment_download": 0.1,
+                "effective_buffer_delay_seconds": 90.0,
+                "contiguous_tail_seconds": 180.0,
+                "errors": 0, "slow_segments": 0,
+            }).encode()
+            mux.playlist("owner-token", sources, now=100)
+            self.assertEqual(mux.source_slot, home_slot)
+            self.assertEqual(mux.home_slot, home_slot)
+            self.assertEqual(mux.switches, 0)
+
+    def test_one_guest_per_source_blocks_collapsing_three_viewers(self):
+        mux = FailoverMux(home_slot=1)
+        home = FakeStream("owner")
+        two = FakeStream("two")
+        three = FakeStream("three")
+        home.gateway.fresh = False
+        mux.playlist("tv", [(1, home), (2, two), (3, three)],
+                     now=100, usage={2: 1, 3: 0})
+        self.assertEqual(mux.source_slot, 3, "The occupied CDN cannot take another guest")
+        self.assertEqual(mux.segment(1), b"three-100")
+        # When every backup is already carrying another guest, it is safer
+        # to keep buffering than to move three users onto a single account.
+        mux2 = FailoverMux(home_slot=1)
+        self.assertIsNone(mux2.playlist("tv", [(1, home), (2, two), (3, three)],
+                                         now=100, usage={2: 1, 3: 1}))
+        self.assertIsNone(mux2.source_slot)
+
+    def test_good_owner_is_sticky_not_switched_for_faster_backup(self):
+        mux = FailoverMux(home_slot=2)
+        sources = [(slot, FakeStream("CDN-" + str(slot))) for slot in (1, 2, 3)]
+        mux.playlist("tv", sources, now=100)
+        self.assertEqual(mux.source_slot, 2)
+        sources[1][1].gateway.fresh = True
+        sources[0][1].gateway.segments.append((103, 6.0))
+        sources[0][1].gateway.payload[103] = b"fast-new-103"
+        sources[1][1].gateway.segments.append((103, 6.0))
+        sources[1][1].gateway.payload[103] = b"own-new-103"
+        mux.playlist("tv", sources, now=112)
+        self.assertEqual(mux.source_slot, 2)
+        self.assertEqual(mux.switches, 0)
+        self.assertEqual(mux.history[-1].content, b"own-new-103")
+
     def test_failover_keeps_monotonic_sequence_and_discontinuity(self):
         mux = FailoverMux()
         original = FakeStream("CDN-1")
