@@ -132,11 +132,13 @@ class ProfileRegistry:
                 if not route:
                     continue
                 manager = route[0]
-                matching_id = next(
-                    (channel.id for channel in manager.channels.values()
-                     if is_pilot(channel.name)), None)
-                if matching_id is None:
-                    continue
+                matching_id = cid
+                if matching_id not in manager.channels:
+                    matches = [channel.id for channel in manager.channels.values()
+                               if is_pilot(channel.name)]
+                    if len(matches) != 1:
+                        continue
+                    matching_id = matches[0]
                 stream = manager.start(matching_id, standby=(slot != home))
                 if stream is not None:
                     candidates.append((slot, stream))
@@ -211,31 +213,29 @@ class ProfileRegistry:
                 profile = self.store.get(slot)
                 route = self.routes.get(profile["token"])
                 manager = route[0] if route else None
-                if manager is None:
-                    cabins.append({"slot": slot, "name": profile["name"] if slot == home else f"Кабинет {slot}",
-                                   "configured": False, "channel_found": False,
-                                   "playing": False})
-                    continue
-                matched = next((channel for channel in manager.channels.values()
-                                if is_pilot(channel.name)), None)
-                if slot == home and not matched:
-                    possible_names = [
-                        channel.name[:100] for channel in manager.channels.values()
-                        if "теория" in channel.name.casefold()
-                        and "взрыва" in channel.name.casefold()
-                    ][:4]
-                stream = None
-                if matched:
-                    with manager.lock:
-                        stream = manager.active.get(matched.id)
-                cabins.append({
+                channels = manager.channels.values() if manager else ()
+                matched = next((channel for channel in channels if is_pilot(channel.name)), None)
+                cabin = {
                     "slot": slot,
                     "name": profile["name"] if slot == home else f"Кабинет {slot}",
-                    "configured": True,
+                    "configured": manager is not None,
                     "channel_found": matched is not None,
                     "channel_name": matched.name if matched else None,
-                    "playing": bool(stream and not stream.standby),
-                })
+                }
+                if slot == home:
+                    if not matched:
+                        possible_names = [
+                            channel.name[:100] for channel in channels
+                            if "теория" in channel.name.casefold()
+                            and "взрыва" in channel.name.casefold()
+                        ][:4]
+                    cabin["playing"] = False
+                    if manager:
+                        with manager.lock:
+                            cabin["playing"] = any(
+                                not stream.standby and is_pilot(stream.channel.name)
+                                for stream in manager.active.values())
+                cabins.append(cabin)
             mux_active = any(owner_slot == home for owner_slot, _ in self.failovers)
             return {
                 "enabled": not disabled,

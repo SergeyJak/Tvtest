@@ -368,7 +368,8 @@ def make_multi_handler(manager: MultiGateway, token: str,
         def respond(self, status, body, content_type, head, extra=None):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
+            if body is not None:
+                self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             for k, v in (extra or {}).items():
@@ -499,6 +500,10 @@ def make_multi_handler(manager: MultiGateway, token: str,
             if cid not in request_manager.channels:
                 return self.respond(404, b"Unknown channel", "text/plain", head)
             if len(route) == 3 and resource == "index.m3u8":
+                if head:
+                    # The catalog entry exists. Its live representation and length
+                    # are determined on GET, when the TV actually tunes the channel.
+                    return self.respond(200, None, "application/vnd.apple.mpegurl", head)
                 pilot = (profile_registry.failover_for(active_token, cid)
                          if profile_registry is not None else None)
                 stream = request_manager.start(cid)

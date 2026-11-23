@@ -245,6 +245,7 @@ class AdminState:
         multi_cdn = []
         multi_cdn_diagnostics = None
         diagnostics_by_cabin = {}
+        playing_by_slot = {}
         names = {profile["slot"]: profile["name"] for profile in profiles}
         for profile, data in statuses:
             for item in data.get("multi_cdn") or []:
@@ -262,6 +263,9 @@ class AdminState:
                     dict(cabin, name=names.get(cabin.get("slot"), "Кабинет"))
                     for cabin in diagnostic.get("cabins") or []
                 ]
+                for cabin in report["cabins"]:
+                    if cabin["slot"] == profile["slot"] and "playing" in cabin:
+                        playing_by_slot[profile["slot"]] = cabin["playing"]
                 diagnostics_by_cabin[str(profile["slot"])] = report
                 if profile["slot"] == 1:
                     multi_cdn_diagnostics = report
@@ -274,6 +278,11 @@ class AdminState:
                 # Gateways are trusted, but expose only labels and known metrics.
                 streams.append(dict(stream, profile_slot=profile["slot"],
                                     profile_name=profile["name"]))
+        # Each TV reports its own activity. Join the authenticated profiles here.
+        for diagnostic in diagnostics_by_cabin.values():
+            for cabin in diagnostic["cabins"]:
+                if cabin["slot"] in playing_by_slot:
+                    cabin["playing"] = playing_by_slot[cabin["slot"]]
         # Number of active TV cabins currently routed through each source.
         # This exposes distribution to the authenticated administrator,
         # not through any family's public TV playlist token.

@@ -218,7 +218,8 @@ class AdminTests(unittest.TestCase):
                 "multi_cdn_diagnostics": {
                     "enabled": True, "home_cabinet": slot,
                     "primary_channel_found": True, "cabins": [
-                        {"slot": other, "configured": True, "channel_found": True}
+                        {"slot": other, "configured": True, "channel_found": True,
+                         **({"playing": slot == 2} if other == slot else {})}
                         for other in (1, 2, 3)],
                 },
             }
@@ -242,6 +243,8 @@ class AdminTests(unittest.TestCase):
         self.assertEqual(data["multi_cdn_diagnostics_by_cabin"]["2"]["home_cabinet"], 2)
         self.assertEqual(data["multi_cdn_diagnostics_by_cabin"]["3"]["cabins"][1]["name"],
                          "Вадим")
+        for report in data["multi_cdn_diagnostics_by_cabin"].values():
+            self.assertEqual([row["playing"] for row in report["cabins"]], [False, True, False])
         self.assertNotIn("SECRET_", json.dumps(data))
         for token in tokens.values():
             self.assertNotIn(token, json.dumps(data))

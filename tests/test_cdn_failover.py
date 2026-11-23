@@ -78,6 +78,30 @@ class MultiCdnTests(unittest.TestCase):
                                          now=100, usage={2: 1, 3: 1}))
         self.assertIsNone(mux2.source_slot)
 
+    def test_warming_home_reclaims_viewer_after_sustained_playable_progress(self):
+        mux = FailoverMux(home_slot=2)
+        backup, home = FakeStream("backup"), FakeStream("home")
+        sources = [(1, backup), (2, home)]
+        home.gateway.fresh = False
+        mux.playlist("tv", sources, now=100)
+        self.assertEqual(mux.source_slot, 1)
+        home.gateway.fresh = True
+        for step in range(1, 10):
+            seq = 102 + step
+            backup.gateway.segments.append((seq, 6.0))
+            backup.gateway.payload[seq] = b"backup"
+            # Fresh download status alone cannot establish home recovery.
+            if step > 5:
+                home.gateway.segments.append((seq, 6.0))
+                home.gateway.payload[seq] = b"home"
+            mux.playlist("tv", sources, now=100 + 6 * step)
+            if step <= 5:
+                self.assertEqual(mux.source_slot, 1)
+        self.assertEqual(mux.source_slot, 2)
+        self.assertEqual(mux.switches, 1)
+        self.assertEqual(mux.switch_events[-1]["reason"], "HOME_RECOVERED")
+        self.assertEqual(mux.history[-1].content, b"home")
+
     def test_good_owner_is_sticky_not_switched_for_faster_backup(self):
         mux = FailoverMux(home_slot=2)
         sources = [(slot, FakeStream("CDN-" + str(slot))) for slot in (1, 2, 3)]

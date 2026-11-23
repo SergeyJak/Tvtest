@@ -370,6 +370,7 @@
     const reasons = {
       START:"Начало просмотра", PUBLISH_STALL:"Плейлист перестал продвигаться",
       SOURCE_UNAVAILABLE:"Источник недоступен",
+      HOME_RECOVERED:"Домашний CDN восстановился",
       SOURCE_RESTARTED:"Перезапуск исходного потока"
     };
     history.forEach(event => {
