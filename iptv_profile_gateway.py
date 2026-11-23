@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from iptv_profiles import ProfileStore
-from iptv_cdn_failover import FailoverMux, is_pilot
+from iptv_cdn_failover import FailoverMux, SESSION_IDLE_SECONDS
 
 
 class ProfileRegistry:
@@ -109,12 +109,46 @@ class ProfileRegistry:
         return next((row["slot"] for row in self.store.all()
                      if row["token"] == token), None)
 
-    def failover_for(self, token: str, cid: str):
-        """All three TV cabinets prefer their own CDN for the pilot channel.
+    @staticmethod
+    def _canonical_name(name: str) -> str:
+        return " ".join(name.casefold().split())
 
-        Cross-cabinet sources are background-only and never preempt viewers
-        watching a different channel in their own account. No provider URL
-        or another user's playback token is exposed to the TV.
+    @classmethod
+    def _matching_channel_id(cls, channels: dict, wanted) -> str | None:
+        """Match the exact channel, never a similar-but-different programme.
+
+        Exact stable IDs handle duplicate channel names and M3U catalogue
+        ordering. If IDs differ across CDN playlists, use a *unique* channel
+        name; reject ambiguous duplicates rather than playing wrong content.
+        """
+        same_id = channels.get(wanted.id)
+        if same_id is not None:
+            if cls._canonical_name(same_id.name) == cls._canonical_name(wanted.name):
+                return wanted.id
+            return None
+        name = cls._canonical_name(wanted.name)
+        matches = [channel for channel in channels.values()
+                   if cls._canonical_name(channel.name) == name]
+        if len(matches) != 1:
+            return None
+        candidate = matches[0]
+        if (wanted.group and candidate.group and
+                cls._canonical_name(wanted.group) != cls._canonical_name(candidate.group)):
+            return None
+        return candidate.id
+
+    def _prune_failovers(self, now: float):
+        """Release old virtual segment buffers after the TV session ends."""
+        for key, mux in list(self.failovers.items()):
+            if now - mux.last_request > 180:
+                del self.failovers[key]
+
+    def failover_for(self, token: str, cid: str):
+        """Use every channel's HOME Edem subscription with optional backups.
+
+        Standby streams are started on demand for the *same* channel only;
+        they never evict an active viewer of a different channel. A channel
+        missing in a backup stays playable from its owner's own source.
         """
         if self.closed or (self.store.directory / "multicdn.disabled").exists():
             return None
@@ -123,8 +157,8 @@ class ProfileRegistry:
             owner = self.routes.get(token)
             if home is None or owner is None or cid not in owner[0].channels:
                 return None
-            if not is_pilot(owner[0].channels[cid].name):
-                return None
+            wanted = owner[0].channels[cid]
+            self._prune_failovers(time.monotonic())
             candidates = []
             for slot in (home, *(other for other in (1, 2, 3) if other != home)):
                 profile = self.store.get(slot)
@@ -132,19 +166,18 @@ class ProfileRegistry:
                 if not route:
                     continue
                 manager = route[0]
-                matching_id = cid
-                if matching_id not in manager.channels:
-                    matches = [channel.id for channel in manager.channels.values()
-                               if is_pilot(channel.name)]
-                    if len(matches) != 1:
-                        continue
-                    matching_id = matches[0]
-                stream = manager.start(matching_id, standby=(slot != home))
-                if stream is not None:
-                    candidates.append((slot, stream))
-            # Virtual IDs are used from the FIRST request in every cabin:
-            # adding a reserve later cannot invalidate TV's old segment URLs.
-            mux = self.failovers.setdefault((home, cid), FailoverMux(home_slot=home))
+                matching_id = (cid if slot == home else
+                               self._matching_channel_id(manager.channels, wanted))
+                if matching_id is None:
+                    continue
+                worker = manager.start(matching_id, standby=(slot != home))
+                if worker is not None:
+                    candidates.append((slot, worker))
+            # Every channel in each TV cabin starts with virtual numbering,
+            # even when both backups are missing or busy.
+            mux = self.failovers.setdefault(
+                (home, cid), FailoverMux(home_slot=home,
+                                         channel_id=cid, channel_name=wanted.name))
             return mux, candidates
 
     def publish_failover(self, mux: FailoverMux, token: str,
