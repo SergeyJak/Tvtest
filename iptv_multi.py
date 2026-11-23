@@ -76,10 +76,11 @@ def channels_from_text(text: str) -> list[Channel]:
 
 class ActiveStream:
     def __init__(self, channel: Channel, gateway: Gateway, slots: threading.BoundedSemaphore,
-                 pinned: bool = False):
+                 pinned: bool = False, standby: bool = False):
         self.channel = channel
         self.gateway = gateway
         self.pinned = pinned
+        self.standby = standby
         self.accessed = time.monotonic()
         self.pending_requests = 0
         self.worker = threading.Thread(target=self._run, args=(slots,), daemon=True)
@@ -145,7 +146,7 @@ class MultiGateway:
         # identical channels watched through separate subscription cabinets.
         return cid if self.profile_slot == 1 else f"p{self.profile_slot}:{cid}"
 
-    def _new_stream(self, channel: Channel, pinned: bool) -> ActiveStream:
+    def _new_stream(self, channel: Channel, pinned: bool, standby: bool = False) -> ActiveStream:
         def refresh() -> str:
             text = private_playlist_text(self.path, self.private_url, self.timeout)
             updated = next((c for c in channels_from_text(text)
@@ -162,9 +163,9 @@ class MultiGateway:
                           require_startup_reserve=self.require_startup_reserve,
                           on_event=(lambda kind, detail, duration: self.telemetry.incident(
                               self.telemetry_channel_id(channel.id), kind, detail, duration)) if self.telemetry else None)
-        return ActiveStream(channel, gateway, self.upstream_slots, pinned)
+        return ActiveStream(channel, gateway, self.upstream_slots, pinned, standby)
 
-    def start(self, cid: str, *, pinned: bool = False) -> ActiveStream | None:
+    def start(self, cid: str, *, pinned: bool = False, standby: bool = False) -> ActiveStream | None:
         """Start a requested channel; do not silently evict active viewers."""
         with self.lock:
             if cid not in self.channels:
@@ -174,8 +175,19 @@ class MultiGateway:
                 stream.accessed = time.monotonic()
                 if pinned:
                     stream.pinned = True
+                if not standby:
+                    stream.standby = False  # Real viewers take precedence.
                 return stream
             self.sweep_locked()
+            if len(self.active) >= self.max_streams and not standby:
+                # Background CDN mirrors must never block real viewers
+                # from tuning their own TV cabinet to a different channel.
+                disposable = [(sid, item) for sid, item in self.active.items()
+                              if item.standby and item.pending_requests == 0]
+                if disposable:
+                    sid, old = min(disposable, key=lambda row: row[1].accessed)
+                    old.close()
+                    del self.active[sid]
             if len(self.active) >= self.max_streams:
                 # A channel-switching TV may keep two stopped channels in
                 # cache; reclaim only genuinely idle, unpinned sessions.
@@ -192,7 +204,7 @@ class MultiGateway:
             if len(self.active) >= self.max_streams:
                 self.stream_limit_denials += 1
                 return None
-            stream = self._new_stream(self.channels[cid], pinned)
+            stream = self._new_stream(self.channels[cid], pinned, standby)
             self.active[cid] = stream
             return stream
 
@@ -234,6 +246,7 @@ class MultiGateway:
                     "id": stream.channel.id,
                     "channel": stream.channel.name,
                     "pinned": stream.pinned,
+                    "standby": stream.standby,
                     "ready": details["ready"],
                     "buffer_state": details["buffer_state"],
                     "contiguous_tail_seconds": details["contiguous_tail_seconds"],
