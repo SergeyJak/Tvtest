@@ -464,6 +464,9 @@ def make_multi_handler(manager: MultiGateway, token: str,
                     pilot = profile_registry.failover_status(active_token)
                     if pilot is not None:
                         data["multi_cdn"] = pilot
+                    diagnostics = profile_registry.pilot_diagnostics(active_token)
+                    if diagnostics is not None:
+                        data["multi_cdn_diagnostics"] = diagnostics
                 return self.respond(200, json.dumps(data, ensure_ascii=False).encode("utf-8"),
                                     "application/json", head)
             if route == ["channels.m3u"]:
