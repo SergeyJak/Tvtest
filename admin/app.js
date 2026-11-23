@@ -146,6 +146,30 @@
       });
     }
   }
+  function renderMultiCdn(rows) {
+    const card = $("cdn-pilot-panel");
+    const pilots = Array.isArray(rows) ? rows : [];
+    card.hidden = pilots.length === 0;
+    if (!pilots.length) return;
+    const current = pilots[0];
+    text("cdn-selected", current.selected_cabinet ? "Кабинет " + current.selected_cabinet : "Накопление буфера");
+    text("cdn-switches", n(current.switches || 0));
+    const target = $("cdn-sources");
+    target.replaceChildren();
+    (current.sources || []).forEach(source => {
+      const row = element("div", "cdn-source");
+      const name = element("strong", "", "CDN · кабинет " + source.cabinet);
+      const state = element("span", "cdn-health " + (source.fresh ? "good" : source.ready ? "warn" : ""),
+          source.fresh ? "● В эфире" : source.ready ? "● Нет новых сегментов" : "● Прогрев");
+      const active = source.cabinet === current.selected_cabinet;
+      if (active) name.append(element("small", "cdn-selected-label", " ВЫБРАН"));
+      const note = element("small", "cdn-source-note",
+          "Буфер " + (source.buffer_seconds == null ? "—" : source.buffer_seconds + " с") +
+          " · последний сегмент " + (source.age_seconds == null ? "—" : source.age_seconds + " с назад"));
+      row.append(name, state, note);
+      target.append(row);
+    });
+  }
   function updateOverview(data) {
     state.overview = data;
     const online = data.gateway_online;
@@ -191,6 +215,7 @@
     text("last-updated", "Обновлено в " + new Date().toLocaleTimeString("ru-RU", {hour:"2-digit",minute:"2-digit",second:"2-digit"}));
     text("footer-time", new Date().getFullYear());
     updateResources(data);
+    renderMultiCdn(data.multi_cdn);
     renderStreams(data.streams);
   }
   function renderStreams(streams) {
