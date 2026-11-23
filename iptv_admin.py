@@ -242,7 +242,10 @@ class AdminState:
             return sum(int(value.get(field) or 0) for _, value in statuses)
         streams = []
         cabins = []
+        multi_cdn = []
         for profile, data in statuses:
+            if profile["slot"] == 1:
+                multi_cdn = data.get("multi_cdn") or []
             cabins.append({
                 "slot": profile["slot"], "name": profile["name"],
                 "active_streams": len(data.get("streams") or []),
@@ -263,6 +266,7 @@ class AdminState:
             "telemetry_enabled": any(bool(s.get("telemetry_enabled")) for _, s in statuses),
             "streams": streams,
             "cabins": cabins,
+            "multi_cdn": multi_cdn,
         }
 
     def login(self, password: str, peer: str) -> str | None:
@@ -329,6 +333,7 @@ class AdminState:
             "cached_mib": round(sum(float(row.get("cached_mib") or 0) for row in active), 1),
             "stalled_streams": sum(1 for row in active if row.get("stalled")),
             "cabins": status.get("cabins", []) if status else [],
+            "multi_cdn": status.get("multi_cdn", []) if status else [],
             "channels": len(channels),
             "active_streams": len(active),
             "max_streams": status.get("max_streams") if status else None,

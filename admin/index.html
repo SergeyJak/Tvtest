@@ -33,6 +33,7 @@
       <div class="side-label">РАБОЧЕЕ ПРОСТРАНСТВО</div>
       <nav class="side-nav" aria-label="Навигация">
         <button type="button" class="nav-button active" data-target="overview"><span class="nav-icon">◈</span> Обзор</button>
+        <button type="button" class="nav-button" data-target="cdn"><span class="nav-icon">◎</span> CDN-монитор</button>
         <button type="button" class="nav-button" data-target="channels"><span class="nav-icon">▤</span> Каналы</button>
         <button type="button" class="nav-button" data-target="epg"><span class="nav-icon">▦</span> Телепрограмма</button>
         <button type="button" class="nav-button" data-target="tv"><span class="nav-icon">▧</span> Кабинеты ТВ</button>
@@ -102,6 +103,33 @@
               <div class="resource-cabins" id="service-cabins" aria-label="Использование кабинетов"></div>
             </article>
           </div>
+          <article class="panel cdn-panel" id="cdn-pilot-panel" hidden>
+            <div class="panel-heading"><div><div class="eyebrow">MULTI-CDN / EXPERIMENT</div><h2>Резервирование «VF Теория большого взрыва»</h2></div><span class="live-label">LIVE</span></div>
+            <p class="resource-note">Три кабинета Edem, одна ссылка ТВ. Переключение между целыми HLS-источниками, без смешивания сегментов.</p>
+            <div class="cdn-summary"><span>Основной источник: <strong id="cdn-selected">—</strong></span><span>Переключений: <strong id="cdn-switches">0</strong></span></div>
+            <div class="cdn-sources" id="cdn-sources"></div>
+            <button type="button" class="text-link" data-go="cdn">Открыть подробный монитор <span>↗</span></button>
+          </article>
+        </section>
+
+        <section class="view" id="view-cdn" hidden>
+          <div class="view-heading"><div><div class="eyebrow">STREAM RELIABILITY / LIVE</div><h1>CDN-монитор<span class="accent">.</span></h1><p>Контроль трёх источников канала «VF Теория большого взрыва». Показывает, что реально отдаёт шлюз телевизору, а не только скорость скачивания с Edem.</p></div><span class="status-pill" id="cdn-monitor-status">Ожидание эфира</span></div>
+          <div class="cdn-monitor-stats">
+            <article class="metric"><div class="metric-top">Выбранный источник <span>◉</span></div><div class="cdn-monitor-metric" id="cdn-monitor-selected">—</div><div class="metric-caption" id="cdn-monitor-selected-sub">Проверяем поток</div></article>
+            <article class="metric"><div class="metric-top">Новых кадров для ТВ <span>↗</span></div><div class="cdn-monitor-metric" id="cdn-monitor-progress">—</div><div class="metric-caption">Прошло с последнего продвижения HLS</div></article>
+            <article class="metric"><div class="metric-top">Запас в кэше <span>▥</span></div><div class="cdn-monitor-metric" id="cdn-monitor-cache">—</div><div class="metric-caption" id="cdn-monitor-cache-sub">Видео, сохранённое в мультиплексоре</div></article>
+            <article class="metric"><div class="metric-top">Переключения <span>⇄</span></div><div class="cdn-monitor-metric" id="cdn-monitor-switches">—</div><div class="metric-caption">С момента запуска видеошлюза</div></article>
+          </div>
+          <article class="panel cdn-detail-panel">
+            <div class="panel-heading"><div><div class="eyebrow">UPSTREAM SOURCES</div><h2>Состояние трёх CDN</h2></div><span class="resource-refresh">Обновление каждые 15 с</span></div>
+            <div class="cdn-monitor-sources" id="cdn-monitor-sources"><div class="empty-state">Подключаем данные источников…</div></div>
+            <p class="note">Названия берутся из кабинетов ТВ. Для удобства можно назвать их «Германия», «Амстердам» и «Англия». Зелёный статус означает поступление новых сегментов, а не гарантированно непрерывное воспроизведение.</p>
+          </article>
+          <article class="panel cdn-detail-panel">
+            <div class="panel-heading"><div><div class="eyebrow">EVENT HISTORY</div><h2>Последние переключения</h2></div><span class="resource-refresh" id="cdn-last-event">Нет событий</span></div>
+            <div class="cdn-event-list" id="cdn-monitor-events"><div class="empty-state">История появится после выбора источника.</div></div>
+            <p class="note">Последние 20 событий хранятся в памяти шлюза. После его перезапуска журнал начинается заново. Логины, ссылки M3U и ключи Edem не сохраняются.</p>
+          </article>
         </section>
 
         <section class="view" id="view-channels" hidden>

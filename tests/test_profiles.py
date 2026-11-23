@@ -145,6 +145,91 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertFalse(active.gateway.stop.is_set())
         self.assertEqual(updated.start(second).gateway._url, channels_from_text(rotated)[1].url)
 
+    def test_m3u_only_refresh_after_region_change_skips_epg_generation(self):
+        from iptv_profile_jobs import run_update
+        with patch("iptv_profiles.download_playlist", return_value=PLAYLIST):
+            row, _ = self.store.update(2, "Резерв", "https://example.org/playlist")
+        before = self.store.get(2)["revision"]
+        rotated = PLAYLIST.replace("PRIVATE_CHANNEL", "DIFFERENT_CDN")
+        with patch("iptv_profile_jobs.download_playlist", return_value=rotated), \
+             patch("iptv_epg_stream.build_epg", side_effect=AssertionError("EPG must not run")):
+            result = run_update(self.store, [2], refresh_m3u=True, m3u_only=True)
+        self.assertEqual(result[2], "refreshed_m3u")
+        self.assertEqual(self.store.get(2)["revision"], before)
+        self.assertIn("DIFFERENT_CDN", self.store.snapshot_path(2).read_text())
+        # Refreshing provider URLs must never disclose the private source key.
+        self.assertNotIn("https://example.org/playlist", str(result))
+
+    def test_m3u_only_keeps_previous_epg_on_channel_list_change_and_failure(self):
+        from iptv_profile_jobs import run_update
+        with patch("iptv_profiles.download_playlist", return_value=PLAYLIST):
+            self.store.update(2, "Резерв", "https://example.org/playlist")
+        old_guide = b"previous-successful-guide-content"
+        self.store.epg_path(2).write_bytes(old_guide)
+        previous_rev = self.store.get(2)["revision"]
+        new_playlist = PLAYLIST + (
+            '#EXTINF:-1 group-title="News",New Channel\n'
+            'https://provider.invalid/new-channel\n')
+        with patch("iptv_profile_jobs.download_playlist", return_value=new_playlist):
+            result = run_update(self.store, [2], refresh_m3u=True, m3u_only=True)
+        self.assertEqual(result[2], "refreshed_m3u")
+        self.assertEqual(self.store.get(2)["revision"], previous_rev + 1)
+        self.assertEqual(self.store.epg_path(2).read_bytes(), old_guide)
+        # Even a failed build after changing channel IDs cannot destroy the
+        # last good guide, which should be atomically replaced only on success.
+        with patch.object(self.store, "guide_source", return_value="https://example.org/guide"), \
+             patch("iptv_profile_jobs.validate_source_url", side_effect=lambda url: url), \
+             patch("iptv_epg_stream.build_epg", side_effect=OSError("source failure")):
+            failure = run_update(self.store, [2])
+        self.assertEqual(failure[2], "failed")
+        self.assertEqual(self.store.epg_path(2).read_bytes(), old_guide)
+        with patch.object(self.store, "guide_source", return_value="https://example.org/guide"), \
+             patch("iptv_profile_jobs.validate_source_url", side_effect=lambda url: url), \
+             patch("iptv_epg_stream.build_epg",
+                   side_effect=lambda playlist, urls, destination, opts:
+                   Path(destination).write_bytes(b"new-guide")):
+            success = run_update(self.store, [2])
+        self.assertEqual(success[2], "updated")
+        self.assertEqual(self.store.epg_path(2).read_bytes(), b"new-guide")
+
+    def test_vf_virtual_ids_survive_backup_becoming_available_during_playback(self):
+        from collections import OrderedDict
+        playlist = ('#EXTM3U\n#EXTINF:-1,VF Теория большого взрыва\n'
+                    'https://cdn1.example/private-video\n')
+        with patch("iptv_profiles.download_playlist", return_value=playlist):
+            self.store.update(1, "Основной", "https://provider.example/primary.m3u")
+        token = self.store.get(1)["token"]
+        manager = self.registry.resolve(token)[0]
+        cid = next(iter(manager.channels))
+        mux, candidates = self.registry.failover_for(token, cid)
+        self.assertEqual(len(candidates), 1)
+        primary = candidates[0][1]
+        with primary.gateway.lock:
+            primary.gateway.cache = OrderedDict(
+                (i, (6.0, f"PRIMARY-{i}".encode())) for i in range(100, 106))
+            primary.gateway.latest = 105
+            primary.gateway.target = 6.0
+            primary.gateway.last_progress = time.time()
+            primary.gateway.last_segment_download = time.time()
+            primary.gateway._fast_start_at = time.monotonic() - 1
+        with self.request(token, f"channel/{cid}/index.m3u8") as response:
+            baseline = response.read().decode()
+        self.assertIn("MEDIA-SEQUENCE:1", baseline)
+        with self.request(token, f"channel/{cid}/segment/1.ts") as response:
+            self.assertEqual(response.read(), b"PRIMARY-100")
+        # The other account is configured while the TV continues watching.
+        with patch("iptv_profiles.download_playlist", return_value=playlist):
+            self.store.update(2, "Резерв", "https://provider.example/backup.m3u")
+        self.registry.resolve(token)
+        updated_mux, expanded = self.registry.failover_for(token, cid)
+        self.assertIs(updated_mux, mux)
+        self.assertEqual(len(expanded), 2)
+        with self.request(token, f"channel/{cid}/index.m3u8") as response:
+            later = response.read().decode()
+        self.assertIn(f"/{token}/channel/{cid}/segment/1.ts", later)
+        with self.request(token, f"channel/{cid}/segment/1.ts") as response:
+            self.assertEqual(response.read(), b"PRIMARY-100")
+
     def test_rename_is_instant_and_does_not_restart_workers(self):
         with patch("iptv_profiles.download_playlist", return_value=OTHER):
             row, _ = self.store.update(2, "Old", "https://example.org/m3u")
@@ -208,6 +293,70 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertEqual(self.store.public_profiles("https://tv.example.test")[0]["m3u"], before)
         self.assertEqual(self.legacy.read_text(), PLAYLIST)
         self.assertEqual(self.legacy_token.read_text(), "stable-original-token-abcdef")
+
+
+    def test_primary_vf_channel_uses_three_cdns_without_changing_tv_links(self):
+        """Real HTTP path keeps one TV link and never exposes CDN URLs."""
+        from collections import OrderedDict
+        for slot in (1, 2, 3):
+            playlist = ("#EXTM3U\n"
+                        "#EXTINF:-1 group-title=\"VF\",VF Теория большого взрыва\n"
+                        f"https://cdn{slot}.example/PRIVATE_{slot}/index.m3u8\n")
+            with patch("iptv_profiles.download_playlist", return_value=playlist):
+                row, changed = self.store.update(
+                    slot, f"CDN-{slot}", f"https://provider{slot}.example/M3U_KEY_{slot}")
+            self.assertTrue(changed)
+        owner_token = self.store.get(1)["token"]
+        backup_token = self.store.get(2)["token"]
+        manager = self.registry.resolve(owner_token)[0]
+        cid = next(iter(manager.channels))
+        self.assertIsNone(self.registry.failover_for(backup_token, cid))
+        pilot = self.registry.failover_for(owner_token, cid)
+        self.assertIsNotNone(pilot)
+        mux, candidates = pilot
+        self.assertEqual([slot for slot, _ in candidates], [1, 2, 3])
+        for slot, stream in candidates:
+            gateway = stream.gateway
+            now = time.time()
+            with gateway.lock:
+                gateway.cache = OrderedDict(
+                    (i, (6.0, f"VIDEO_CDN_{slot}_{i}".encode()))
+                    for i in range(100, 106))
+                gateway.latest = 105
+                gateway.target = 6.0
+                gateway.last_progress = now
+                gateway.last_segment_download = now
+                gateway._fast_start_at = time.monotonic() - 2
+        with self.request(owner_token, f"channel/{cid}/index.m3u8") as response:
+            first_manifest = response.read().decode()
+        self.assertIn(f"/{owner_token}/channel/{cid}/segment/1.ts", first_manifest)
+        self.assertNotIn("PRIVATE_1", first_manifest)
+        self.assertNotIn("M3U_KEY_1", first_manifest)
+        with self.request(owner_token, f"channel/{cid}/segment/1.ts") as response:
+            self.assertEqual(response.read(), b"VIDEO_CDN_1_100")
+        self.assertEqual(mux.source_slot, 1)
+        # Trigger a source stall and verify a stable virtual media sequence.
+        with candidates[0][1].gateway.lock:
+            candidates[0][1].gateway.last_progress -= 90
+            candidates[0][1].gateway.last_segment_download -= 90
+        mux.last_switch = time.monotonic() - 25
+        with self.request(owner_token, f"channel/{cid}/index.m3u8") as response:
+            next_manifest = response.read().decode()
+        self.assertIn("#EXT-X-DISCONTINUITY", next_manifest)
+        self.assertIn(f"/{owner_token}/channel/{cid}/segment/4.ts", next_manifest)
+        with self.request(owner_token, f"channel/{cid}/segment/4.ts") as response:
+            self.assertEqual(response.read(), b"VIDEO_CDN_2_100")
+        self.assertEqual(mux.source_slot, 2)
+        with self.request(owner_token, "status") as response:
+            live = json.load(response)
+        self.assertEqual(live["multi_cdn"][0]["selected_cabinet"], 2)
+        self.assertEqual(live["multi_cdn"][0]["switches"], 1)
+        self.assertNotIn("PRIVATE_", json.dumps(live))
+        self.assertNotIn("M3U_KEY_", json.dumps(live))
+        # Operator can disable the pilot without deleting M3U or changing keys.
+        (self.store.directory / "multicdn.disabled").touch()
+        self.assertIsNone(self.registry.failover_for(owner_token, cid))
+        self.assertIsNone(self.registry.existing_failover(owner_token, cid))
 
 
 if __name__ == "__main__":

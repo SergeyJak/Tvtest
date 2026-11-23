@@ -76,10 +76,11 @@ def channels_from_text(text: str) -> list[Channel]:
 
 class ActiveStream:
     def __init__(self, channel: Channel, gateway: Gateway, slots: threading.BoundedSemaphore,
-                 pinned: bool = False):
+                 pinned: bool = False, standby: bool = False):
         self.channel = channel
         self.gateway = gateway
         self.pinned = pinned
+        self.standby = standby
         self.accessed = time.monotonic()
         self.pending_requests = 0
         self.worker = threading.Thread(target=self._run, args=(slots,), daemon=True)
@@ -145,7 +146,7 @@ class MultiGateway:
         # identical channels watched through separate subscription cabinets.
         return cid if self.profile_slot == 1 else f"p{self.profile_slot}:{cid}"
 
-    def _new_stream(self, channel: Channel, pinned: bool) -> ActiveStream:
+    def _new_stream(self, channel: Channel, pinned: bool, standby: bool = False) -> ActiveStream:
         def refresh() -> str:
             text = private_playlist_text(self.path, self.private_url, self.timeout)
             updated = next((c for c in channels_from_text(text)
@@ -162,21 +163,38 @@ class MultiGateway:
                           require_startup_reserve=self.require_startup_reserve,
                           on_event=(lambda kind, detail, duration: self.telemetry.incident(
                               self.telemetry_channel_id(channel.id), kind, detail, duration)) if self.telemetry else None)
-        return ActiveStream(channel, gateway, self.upstream_slots, pinned)
+        return ActiveStream(channel, gateway, self.upstream_slots, pinned, standby)
 
-    def start(self, cid: str, *, pinned: bool = False) -> ActiveStream | None:
+    def start(self, cid: str, *, pinned: bool = False, standby: bool = False) -> ActiveStream | None:
         """Start a requested channel; do not silently evict active viewers."""
         with self.lock:
             if cid not in self.channels:
                 return None
             if cid in self.active:
                 stream = self.active[cid]
-                stream.accessed = time.monotonic()
+                # Background probes cannot extend a real viewer's lifetime.
+                # Otherwise an abandoned VF session fills the one-stream cap
+                # forever while the primary TV periodically probes backups.
+                if not standby or stream.standby:
+                    stream.accessed = time.monotonic()
                 if pinned:
                     stream.pinned = True
+                if not standby:
+                    stream.standby = False  # Real viewers take precedence.
                 return stream
             self.sweep_locked()
-            if len(self.active) >= self.max_streams:
+            if len(self.active) >= self.max_streams and not standby:
+                # Background CDN mirrors must never block real viewers
+                # from tuning their own TV cabinet to a different channel.
+                disposable = [(sid, item) for sid, item in self.active.items()
+                              if item.standby and item.pending_requests == 0]
+                if disposable:
+                    sid, old = min(disposable, key=lambda row: row[1].accessed)
+                    old.close()
+                    del self.active[sid]
+            if len(self.active) >= self.max_streams and not standby:
+                # Only real viewers may reclaim idle sessions. A CDN mirror
+                # must never displace another cabin's selected channel.
                 # A channel-switching TV may keep two stopped channels in
                 # cache; reclaim only genuinely idle, unpinned sessions.
                 # Never steal from active viewers or pending warmups.
@@ -192,7 +210,7 @@ class MultiGateway:
             if len(self.active) >= self.max_streams:
                 self.stream_limit_denials += 1
                 return None
-            stream = self._new_stream(self.channels[cid], pinned)
+            stream = self._new_stream(self.channels[cid], pinned, standby)
             self.active[cid] = stream
             return stream
 
@@ -234,6 +252,7 @@ class MultiGateway:
                     "id": stream.channel.id,
                     "channel": stream.channel.name,
                     "pinned": stream.pinned,
+                    "standby": stream.standby,
                     "ready": details["ready"],
                     "buffer_state": details["buffer_state"],
                     "contiguous_tail_seconds": details["contiguous_tail_seconds"],
@@ -440,7 +459,13 @@ def make_multi_handler(manager: MultiGateway, token: str,
             if route == ["epg.xml.gz"] and active_epg_file is not None:
                 return self.serve_epg(head, active_epg_file)
             if route == ["status"]:
-                return self.respond(200, request_manager.status(), "application/json", head)
+                data = json.loads(request_manager.status())
+                if profile_registry is not None:
+                    pilot = profile_registry.failover_status(active_token)
+                    if pilot is not None:
+                        data["multi_cdn"] = pilot
+                return self.respond(200, json.dumps(data, ensure_ascii=False).encode("utf-8"),
+                                    "application/json", head)
             if route == ["channels.m3u"]:
                 host = self.headers.get("Host", "")
                 if not re.fullmatch(r"[A-Za-z0-9.:\-\[\]]{1,255}", host):
@@ -471,6 +496,8 @@ def make_multi_handler(manager: MultiGateway, token: str,
             if cid not in request_manager.channels:
                 return self.respond(404, b"Unknown channel", "text/plain", head)
             if len(route) == 3 and resource == "index.m3u8":
+                pilot = (profile_registry.failover_for(active_token, cid)
+                         if profile_registry is not None else None)
                 stream = request_manager.start(cid)
                 if stream is None:
                     self.track_client_failure(cid, "STREAM_LIMIT", 503)
@@ -483,7 +510,8 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 with request_manager.lock:
                     stream.pending_requests += 1
                 try:
-                    raw = stream.gateway.playlist(active_token)
+                    raw = (pilot[0].playlist(active_token, pilot[1])
+                           if pilot else stream.gateway.playlist(active_token))
                     waited = False
                     deadline = time.monotonic() + request_manager.startup_wait
                     while raw is None and not request_manager.stop.is_set():
@@ -493,7 +521,8 @@ def make_multi_handler(manager: MultiGateway, token: str,
                         waited = True
                         if stream.gateway.stop.wait(min(0.25, remaining)):
                             break
-                        raw = stream.gateway.playlist(active_token)
+                        raw = (pilot[0].playlist(active_token, pilot[1])
+                               if pilot else stream.gateway.playlist(active_token))
                     with request_manager.lock:
                         if waited:
                             if raw is not None:
@@ -528,7 +557,12 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 if stream is None:
                     self.track_client_failure(cid, "STREAM_EXPIRED", 404)
                     return self.respond(404, b"Stream expired", "text/plain", head)
-                data = stream.gateway.segment(seq, record_miss=True)
+                pilot_mux = (profile_registry.existing_failover(active_token, cid)
+                             if profile_registry is not None else None)
+                if pilot_mux is not None:
+                    data = pilot_mux.segment(seq)
+                else:
+                    data = stream.gateway.segment(seq, record_miss=True)
                 if data is None:
                     self.track_client_failure(cid, "SEGMENT_CACHE_MISS", 404)
                     return self.respond(404, b"Segment not in cache", "text/plain", head)

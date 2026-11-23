@@ -5,7 +5,7 @@
   const app = $("app");
   const loginScreen = $("login-screen");
   const state = {overview: null, channels: [], epgStatus: "", page: 0, size: 50, lastCatalog: 0, view: "overview", busy: false};
-  const views = {overview:"ОБЗОР", channels:"КАНАЛЫ", epg:"ТЕЛЕПРОГРАММА", tv:"КАБИНЕТЫ ТВ", history:"ПРОСМОТРЫ", incidents:"ОШИБКИ И ЗАВИСАНИЯ", system:"ДИАГНОСТИКА"};
+  const views = {overview:"ОБЗОР", cdn:"CDN-МОНИТОР", channels:"КАНАЛЫ", epg:"ТЕЛЕПРОГРАММА", tv:"КАБИНЕТЫ ТВ", history:"ПРОСМОТРЫ", incidents:"ОШИБКИ И ЗАВИСАНИЯ", system:"ДИАГНОСТИКА"};
 
   function text(id, value) {
     const node = $(id);
@@ -146,6 +146,152 @@
       });
     }
   }
+  function renderMultiCdn(rows) {
+    const card = $("cdn-pilot-panel");
+    const pilots = Array.isArray(rows) ? rows : [];
+    card.hidden = pilots.length === 0;
+    if (!pilots.length) return;
+    const current = pilots[0];
+    text("cdn-selected", current.selected_cabinet ? "Кабинет " + current.selected_cabinet : "Накопление буфера");
+    text("cdn-switches", n(current.switches || 0));
+    const target = $("cdn-sources");
+    target.replaceChildren();
+    (current.sources || []).forEach(source => {
+      const row = element("div", "cdn-source");
+      const name = element("strong", "", "CDN · " + (source.name || "Кабинет " + source.cabinet));
+      const state = element("span", "cdn-health " + (source.fresh ? "good" : source.ready ? "warn" : ""),
+          source.fresh ? "● В эфире" : source.ready ? "● Нет новых сегментов" : "● Прогрев");
+      const active = source.cabinet === current.selected_cabinet;
+      if (active) name.append(element("small", "cdn-selected-label", " ВЫБРАН"));
+      const note = element("small", "cdn-source-note",
+          "Буфер " + (source.buffer_seconds == null ? "—" : source.buffer_seconds + " с") +
+          " · последний сегмент " + (source.age_seconds == null ? "—" : source.age_seconds + " с назад"));
+      row.append(name, state, note);
+      target.append(row);
+    });
+  }
+  function renderCdnMonitor(data) {
+    const active = Array.isArray(data.multi_cdn) && data.multi_cdn.length
+      ? data.multi_cdn[0] : null;
+    const streamLive = !!data.gateway_online && !!active
+      && (active.seconds_since_last_probe === null
+          || active.seconds_since_last_probe === undefined
+          || active.seconds_since_last_probe < 35);
+    const names = new Map((data.cabins || []).map(cabin =>
+      [Number(cabin.slot), cabin.name || "Кабинет " + cabin.slot]));
+    const sourceItems = active?.sources || [];
+    sourceItems.forEach(item => {
+      if (item.name) names.set(Number(item.cabinet), item.name);
+    });
+    const cabinName = slot => slot == null ? "—" : (names.get(Number(slot)) || "Кабинет " + slot);
+    const selectedName = active?.selected_cabinet ? cabinName(active.selected_cabinet) : null;
+    const progress = active?.last_playlist_progress_seconds;
+    const delayed = streamLive && progress != null && Number(progress) >= 18;
+    badge("cdn-monitor-status", !data.gateway_online ? "● Шлюз недоступен" :
+      !active ? "○ Ожидание просмотра" :
+      !streamLive ? "○ Канал неактивен" :
+      delayed ? "● Плейлист задерживается" :
+      selectedName ? "● Источник выбран" : "○ Прогрев",
+      !data.gateway_online || delayed);
+    text("cdn-monitor-selected", streamLive ? (selectedName || "Прогрев") : "—");
+    text("cdn-monitor-selected-sub", !active ? "Включи VF в основном кабинете" :
+      !streamLive ? "Нет текущего просмотра" : "Источник сегментов для телевизора");
+    text("cdn-monitor-progress", streamLive && progress != null ? duration(progress) : "—");
+    text("cdn-monitor-cache", active && Number.isFinite(Number(active.cached_video_seconds))
+      ? duration(active.cached_video_seconds) : "—");
+    text("cdn-monitor-cache-sub", active?.virtual_segment_sequence == null ?
+      "Нет опубликованных сегментов" : "Последний виртуальный сегмент № " + n(active.virtual_segment_sequence));
+    text("cdn-monitor-switches", active ? n(active.switches || 0) : "—");
+    const sourceContainer = $("cdn-monitor-sources");
+    sourceContainer.replaceChildren();
+    [1, 2, 3].forEach(slot => {
+      const source = sourceItems.find(item => Number(item.cabinet) === slot);
+      const selected = streamLive && Number(active?.selected_cabinet) === slot;
+      const card = element("div", "cdn-monitor-source" + (selected ? " selected" : ""));
+      const top = element("div", "cdn-monitor-source-top");
+      const label = element("div", "");
+      label.append(element("span", "eyebrow", "КАБИНЕТ " + slot));
+      label.append(element("h3", "", cabinName(slot)));
+      const healthy = streamLive && source?.fresh;
+      const statusText = !streamLive ? "Нет просмотра" :
+        !source ? "Нет телеметрии" :
+        selected && healthy ? "● Выбран" :
+        selected ? "● Выбран · задержка" :
+        healthy ? "● Готовый резерв" :
+        source.ready ? "● Поток задерживается" : "○ Буферизация";
+      top.append(label, element("span", "cdn-monitor-source-status " +
+        (healthy ? "good" : source?.ready && streamLive ? "warn" : ""), statusText));
+      card.append(top);
+      const buffer = source?.buffer_seconds;
+      const video = source?.contiguous_tail_seconds;
+      const bufferPercent = streamLive && Number.isFinite(Number(buffer))
+        ? Math.min(100, Math.max(0, 100 * Number(buffer) / 90)) : 0;
+      const meterHead = element("div", "cdn-monitor-meter-head");
+      meterHead.append(element("span", "", "Запас HLS"));
+      meterHead.append(element("strong", "",
+        streamLive && buffer != null ? duration(buffer) : "—"));
+      card.append(meterHead);
+      const track = element("div", "cdn-buffer-track");
+      track.setAttribute("role", "progressbar");
+      track.setAttribute("aria-label", "Запас HLS относительно 90 секунд");
+      track.setAttribute("aria-valuemin", "0");
+      track.setAttribute("aria-valuemax", "90");
+      track.setAttribute("aria-valuenow", streamLive && buffer != null
+        ? String(Math.max(0, Math.min(90, Math.round(buffer)))) : "0");
+      const bar = element("div", "cdn-buffer-fill" + (bufferPercent < 20 ? " low" : ""));
+      bar.style.width = bufferPercent + "%";
+      track.append(bar);
+      card.append(track);
+      const details = element("div", "cdn-source-facts");
+      [
+        ["Видео в кэше", streamLive && video != null ? duration(video) : "—"],
+        ["Новый сегмент", streamLive && source?.age_seconds != null
+          ? duration(source.age_seconds) + " назад" : "—"],
+        ["Плейлист CDN", streamLive && source?.published_age_seconds != null
+          ? duration(source.published_age_seconds) + " назад" : "—"],
+        ["Скачан сегмент", streamLive && source?.downloaded_sequence != null
+          ? "#" + n(source.downloaded_sequence) : "—"],
+        ["Выдан CDN", streamLive && source?.published_sequence != null
+          ? "#" + n(source.published_sequence) : "—"],
+        ["Медленных сегментов", streamLive ? n(source?.slow_segments) : "—"],
+      ].forEach(([title, value]) => {
+        const fact = element("div", "cdn-source-fact");
+        fact.append(element("span", "", title), element("strong", "", value));
+        details.append(fact);
+      });
+      card.append(details);
+      sourceContainer.append(card);
+    });
+    const events = $("cdn-monitor-events");
+    events.replaceChildren();
+    const history = active?.switch_history || [];
+    text("cdn-last-event", history.length ? "Событий: " + n(history.length) : "Нет событий");
+    if (!active || !history.length) {
+      events.append(element("div", "empty-state", !active
+        ? "История появится после первого просмотра пилотного канала."
+        : "Пока переключений не было."));
+      return;
+    }
+    const reasons = {
+      START:"Начало просмотра", PUBLISH_STALL:"Плейлист перестал продвигаться",
+      SOURCE_UNAVAILABLE:"Источник недоступен",
+      SOURCE_RESTARTED:"Перезапуск исходного потока"
+    };
+    history.forEach(event => {
+      const item = element("div", "cdn-monitor-event");
+      const time = Number(event.at);
+      item.append(element("time", "", Number.isFinite(time) && time > 0
+        ? new Date(time * 1000).toLocaleString("ru-RU", {
+          day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit", second:"2-digit"
+        }) : "—"));
+      item.append(element("strong", "", event.kind === "start"
+        ? "Начальный источник: " + cabinName(event.to_cabinet)
+        : cabinName(event.from_cabinet) + " → " + cabinName(event.to_cabinet)));
+      item.append(element("span", "", reasons[event.reason] || "Переключение источника"));
+      events.append(item);
+    });
+  }
+
   function updateOverview(data) {
     state.overview = data;
     const online = data.gateway_online;
@@ -191,6 +337,8 @@
     text("last-updated", "Обновлено в " + new Date().toLocaleTimeString("ru-RU", {hour:"2-digit",minute:"2-digit",second:"2-digit"}));
     text("footer-time", new Date().getFullYear());
     updateResources(data);
+    renderMultiCdn(data.multi_cdn);
+    renderCdnMonitor(data);
     renderStreams(data.streams);
   }
   function renderStreams(streams) {
