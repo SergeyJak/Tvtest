@@ -135,9 +135,18 @@ class FailoverMux:
                         selected_records = records[-min(3, len(records)):]
                         discontinuity = bool(self.history)
                     else:
-                        selected_records = [row for row in records
-                                            if row[0] > self.last_upstream_seq]
-                        discontinuity = False
+                        if records[-1][0] < self.last_upstream_seq - 3:
+                            # Provider reset the HLS media sequence on the
+                            # same CDN. Begin a fresh decoder epoch rather
+                            # than freezing until its counter catches up.
+                            selected_records = records[-min(3, len(records)):]
+                            discontinuity = True
+                        else:
+                            selected_records = [row for row in records
+                                                if row[0] > self.last_upstream_seq]
+                            discontinuity = bool(
+                                selected_records
+                                and selected_records[0][0] > self.last_upstream_seq + 1)
                     for index, (seq, duration, data) in enumerate(selected_records):
                         self._append(seq, duration, data,
                                      discontinuity=discontinuity and index == 0)
