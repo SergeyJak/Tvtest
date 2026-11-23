@@ -112,7 +112,7 @@ class ProfileRegistry:
         Alternative cabinet tokens never expose or consume each other's media
         and a busy alternative is never evicted for this experiment.
         """
-        if self.closed:
+        if self.closed or (self.store.directory / "multicdn.disabled").exists():
             return None
         with self.lock:
             row = self.store.get(1)
@@ -146,6 +146,8 @@ class ProfileRegistry:
 
     def existing_failover(self, token: str, cid: str):
         """Only original cabinet may access previously published virtual segments."""
+        if (self.store.directory / "multicdn.disabled").exists():
+            return None
         with self.lock:
             row = self.store.get(1)
             return self.failovers.get(cid) if token == row["token"] else None
@@ -155,7 +157,14 @@ class ProfileRegistry:
             row = self.store.get(1)
             if token != row["token"]:
                 return None
-            return [mux.status() for mux in self.failovers.values()]
+            names = {row["slot"]: row["name"] for row in self.store.all()}
+            result = []
+            for mux in self.failovers.values():
+                status = mux.status()
+                for source in status["sources"]:
+                    source["name"] = names.get(source["cabinet"], "Кабинет")
+                result.append(status)
+            return result
 
     def close(self):
         with self.lock:
