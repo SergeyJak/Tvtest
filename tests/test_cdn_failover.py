@@ -125,7 +125,7 @@ class MultiCdnTests(unittest.TestCase):
         candidates = [(1, original), (2, backup), (3, third)]
         playlist = mux.playlist("safe-token", candidates, now=100).decode()
         self.assertIn("#EXT-X-MEDIA-SEQUENCE:1", playlist)
-        self.assertIn("/safe-token/segment/1.ts", playlist)
+        self.assertIn(f"/safe-token/segment/{mux.generation}.1.ts", playlist)
         self.assertNotIn("#EXT-X-DISCONTINUITY\n", playlist)
         self.assertEqual(mux.source_slot, 1)
         self.assertEqual(mux.segment(1), b"CDN-1-100")
@@ -138,7 +138,7 @@ class MultiCdnTests(unittest.TestCase):
         self.assertEqual(mux.source_slot, 2)
         self.assertEqual(mux.switches, 1)
         self.assertIn("#EXT-X-DISCONTINUITY\n", swapped)
-        self.assertIn("/safe-token/segment/4.ts", swapped)
+        self.assertIn(f"/safe-token/segment/{mux.generation}.4.ts", swapped)
         self.assertEqual(mux.segment(1), b"CDN-1-100")
         self.assertEqual(mux.segment(4), b"CDN-2-100")
         self.assertEqual(mux.segment(6), b"CDN-2-102")

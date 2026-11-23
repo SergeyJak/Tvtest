@@ -8,10 +8,21 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from iptv_profiles import ProfileStore
 from iptv_cdn_failover import FailoverMux, SESSION_IDLE_SECONDS
+
+
+@dataclass
+class Tuning:
+    mux: FailoverMux
+    sources: dict = field(default_factory=dict)  # slot -> (manager, worker)
+
+    def candidates(self):
+        return [(slot, worker) for slot, (_, worker) in self.sources.items()
+                if not worker.gateway.stop.is_set()]
 
 
 class ProfileRegistry:
@@ -27,6 +38,8 @@ class ProfileRegistry:
         self.managers = {}  # slot -> (revision, manager)
         self.routes = {}
         self.failovers = {}  # (home cabin, channel ID) => isolated virtual HLS timeline
+        self.tunings: dict[int, Tuning] = {}
+        self.next_sequences = {}  # Resume numbering after the video cache expires.
         self.closed = False
         self.legacy_detached = False
         self._reload()
@@ -75,7 +88,7 @@ class ProfileRegistry:
                     # A scheduled refresh may rotate URLs without changing
                     # channel IDs. New workers use the updated catalog.
                     with manager.lock:
-                        manager.channels = {channel.id: channel for channel in channels}
+                        manager.set_channels(channels)
                 else:
                     opts = dict(self.options)
                     # Keep original primary capacity after switching its M3U
@@ -92,6 +105,7 @@ class ProfileRegistry:
                     thread.start()
                     if cached:
                         cached[1].close()
+                    self._end_tuning(slot)
                 guide = self.store.guide_path(row)
                 if not self.store.guide_source(row):
                     guide = None
@@ -115,33 +129,49 @@ class ProfileRegistry:
         return " ".join(name.casefold().split())
 
     @classmethod
-    def _matching_channel_id(cls, channels: dict, wanted) -> str | None:
-        """Match the exact channel, never a similar-but-different programme.
-
-        Exact stable IDs handle duplicate channel names and M3U catalogue
-        ordering. If IDs differ across CDN playlists, use a *unique* channel
-        name; reject ambiguous duplicates rather than playing wrong content.
-        """
-        same_id = channels.get(wanted.id)
-        if same_id is not None:
-            if cls._canonical_name(same_id.name) == cls._canonical_name(wanted.name):
-                return wanted.id
-            return None
+    def _matching_channel_id(cls, owner, backup, wanted) -> str | None:
+        """An ordinal in one provider's playlist cannot identify a duplicate in another."""
         name = cls._canonical_name(wanted.name)
-        matches = [channel for channel in channels.values()
-                   if cls._canonical_name(channel.name) == name]
-        if len(matches) != 1:
-            return None
-        candidate = matches[0]
-        if (wanted.group and candidate.group and
-                cls._canonical_name(wanted.group) != cls._canonical_name(candidate.group)):
-            return None
-        return candidate.id
+        home = owner.channels_by_name[name]
+        matches = backup.channels_by_name.get(name, [])
+        group = cls._canonical_name(wanted.group)
+        if len(home) == len(matches) == 1:
+            other = cls._canonical_name(matches[0].group)
+            return matches[0].id if not group or not other or group == other else None
+        if group:
+            home = [c for c in home if cls._canonical_name(c.group) == group]
+            matches = [c for c in matches if cls._canonical_name(c.group) == group]
+            if len(home) == len(matches) == 1:
+                return matches[0].id
+        return None
+
+    def _release_unused(self, reserves):
+        for manager, worker in reserves:
+            if any((manager, worker) in tuning.sources.values() for tuning in self.tunings.values()):
+                continue
+            with manager.lock:
+                cid = worker.channel.id
+                if (manager.active.get(cid) is worker and worker.standby
+                        and not worker.pinned and not worker.pending_requests):
+                    worker.close()
+                    del manager.active[cid]
+
+    def _end_tuning(self, home):
+        previous = self.tunings.pop(home, None)
+        if previous:
+            self._release_unused(previous.sources.values())
+            # Keep already issued segment bytes until expiry, without pinning the upstream cache.
+            with previous.mux.lock:
+                previous.mux.source_stream = None
 
     def _prune_failovers(self, now: float):
         """Release old channel buffers after its TV session ends."""
+        for home, tuning in list(self.tunings.items()):
+            if now - tuning.mux.last_request >= SESSION_IDLE_SECONDS:
+                self._end_tuning(home)
         for key, mux in list(self.failovers.items()):
             if now - mux.last_request > 70:
+                self.next_sequences[key] = mux.next_sequence
                 del self.failovers[key]
 
     def failover_for(self, token: str, cid: str):
@@ -151,38 +181,53 @@ class ProfileRegistry:
         they never evict an active viewer of a different channel. A channel
         missing in a backup stays playable from its owner's own source.
         """
-        if self.closed or (self.store.directory / "multicdn.disabled").exists():
-            return None
         with self.lock:
+            if self.closed or (self.store.directory / "multicdn.disabled").exists():
+                for slot in list(self.tunings):
+                    self._end_tuning(slot)
+                return None
             home = self._slot_for_token(token)
             owner = self.routes.get(token)
             if home is None or owner is None or cid not in owner[0].channels:
                 return None
             wanted = owner[0].channels[cid]
             self._prune_failovers(time.monotonic())
-            candidates = []
-            for slot in (home, *(other for other in (1, 2, 3) if other != home)):
-                profile = self.store.get(slot)
+            worker = owner[0].start(cid)
+            if worker is None:
+                return None, []
+            key = (home, cid)
+            tuning = self.tunings.get(home)
+            if tuning is None or tuning.mux.channel_id != cid:
+                self._end_tuning(home)
+                mux = self.failovers.get(key)
+                if mux is None:
+                    mux = FailoverMux(home_slot=home, channel_id=cid, channel_name=wanted.name,
+                                      first_sequence=self.next_sequences.pop(key, 1))
+                    self.failovers[key] = mux
+                else:
+                    mux.restart_session(time.monotonic())
+                tuning = self.tunings[home] = Tuning(mux)
+            sources = {home: (owner[0], worker)}
+            for profile in self.store.all():
+                slot = profile["slot"]
+                if slot == home:
+                    continue
                 route = self.routes.get(profile["token"])
                 if not route:
                     continue
                 manager = route[0]
-                matching_id = (cid if slot == home else
-                               self._matching_channel_id(manager.channels, wanted))
+                matching_id = self._matching_channel_id(owner[0], manager, wanted)
                 if matching_id is None:
                     continue
-                worker = manager.start(matching_id, standby=(slot != home))
+                worker = manager.start(matching_id, standby=True)
                 if worker is not None:
-                    candidates.append((slot, worker))
-            # Every channel in each TV cabin starts with virtual numbering,
-            # even when both backups are missing or busy.
-            mux = self.failovers.setdefault(
-                (home, cid), FailoverMux(home_slot=home,
-                                         channel_id=cid, channel_name=wanted.name))
-            return mux, candidates
+                    sources[slot] = (manager, worker)
+            dropped = set(tuning.sources.values()) - set(sources.values())
+            tuning.sources = sources
+            self._release_unused(dropped)
+            return tuning.mux, tuning.candidates()
 
-    def publish_failover(self, mux: FailoverMux, token: str,
-                         candidates: list[tuple[int, object]]) -> bytes | None:
+    def publish_failover(self, mux: FailoverMux, token: str) -> bytes | None:
         """Serialize CDN placement decisions across users for stable capacity.
 
         The usage snapshot never counts inactive TV sessions. A healthy
@@ -191,22 +236,27 @@ class ProfileRegistry:
         """
         with self.lock:
             now = time.monotonic()
+            current = self.tunings.get(mux.home_slot)
+            if current is None or current.mux is not mux:
+                return None  # An earlier manifest request finished warming after a retune.
             usage: dict[int, int] = {}
-            for other in self.failovers.values():
+            for tuning in self.tunings.values():
+                other = tuning.mux
                 if other is mux:
                     continue
                 with other.lock:
                     slot = other.source_slot
-                    live = now - other.last_request < 45.0 and other.history
+                    live = now - other.last_request < SESSION_IDLE_SECONDS and other.history
                 if slot is not None and live and slot != other.home_slot:
                     usage[slot] = usage.get(slot, 0) + 1
-            return mux.playlist(token, candidates, now=now, usage=usage)
+            return mux.playlist(token, current.candidates(), now=now, usage=usage)
 
     def existing_failover(self, token: str, cid: str):
         """Return only the calling TV's private virtual HLS timeline."""
         if (self.store.directory / "multicdn.disabled").exists():
             return None
         with self.lock:
+            self._prune_failovers(time.monotonic())
             slot = self._slot_for_token(token)
             return self.failovers.get((slot, cid)) if slot is not None else None
 
@@ -222,6 +272,8 @@ class ProfileRegistry:
                 if owner_slot != home:
                     continue
                 status = mux.status()
+                tuning = self.tunings.get(home)
+                status["tuned"] = tuning is not None and tuning.mux is mux
                 status["home_name"] = names.get(home, "Кабинет")
                 # The bearer TV token must not reveal other family members'
                 # cabinet names. Authenticated admin enriches names locally.
@@ -255,8 +307,9 @@ class ProfileRegistry:
                 profile = self.store.get(slot)
                 route = self.routes.get(profile["token"])
                 manager = route[0] if route else None
-                match = (self._matching_channel_id(manager.channels, wanted)
-                         if manager and wanted else None)
+                match = None
+                if manager and wanted:
+                    match = wanted.id if slot == home else self._matching_channel_id(owner[0], manager, wanted)
                 cabin = {
                     "slot": slot,
                     "name": profile["name"] if slot == home else f"Кабинет {slot}",
@@ -284,6 +337,8 @@ class ProfileRegistry:
     def close(self):
         with self.lock:
             self.closed = True
+            for home in list(self.tunings):
+                self._end_tuning(home)
             for _, manager in self.managers.values():
                 manager.close()
             self.managers.clear()

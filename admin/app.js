@@ -146,9 +146,13 @@
       });
     }
   }
+  function isLiveCdn(report) {
+    return !!report && report.tuned !== false &&
+      (report.seconds_since_last_probe == null || report.seconds_since_last_probe < 35);
+  }
   function renderMultiCdn(rows) {
     const card = $("cdn-pilot-panel");
-    const pilots = Array.isArray(rows) ? rows : [];
+    const pilots = Array.isArray(rows) ? rows.filter(isLiveCdn) : [];
     card.hidden = pilots.length === 0;
     if (!pilots.length) return;
     const current = [...pilots].sort((a,b) =>
@@ -177,7 +181,6 @@
     target.replaceChildren();
     const diag = (data.multi_cdn_diagnostics_by_cabin || {})[String(home)] ||
       (home === 1 ? data.multi_cdn_diagnostics : null);
-    const live = !!active;
     const tvStreams = Array.isArray(data.streams) ? data.streams : [];
     let message = "";
     let detail = "";
@@ -198,7 +201,10 @@
       message = "Каталог выбранного кабинета пуст.";
       detail = "Проверь M3U-ссылку и обновление списка каналов в этом кабинете.";
       state = "warn";
-    } else if (!live) {
+    } else if (active && !isLiveCdn(active)) {
+      message = "Просмотр этого канала завершён.";
+      detail = "Ниже показаны данные последнего просмотра.";
+    } else if (!active) {
       const own = tvStreams.find(stream => Number(stream.profile_slot) === home && !stream.standby);
       if (own) {
         message = "Есть активная трансляция, но её Multi-CDN ещё не активирован.";
@@ -237,8 +243,7 @@
 
   function renderCdnMonitor(data) {
     const rows = Array.isArray(data.multi_cdn) ? data.multi_cdn : [];
-    const available = rows.find(item =>
-      item.seconds_since_last_probe == null || item.seconds_since_last_probe < 35);
+    const available = rows.find(isLiveCdn);
     if (![1, 2, 3].includes(state.cdnHome)) {
       state.cdnHome = available ? Number(available.home_cabinet) : 1;
     }
@@ -253,8 +258,7 @@
       button.type = "button";
       button.dataset.slot = String(slot);
       button.setAttribute("aria-pressed", String(state.cdnHome === slot));
-      const report = rows.find(item => Number(item.home_cabinet) === slot);
-      if (report && report.seconds_since_last_probe < 35) {
+      if (rows.some(item => Number(item.home_cabinet) === slot && isLiveCdn(item))) {
         button.append(element("span", "cdn-cabin-online", " ●"));
       }
       switcher.append(button);
@@ -276,7 +280,7 @@
       picker.disabled = false;
       homeRows.forEach(item => {
         const option = element("option", "",
-          (item.seconds_since_last_probe < 35 ? "● " : "○ ") +
+          (isLiveCdn(item) ? "● " : "○ ") +
           (item.channel || "Без названия"));
         option.value = item.channel_id || "";
         picker.append(option);
@@ -285,14 +289,11 @@
     }
     text("cdn-channel-help", !active
       ? "Начни просмотр любого канала в этом кабинете."
-      : active.seconds_since_last_probe < 35
+      : isLiveCdn(active)
         ? "Сейчас смотрят: " + active.channel
         : "Последний просмотр: " + active.channel + " (неактивен)");
     renderCdnDiagnostics(data, active, state.cdnHome);
-    const streamLive = !!data.gateway_online && !!active
-      && (active.seconds_since_last_probe === null
-          || active.seconds_since_last_probe === undefined
-          || active.seconds_since_last_probe < 35);
+    const streamLive = !!data.gateway_online && isLiveCdn(active);
     const names = new Map((data.cabins || []).map(cabin =>
       [Number(cabin.slot), cabin.name || "Кабинет " + cabin.slot]));
     const sourceItems = active?.sources || [];

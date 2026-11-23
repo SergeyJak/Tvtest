@@ -7,6 +7,7 @@ upstream HLS sequence numbers, timestamps or provider URLs together.
 from __future__ import annotations
 
 import math
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -52,7 +53,7 @@ class FailoverMux:
     """
 
     def __init__(self, home_slot: int = 1, *, channel_id: str | None = None,
-                 channel_name: str = "VF Теория большого взрыва"):
+                 channel_name: str = "VF Теория большого взрыва", first_sequence: int = 1):
         if home_slot not in (1, 2, 3):
             raise ValueError("Unknown home cabin")
         self.home_slot = home_slot
@@ -62,7 +63,8 @@ class FailoverMux:
         self.source_slot = None
         self.source_stream = None
         self.home_progress = None
-        self.next_sequence = 1
+        self.generation = secrets.token_hex(12)
+        self.next_sequence = first_sequence
         self.history: list[VirtualSegment] = []
         self.discontinuity_sequence = 0
         self.target_duration = 1
@@ -155,16 +157,18 @@ class FailoverMux:
             if removed.discontinuity:
                 self.discontinuity_sequence += 1
 
-    def _retire_history(self):
+    def restart_session(self, now: float):
         """Start a new viewing session without reusing stale video or sequence IDs."""
-        self.discontinuity_sequence += sum(segment.discontinuity for segment in self.history)
-        self.history.clear()
-        self.source_slot = None
-        self.source_stream = None
-        self.home_progress = None
-        self.last_progress = 0.0
-        self.last_switch = 0.0
-        # next_sequence intentionally remains monotonic.
+        with self.lock:
+            self.discontinuity_sequence += sum(segment.discontinuity for segment in self.history)
+            self.history.clear()
+            self.source_slot = None
+            self.source_stream = None
+            self.home_progress = None
+            self.last_progress = 0.0
+            self.last_switch = 0.0
+            self.last_request = now
+            # Keep next_sequence and each worker's last published cursor.
 
     def _publish_from(self, slot, stream, now: float, *, reason: str = "START") -> bool:
         """Select a worker only when it contributes playable, unseen video."""
@@ -234,7 +238,7 @@ class FailoverMux:
             if (self.history and now >= self.last_request
                     and now - self.last_request >= SESSION_IDLE_SECONDS):
                 # A stopped TV must not be served segments from the old session.
-                self._retire_history()
+                self.restart_session(now)
             self.last_request = now
             self.slots_seen = sorted(sources)
             self.source_health = {slot: self._health(stream) for slot, stream in sources.items()}
@@ -278,7 +282,7 @@ class FailoverMux:
                 if entry.discontinuity:
                     output.append("#EXT-X-DISCONTINUITY")
                 output.append(f"#EXTINF:{entry.duration:.3f},")
-                output.append(f"/{token}/segment/{entry.number}.ts")
+                output.append(f"/{token}/segment/{self.generation}.{entry.number}.ts")
             return ("\n".join(output) + "\n").encode("utf-8")
 
     def segment(self, sequence: int) -> bytes | None:

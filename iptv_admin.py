@@ -61,34 +61,8 @@ def read_or_create_password(path: Path) -> str:
 
 
 def catalogue(playlist_file: Path) -> list[dict]:
-    """Read labels and M3U group-title while retaining the gateway's stable IDs.
-
-    The gateway currently ignores group-title when calculating IDs. Changing
-    that would break saved TV/EPG links, so the admin only uses it for display.
-    """
-    from urllib.parse import urlsplit
-
-    raw = playlist_file.read_text(encoding="utf-8-sig")
-    entries = channels_from_text(raw)
-    display_groups: list[str] = []
-    pending = False
-    group = ""
-    for source_line in raw.splitlines():
-        line = source_line.strip()
-        if line.startswith("#EXTINF:"):
-            pending = True
-            match = re.search(r'group-title\s*=\s*"([^"]*)"', line, flags=re.I)
-            group = match.group(1) if match else ""
-        elif line.startswith("#EXTGRP:") and pending:
-            group = line[len("#EXTGRP:"):].strip()
-        elif line and not line.startswith("#") and pending:
-            if urlsplit(line).scheme in ("http", "https"):
-                display_groups.append(group)
-            pending = False
-    return [
-        {"id": c.id, "name": c.name, "group": display_groups[index] or c.group}
-        for index, c in enumerate(entries)
-    ]
+    entries = channels_from_text(playlist_file.read_text(encoding="utf-8-sig"))
+    return [{"id": c.id, "name": c.name, "group": c.group} for c in entries]
 
 
 def scan_epg(path: Path) -> dict:
@@ -228,7 +202,9 @@ class AdminState:
                 continue
             try:
                 url = f"http://127.0.0.1:{self.gateway_port}/{token}/status"
-                with urllib.request.urlopen(url, timeout=1.5) as response:
+                request = urllib.request.Request(url)
+                request.add_unredirected_header("Authorization", "Bearer " + self.profiles.monitor_token)
+                with urllib.request.urlopen(request, timeout=1.5) as response:
                     if response.status != 200:
                         continue
                     item = json.loads(response.read(2 * 1024 * 1024))
@@ -290,7 +266,8 @@ class AdminState:
         for report in multi_cdn:
             slot = report.get("selected_cabinet")
             age = report.get("seconds_since_last_probe")
-            if slot in (1, 2, 3) and isinstance(age, (int, float)) and 0 <= age < 35:
+            if (report.get("tuned", True) and slot in (1, 2, 3)
+                    and isinstance(age, (int, float)) and 0 <= age < 35):
                 viewer_load[str(slot)] += 1
         for report in multi_cdn:
             report["source_viewer_load"] = dict(viewer_load)

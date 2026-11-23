@@ -178,7 +178,7 @@ class AdminTests(unittest.TestCase):
             status = 200
 
         def mocked_open(url, timeout):
-            token = url.split("/")[3]
+            token = url.full_url.split("/")[3]
             self.assertEqual(timeout, 1.5)
             self.assertIn(token, token_status)
             return Response(json.dumps(token_status[token]).encode())
@@ -228,7 +228,7 @@ class AdminTests(unittest.TestCase):
             status = 200
 
         def fake_open(url, timeout):
-            token = url.split("/")[3]
+            token = url.full_url.split("/")[3]
             slot = next(slot for slot, own in tokens.items() if own == token)
             return Response(json.dumps(fake_status(slot)).encode())
 

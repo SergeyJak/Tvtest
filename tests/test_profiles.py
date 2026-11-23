@@ -215,7 +215,7 @@ class ThreeCabinetTests(unittest.TestCase):
         with self.request(token, f"channel/{cid}/index.m3u8") as response:
             baseline = response.read().decode()
         self.assertIn("MEDIA-SEQUENCE:1", baseline)
-        with self.request(token, f"channel/{cid}/segment/1.ts") as response:
+        with self.request(token, f"channel/{cid}/segment/{mux.generation}.1.ts") as response:
             self.assertEqual(response.read(), b"PRIMARY-100")
         # The other account is configured while the TV continues watching.
         with patch("iptv_profiles.download_playlist", return_value=playlist):
@@ -226,8 +226,8 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertEqual(len(expanded), 2)
         with self.request(token, f"channel/{cid}/index.m3u8") as response:
             later = response.read().decode()
-        self.assertIn(f"/{token}/channel/{cid}/segment/1.ts", later)
-        with self.request(token, f"channel/{cid}/segment/1.ts") as response:
+        self.assertIn(f"/{token}/channel/{cid}/segment/{mux.generation}.1.ts", later)
+        with self.request(token, f"channel/{cid}/segment/{mux.generation}.1.ts") as response:
             self.assertEqual(response.read(), b"PRIMARY-100")
 
     def test_rename_is_instant_and_does_not_restart_workers(self):
@@ -445,8 +445,8 @@ class ThreeCabinetTests(unittest.TestCase):
         for slot in (1, 2, 3):
             with self.request(tokens[slot], f"channel/{ids[slot]}/index.m3u8") as response:
                 playlist = response.read().decode()
-            self.assertIn(f"/{tokens[slot]}/channel/{ids[slot]}/segment/1.ts", playlist)
-            with self.request(tokens[slot], f"channel/{ids[slot]}/segment/1.ts") as response:
+            self.assertIn(f"/{tokens[slot]}/channel/{ids[slot]}/segment/{muxes[slot].generation}.1.ts", playlist)
+            with self.request(tokens[slot], f"channel/{ids[slot]}/segment/{muxes[slot].generation}.1.ts") as response:
                 self.assertEqual(response.read(), f"CDN_{slot}_100".encode())
             self.assertEqual(muxes[slot].source_slot, slot)
             with self.request(tokens[slot], "status") as response:
@@ -495,8 +495,8 @@ class ThreeCabinetTests(unittest.TestCase):
         with self.request(token, f"channel/{cid}/index.m3u8") as response:
             manifest = response.read().decode()
         self.assertIn("#EXT-X-MEDIA-SEQUENCE:1", manifest)
-        self.assertIn(f"/{token}/channel/{cid}/segment/1.ts", manifest)
-        with self.request(token, f"channel/{cid}/segment/1.ts") as response:
+        self.assertIn(f"/{token}/channel/{cid}/segment/{mux.generation}.1.ts", manifest)
+        with self.request(token, f"channel/{cid}/segment/{mux.generation}.1.ts") as response:
             self.assertEqual(response.read(), b"CHANNEL_B_100")
         with self.request(token, "status") as response:
             report = json.load(response)["multi_cdn"][0]
@@ -540,24 +540,15 @@ class ThreeCabinetTests(unittest.TestCase):
         by_name = {channel.name: channel.id for channel in manager.channels.values()}
 
         # All channels, not just VF, receive a private virtual HLS timeline.
-        for name in ("Первый канал UHD", "Кинокомедия HD", "Channel Not Shared"):
+        for name, slots in (("Первый канал UHD", [1, 2, 3]), ("Кинокомедия HD", [1, 2]),
+                            ("Channel Not Shared", [1])):
             cid = by_name[name]
             mux, candidate_streams = self.registry.failover_for(token, cid)
             self.assertEqual(mux.channel_name, name)
             self.assertEqual(mux.channel_id, cid)
             self.assertEqual(mux.home_slot, 1)
-            self.assertIn(1, [slot for slot, _ in candidate_streams])
-        self.assertEqual(
-            self.registry._matching_channel_id(
-                self.registry.resolve(self.store.get(2)["token"])[0].channels,
-                manager.channels[by_name["Кинокомедия HD"]]),
-            by_name["Кинокомедия HD"])
-        self.assertIsNone(self.registry._matching_channel_id(
-            self.registry.resolve(self.store.get(3)["token"])[0].channels,
-            manager.channels[by_name["Кинокомедия HD"]]))
-        self.assertIsNone(self.registry._matching_channel_id(
-            self.registry.resolve(self.store.get(2)["token"])[0].channels,
-            manager.channels[by_name["Channel Not Shared"]]))
+            self.assertEqual([slot for slot, _ in candidate_streams], slots)
+            self.assertTrue(all(worker.channel.name == name for _, worker in candidate_streams))
         # No upstream URL leaves the status interface.
         with self.request(token, "status") as response:
             data = json.load(response)
@@ -576,10 +567,189 @@ class ThreeCabinetTests(unittest.TestCase):
             ("Кино", "Other", "https://example.org/3"),
             ("Кино", "Other", "https://example.org/4"),
         ])
-        mapping = {channel.id: channel for channel in ambiguous}
-        self.assertIsNone(self.registry._matching_channel_id(mapping, target))
-        same = {channel.id: channel for channel in source}
-        self.assertEqual(self.registry._matching_channel_id(same, target), target.id)
+        owner = MultiGateway(source, self.legacy)
+        backup = MultiGateway(ambiguous, self.legacy)
+        self.assertIsNone(self.registry._matching_channel_id(owner, backup, target))
+        self.assertEqual(self.registry._matching_channel_id(owner, owner, target), target.id)
+
+    def configure_backup(self, slot, playlist=PLAYLIST):
+        with patch("iptv_profiles.download_playlist", return_value=playlist):
+            row, _ = self.store.update(slot, f"TV {slot}", f"https://provider.example/{slot}")
+        self.registry.resolve(row["token"])
+        return row["token"]
+
+    @staticmethod
+    def fill_cache(worker, prefix):
+        gw = worker.gateway
+        with gw.lock:
+            gw.cache.clear()
+            for seq in range(6):
+                gw.cache[seq] = (6.0, f"{prefix}-{seq}".encode())
+            gw.latest = 5
+            gw.delay = gw.startup_reserve = 0
+            gw.last_progress = gw.last_segment_download = time.time()
+            gw._fast_start_at = 0
+
+    def test_retune_releases_both_unused_standbys_immediately(self):
+        for slot in (2, 3):
+            self.configure_backup(slot)
+        token = self.store.get(1)["token"]
+        first, second = self.base_manager.order
+        _, old = self.registry.failover_for(token, first)
+        _, new = self.registry.failover_for(token, second)
+        self.assertEqual([slot for slot, _ in new], [1, 2, 3])
+        self.assertTrue(all(worker.gateway.stop.is_set() for _, worker in old[1:]))
+
+    def test_retune_keeps_shared_standby_and_other_home_viewer(self):
+        second_token = self.configure_backup(2)
+        self.configure_backup(3)
+        token = self.store.get(1)["token"]
+        first, second = self.base_manager.order
+        _, old = self.registry.failover_for(token, first)
+        _, shared = self.registry.failover_for(second_token, first)
+        self.assertIs(dict(old)[3], dict(shared)[3])
+        _, new = self.registry.failover_for(token, second)
+        self.assertEqual([slot for slot, _ in new], [1])
+        self.assertFalse(dict(shared)[2].gateway.stop.is_set())
+        self.assertFalse(dict(shared)[3].gateway.stop.is_set())
+        _, following = self.registry.failover_for(second_token, second)
+        self.assertIn(3, dict(following))
+        self.assertTrue(dict(shared)[3].gateway.stop.is_set())
+
+    def test_retune_frees_guest_place_for_another_viewer(self):
+        second_token = self.configure_backup(2)
+        third_token = self.configure_backup(3)
+        first, second = self.base_manager.order
+        primary = self.store.get(1)["token"]
+        third = self.registry.resolve(third_token)[0]
+        self.fill_cache(third.start(first), "third")
+        route = f"channel/{first}/index.m3u8"
+        with self.request(primary, route) as response:
+            self.assertEqual(response.status, 200)
+        self.assertEqual(self.registry.existing_failover(primary, first).source_slot, 3)
+        self.registry.failover_for(primary, second)
+        with self.request(second_token, route) as response:
+            self.assertEqual(response.status, 200)
+        self.assertEqual(self.registry.existing_failover(second_token, first).source_slot, 3)
+        report = self.admin_state().gateway_status()["multi_cdn"]
+        self.assertEqual(report[0]["source_viewer_load"]["3"], 1)
+
+    def test_expired_segment_url_cannot_read_native_or_reopened_timeline(self):
+        token = self.store.get(1)["token"]
+        cid = self.base_manager.order[0]
+        worker = self.base_manager.start(cid)
+        self.fill_cache(worker, "old")
+        route = f"channel/{cid}/index.m3u8"
+
+        def first_segment():
+            with self.request(token, route) as response:
+                return next(line for line in response.read().decode().splitlines()
+                            if line.startswith("/"))
+
+        def assert_expired(url):
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                urllib.request.urlopen(self.base + url)
+            self.assertEqual(error.exception.code, 404)
+            error.exception.close()
+
+        old_url = first_segment()
+        with urllib.request.urlopen(self.base + old_url) as response:
+            self.assertEqual(response.read(), b"old-3")
+        self.registry.existing_failover(token, cid).last_request -= 100
+        with self.request(token, "status"):
+            pass
+        assert_expired(old_url)
+        self.fill_cache(worker, "new")
+        new_url = first_segment()
+        self.assertNotEqual(new_url, old_url)
+        assert_expired(old_url)
+        with urllib.request.urlopen(self.base + new_url) as response:
+            self.assertEqual(response.read(), b"new-3")
+        (self.store.directory / "multicdn.disabled").touch()
+        assert_expired(new_url)
+        raw_url = first_segment()
+        with urllib.request.urlopen(self.base + raw_url) as response:
+            self.assertTrue(response.read().startswith(b"new-"))
+
+    def test_idle_tuning_cannot_republish_same_worker_window(self):
+        token = self.store.get(1)["token"]
+        cid = self.base_manager.order[0]
+        worker = self.base_manager.start(cid)
+        self.fill_cache(worker, "old")
+        route = f"channel/{cid}/index.m3u8"
+        with self.request(token, route) as response:
+            self.assertEqual(response.status, 200)
+        self.registry.existing_failover(token, cid).last_request -= 50
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.request(token, route)
+        self.assertEqual(error.exception.code, 503)
+        error.exception.close()
+
+    def test_inline_regions_match_across_reordered_catalogues_and_keep_public_ids(self):
+        from iptv_multi import channels_from_entries
+        def regional_playlist(regions):
+            return "#EXTM3U\n" + "".join(
+                f'#EXTINF:-1 group-title="{region}",News\nhttps://provider.example/{region}\n'
+                for region in regions)
+        home = self.configure_backup(1, regional_playlist(["East", "West"]))
+        self.configure_backup(2, regional_playlist(["West", "East"]))
+        manager = self.registry.resolve(home)[0]
+        legacy_ids = [c.id for c in channels_from_entries([
+            ("News", "", "https://provider.example/East"),
+            ("News", "", "https://provider.example/West")])]
+        self.assertEqual(manager.order, legacy_ids)
+        for cid, region in zip(legacy_ids, ("East", "West")):
+            _, sources = self.registry.failover_for(home, cid)
+            self.assertEqual(dict(sources)[2].channel.url, f"https://provider.example/{region}")
+            self.assertEqual(manager.channels[cid].group, region)
+
+    def test_duplicate_same_name_and_group_in_either_catalogue_skips_backup(self):
+        entry = '#EXTINF:-1 group-title="East",News\nhttps://provider.example/news\n'
+        for home_count, backup_count in ((2, 1), (1, 2), (2, 2)):
+            with self.subTest(home=home_count, backup=backup_count):
+                home = self.configure_backup(1, "#EXTM3U\n" + entry * home_count)
+                self.configure_backup(2, "#EXTM3U\n" + entry * backup_count)
+                manager = self.registry.resolve(home)[0]
+                for cid in manager.order:
+                    _, sources = self.registry.failover_for(home, cid)
+                    self.assertEqual([slot for slot, _ in sources], [1])
+                    self.assertEqual(sources[0][1].channel.id, cid)
+
+    def test_refresh_reordering_inline_regions_cannot_reuse_wrong_live_worker(self):
+        east = '#EXTINF:-1 group-title="East",News\nhttps://provider.example/east\n'
+        west = east.replace("East", "West").replace("east", "west")
+        original = "#EXTM3U\n" + east + west
+        home = self.configure_backup(1, original)
+        second = self.configure_backup(2, original)
+        manager = self.registry.resolve(second)[0]
+        manager.start(manager.order[0])
+        with patch("iptv_profile_jobs.download_playlist", return_value="#EXTM3U\n" + west + east):
+            generate_for_slot(self.store, 2, refresh_m3u=True, m3u_only=True)
+        owner = self.registry.resolve(home)[0]
+        _, sources = self.registry.failover_for(home, owner.order[1])
+        self.assertEqual(dict(sources)[2].channel.url, "https://provider.example/west")
+
+    def test_idle_tv_status_hides_standby_that_admin_can_inspect(self):
+        home = self.store.get(1)["token"]
+        idle = self.configure_backup(2)
+        cid = self.base_manager.order[0]
+        self.registry.failover_for(home, cid)
+        for headers in ({}, {"Authorization": f"Bearer {idle}"}):
+            req = urllib.request.Request(f"{self.base}/{idle}/status", headers=headers)
+            with urllib.request.urlopen(req) as response:
+                report = json.load(response)
+            self.assertEqual(report["streams"], [])
+            self.assertEqual(report["active_streams"], 0)
+            self.assertNotIn(cid, json.dumps(report))
+            self.assertNotIn("Channel A", json.dumps(report))
+        status = self.admin_state().gateway_status()
+        details = [row for row in status["streams"] if row["profile_slot"] == 2]
+        self.assertEqual([(row["id"], row["standby"]) for row in details], [(cid, True)])
+
+    def admin_state(self):
+        from iptv_admin import AdminState
+        return AdminState(self.legacy, self.legacy_epg, self.server.server_port,
+                          self.legacy_token, "admin-test-password", profiles_dir=self.store.directory)
 
     def test_old_channel_mux_is_reclaimed_to_limit_cache_growth(self):
         playlist = ("#EXTM3U\n"
@@ -634,10 +804,10 @@ class ThreeCabinetTests(unittest.TestCase):
                 gateway._fast_start_at = time.monotonic() - 2
         with self.request(owner_token, f"channel/{cid}/index.m3u8") as response:
             first_manifest = response.read().decode()
-        self.assertIn(f"/{owner_token}/channel/{cid}/segment/1.ts", first_manifest)
+        self.assertIn(f"/{owner_token}/channel/{cid}/segment/{mux.generation}.1.ts", first_manifest)
         self.assertNotIn("PRIVATE_1", first_manifest)
         self.assertNotIn("M3U_KEY_1", first_manifest)
-        with self.request(owner_token, f"channel/{cid}/segment/1.ts") as response:
+        with self.request(owner_token, f"channel/{cid}/segment/{mux.generation}.1.ts") as response:
             self.assertEqual(response.read(), b"VIDEO_CDN_1_100")
         self.assertEqual(mux.source_slot, 1)
         # Trigger a source stall and verify a stable virtual media sequence.
@@ -648,8 +818,8 @@ class ThreeCabinetTests(unittest.TestCase):
         with self.request(owner_token, f"channel/{cid}/index.m3u8") as response:
             next_manifest = response.read().decode()
         self.assertIn("#EXT-X-DISCONTINUITY", next_manifest)
-        self.assertIn(f"/{owner_token}/channel/{cid}/segment/4.ts", next_manifest)
-        with self.request(owner_token, f"channel/{cid}/segment/4.ts") as response:
+        self.assertIn(f"/{owner_token}/channel/{cid}/segment/{mux.generation}.4.ts", next_manifest)
+        with self.request(owner_token, f"channel/{cid}/segment/{mux.generation}.4.ts") as response:
             self.assertEqual(response.read(), b"VIDEO_CDN_2_100")
         self.assertEqual(mux.source_slot, 2)
         with self.request(owner_token, "status") as response:

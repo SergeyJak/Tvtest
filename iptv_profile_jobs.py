@@ -32,7 +32,8 @@ def generate_for_slot(store: ProfileStore, slot: int, *, refresh_m3u: bool = Fal
     source_path = store.snapshot_path(slot)
     if refresh_m3u:
         updated = download_playlist(row["source_url"])
-        ids = [channel.id for channel in channels_from_text(updated)]
+        channels = channels_from_text(updated)
+        ids = [channel.id for channel in channels]
         if not ids or len(ids) != len(set(ids)):
             raise ProfileError("Получен пустой или некорректный каталог")
         with store._locked():
@@ -40,8 +41,9 @@ def generate_for_slot(store: ProfileStore, slot: int, *, refresh_m3u: bool = Fal
             record = latest["profiles"][slot - 1]
             if record["revision"] != row["revision"]:
                 return "changed_while_refreshing"
-            current_ids = [c.id for c in channels_from_text(source_path.read_text(encoding="utf-8-sig"))]
-            if ids != current_ids:
+            current = channels_from_text(source_path.read_text(encoding="utf-8-sig"))
+            # Two regional variants can swap ordinals without changing the list of public IDs.
+            if [(c.id, c.group) for c in channels] != [(c.id, c.group) for c in current]:
                 record["revision"] += 1
                 # Keep the last good EPG until a newly generated guide
                 # is atomically installed. M3U-only refresh must never

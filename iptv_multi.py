@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import hashlib
+import hmac
 import http.client
 import os
 import stat
@@ -27,7 +28,6 @@ from pathlib import Path
 from iptv_gateway import (
     Gateway, load_or_create_token, private_playlist_text, safe_error,
 )
-from iptv_healthcheck import entries_from_m3u
 from iptv_telemetry import Telemetry
 
 
@@ -41,12 +41,17 @@ class Channel:
 
 def channels_from_entries(entries: list[tuple[str, str, str]]) -> list[Channel]:
     """Stable public IDs depend on channel identity, not a private URL."""
+    return _catalogue((name, group, group, url) for name, group, url in entries)
+
+
+def _catalogue(rows) -> list[Channel]:
     seen: dict[tuple[str, str], int] = {}
     channels = []
-    for name, group, url in entries:
+    for name, id_group, group, url in rows:
         if not name or urllib.parse.urlsplit(url).scheme not in ("http", "https"):
             continue
-        identity = (name.casefold(), group.casefold())
+        # Existing TV and EPG IDs include only the separate EXTGRP tag.
+        identity = (name.casefold(), id_group.casefold())
         ordinal = seen.get(identity, 0)
         seen[identity] = ordinal + 1
         marker = f"{identity[0]}\x00{identity[1]}\x00{ordinal}".encode("utf-8")
@@ -57,21 +62,25 @@ def channels_from_entries(entries: list[tuple[str, str, str]]) -> list[Channel]:
 
 def channels_from_text(text: str) -> list[Channel]:
     """Private playlist parsing without exposing its URLs to a TV."""
-    # Matches the small #EXTINF / #EXTGRP subset of entries_from_m3u.
     name = None
-    group = ""
     result = []
     for raw in text.splitlines():
         line = raw.strip()
         if line.startswith("#EXTINF:"):
-            name = line.rsplit(",", 1)[-1].strip()
+            meta, _, title = line.rpartition(",")
+            name = title.strip()
+            inline_group = ""
+            for attr in re.finditer(r'''\s+([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s,]+))''', meta):
+                if attr[1].casefold() == "group-title":
+                    inline_group = (attr[2] or attr[3] or attr[4] or "").strip()
+                    break
             group = ""
         elif line.startswith("#EXTGRP:"):
             group = line[len("#EXTGRP:"):].strip()
         elif line and not line.startswith("#") and name is not None:
-            result.append((name, group, line))
+            result.append((name, group, group or inline_group, line))
             name = None
-    return channels_from_entries(result)
+    return _catalogue(result)
 
 
 class ActiveStream:
@@ -113,8 +122,7 @@ class MultiGateway:
         self.telemetry = telemetry
         self.profile_slot = profile_slot
         self.prefer_owner_tuning = prefer_owner_tuning
-        self.channels = {c.id: c for c in channels}
-        self.order = [c.id for c in channels]
+        self.set_channels(channels)
         self.path = playlist_path
         self.private_url = private_url
         self.delay = delay
@@ -143,6 +151,14 @@ class MultiGateway:
         self.legacy_manifest_requests = 0
         self.legacy_segment_requests = 0
 
+    def set_channels(self, channels: list[Channel]):
+        self.channels = {c.id: c for c in channels}
+        self.order = list(self.channels)
+        self.channels_by_name = {}
+        for channel in channels:
+            name = " ".join(channel.name.casefold().split())
+            self.channels_by_name.setdefault(name, []).append(channel)
+
     def telemetry_channel_id(self, cid: str) -> str:
         # Keep existing profile-1 history stable. Distinguish otherwise
         # identical channels watched through separate subscription cabinets.
@@ -153,7 +169,7 @@ class MultiGateway:
             text = private_playlist_text(self.path, self.private_url, self.timeout)
             updated = next((c for c in channels_from_text(text)
                             if c.id == channel.id), None)
-            if updated is None:
+            if updated is None or updated.group != channel.group:
                 raise ValueError("missing_channel_after_refresh")
             return updated.url
 
@@ -246,10 +262,12 @@ class MultiGateway:
                 stream.close()
             self.active.clear()
 
-    def status(self) -> bytes:
+    def status(self, *, include_standby: bool = False) -> bytes:
         with self.lock:
             summaries = []
             for stream in self.active.values():
+                if stream.standby and not include_standby:
+                    continue
                 details = json.loads(stream.gateway.status())
                 summaries.append({
                     "id": stream.channel.id,
@@ -290,7 +308,7 @@ class MultiGateway:
                 "telemetry_enabled": self.telemetry is not None,
                 "telemetry_dropped": self.telemetry.dropped if self.telemetry else 0,
                 "channels": len(self.channels),
-                "active_streams": len(self.active),
+                "active_streams": len(summaries),
                 "max_streams": self.max_streams,
                 "delay_seconds": self.delay,
                 "startup_wait_seconds": self.startup_wait,
@@ -463,7 +481,10 @@ def make_multi_handler(manager: MultiGateway, token: str,
             if route == ["epg.xml.gz"] and active_epg_file is not None:
                 return self.serve_epg(head, active_epg_file)
             if route == ["status"]:
-                data = json.loads(request_manager.status())
+                credential = self.headers.get("Authorization", "")
+                include_standby = (profile_registry is not None and credential.isascii()
+                                   and hmac.compare_digest(credential, "Bearer " + profile_registry.store.monitor_token))
+                data = json.loads(request_manager.status(include_standby=include_standby))
                 if profile_registry is not None:
                     pilot = profile_registry.failover_status(active_token)
                     if pilot is not None:
@@ -509,7 +530,11 @@ def make_multi_handler(manager: MultiGateway, token: str,
                     return self.respond(200, None, "application/vnd.apple.mpegurl", head)
                 pilot = (profile_registry.failover_for(active_token, cid)
                          if profile_registry is not None else None)
-                stream = request_manager.start(cid)
+                if pilot is None:
+                    stream = request_manager.start(cid)
+                else:
+                    mux, candidates = pilot
+                    stream = dict(candidates).get(mux.home_slot) if mux else None
                 if stream is None:
                     self.track_client_failure(cid, "STREAM_LIMIT", 503)
                     return self.respond(503, b"Too many active streams",
@@ -521,7 +546,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 with request_manager.lock:
                     stream.pending_requests += 1
                 try:
-                    raw = (profile_registry.publish_failover(pilot[0], active_token, pilot[1])
+                    raw = (profile_registry.publish_failover(pilot[0], active_token)
                            if pilot else stream.gateway.playlist(active_token))
                     waited = False
                     deadline = time.monotonic() + request_manager.startup_wait
@@ -532,7 +557,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                         waited = True
                         if stream.gateway.stop.wait(min(0.25, remaining)):
                             break
-                        raw = (profile_registry.publish_failover(pilot[0], active_token, pilot[1])
+                        raw = (profile_registry.publish_failover(pilot[0], active_token)
                                if pilot else stream.gateway.playlist(active_token))
                     with request_manager.lock:
                         if waited:
@@ -555,23 +580,32 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 # Inject this channel's stable ID without touching source URLs.
                 before = f"/{active_token}/segment/".encode()
                 after = f"/{active_token}/channel/{cid}/segment/".encode()
+                if profile_registry is not None and pilot is None:
+                    after += b"native."
                 stream.gateway.record_client("manifest", 200)
                 return self.respond(200, raw.replace(before, after),
                                     "application/vnd.apple.mpegurl", head)
             if len(route) == 4 and resource == "segment" and route[3].endswith(".ts"):
-                try:
-                    seq = int(route[3][:-3])
-                except ValueError:
+                match = re.fullmatch(r"(?:(native|[a-f0-9]{24})\.)?([0-9]{1,20})\.ts", route[3])
+                if match is None:
                     return self.respond(404, b"Invalid segment", "text/plain", head)
+                generation, seq = match[1], int(match[2])
+                # Older virtual and native manifests both used bare numbers.
+                # Only the original prewarm alias is unambiguously native.
+                if generation is None and profile_registry is not None and path.startswith(prefix + "/channel/"):
+                    return self.respond(404, b"Segment expired", "text/plain", head)
+                mux = None
+                if generation not in (None, "native"):
+                    mux = profile_registry.existing_failover(active_token, cid) if profile_registry else None
+                    if mux is None or mux.generation != generation:
+                        return self.respond(404, b"Segment expired", "text/plain", head)
                 # An expired stream is not restarted on a stale segment URL.
                 stream = request_manager.active_stream(cid)
                 if stream is None:
                     self.track_client_failure(cid, "STREAM_EXPIRED", 404)
                     return self.respond(404, b"Stream expired", "text/plain", head)
-                pilot_mux = (profile_registry.existing_failover(active_token, cid)
-                             if profile_registry is not None else None)
-                if pilot_mux is not None:
-                    data = pilot_mux.segment(seq)
+                if mux is not None:
+                    data = mux.segment(seq)
                 else:
                     data = stream.gateway.segment(seq, record_miss=True)
                 if data is None:
@@ -675,7 +709,7 @@ def main(argv=None):
             print(f"Remote playlist unavailable ({safe_error(exc)}); using local M3U.")
     if not channels:
         try:
-            channels = channels_from_entries(entries_from_m3u(args.playlist))
+            channels = channels_from_text(args.playlist.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             p.error("Could not read local M3U playlist")
     if args.filter:
