@@ -15,6 +15,8 @@ PILOT_NAME = "vf теория большого взрыва"
 WINDOW_SEGMENTS = 12
 MAX_VIRTUAL_BYTES = 64 * 1024 * 1024
 SWITCH_COOLDOWN = 18.0
+PUBLISH_STALL_SECONDS = 18.0
+SESSION_IDLE_SECONDS = 45.0
 
 
 def is_pilot(name: str) -> bool:
@@ -73,15 +75,15 @@ class FailoverMux:
             "slow_segments": data.get("slow_segments"),
         }
 
-    def _candidate(self, streams: dict[int, object], now: float):
+    def _candidate(self, streams: dict[int, object], *, exclude: int | None = None):
         eligible = [slot for slot, info in self.source_health.items()
-                    if info["fresh"] and slot in streams]
+                    if info["fresh"] and slot in streams and slot != exclude]
         if not eligible:
             return None
         if self.source_slot in eligible and self.source_stream is streams[self.source_slot]:
             return self.source_slot
         if self.source_slot is None and 1 in eligible:
-            return 1  # Keep the original cabinet the preferred source.
+            return 1  # Prefer the viewer's own account for a fresh session.
         return max(eligible, key=lambda slot: (
             self.source_health[slot]["buffer_seconds"] or 0,
             -(self.source_health[slot]["age_seconds"] or 0),
@@ -99,12 +101,57 @@ class FailoverMux:
             if removed.discontinuity:
                 self.discontinuity_sequence += 1
 
+    def _retire_history(self):
+        """Start a new viewing session without reusing stale video or sequence IDs."""
+        self.discontinuity_sequence += sum(segment.discontinuity for segment in self.history)
+        self.history.clear()
+        self.source_slot = None
+        self.source_stream = None
+        self.last_upstream_seq = None
+        self.last_progress = 0.0
+        self.last_switch = 0.0
+        # next_sequence intentionally remains monotonic.
+
+    def _publish_from(self, stream, now: float) -> bool:
+        """Copy newly offered video from the selected Gateway into our timeline."""
+        records = stream.gateway.published()
+        records = [(seq, duration, stream.gateway.segment(seq))
+                   for seq, duration in records]
+        records = [(seq, duration, data) for seq, duration, data in records if data]
+        if not records:
+            return False
+        if self.last_upstream_seq is None:
+            selected_records = records[-min(3, len(records)):]
+            discontinuity = bool(self.history)
+        elif records[-1][0] < self.last_upstream_seq - 3:
+            # Same upstream restarted its media-sequence numbering.
+            selected_records = records[-min(3, len(records)):]
+            discontinuity = True
+        else:
+            selected_records = [row for row in records if row[0] > self.last_upstream_seq]
+            discontinuity = bool(
+                selected_records and selected_records[0][0] > self.last_upstream_seq + 1)
+        for index, (seq, duration, data) in enumerate(selected_records):
+            self._append(seq, duration, data,
+                         discontinuity=discontinuity and index == 0)
+            self.last_upstream_seq = seq
+            self.last_progress = now
+        return bool(selected_records)
+
     def playlist(self, token: str, candidates: list[tuple[int, object]], *, now: float | None = None):
-        """Return the virtual playlist or None while every source warms/stalls."""
-        import json
+        """Emit one stable HLS timeline, failing over on *published* video stalls.
+
+        A CDN can continue downloading while the TV-facing HLS playlist is
+        frozen on a gap. Check progress after trying the current source, not
+        just the age of its last downloaded segment.
+        """
         now = time.monotonic() if now is None else now
         sources = {slot: stream for slot, stream in candidates}
         with self.lock:
+            if (self.history and now >= self.last_request
+                    and now - self.last_request >= SESSION_IDLE_SECONDS):
+                # A stopped TV must not be served segments from the old session.
+                self._retire_history()
             self.last_request = now
             self.slots_seen = sorted(sources)
             self.source_health = {slot: self._health(stream) for slot, stream in sources.items()}
@@ -113,55 +160,30 @@ class FailoverMux:
             if current is not self.source_stream:
                 current = None
 
-            selected_healthy = (current is not None
-                                and self.source_health.get(selected, {}).get("fresh"))
-            can_switch = now - self.last_switch >= SWITCH_COOLDOWN
-            if not selected_healthy and can_switch:
-                alternate = self._candidate(sources, now)
+            if current is not None and self.source_health.get(selected, {}).get("fresh"):
+                self._publish_from(current, now)
+
+            stalled = bool(self.history and self.last_progress
+                           and now - self.last_progress >= PUBLISH_STALL_SECONDS)
+            healthy = (current is not None
+                       and self.source_health.get(selected, {}).get("fresh")
+                       and not stalled)
+            can_switch = (selected is None or now - self.last_switch >= SWITCH_COOLDOWN)
+            if not healthy and can_switch:
+                # Never reselect a source merely because it downloads segments
+                # if its published TV playlist stopped advancing.
+                alternate = self._candidate(sources, exclude=selected if stalled else None)
                 if alternate is not None and (alternate != selected or current is None):
-                    selected = alternate
-                    current = sources[alternate]
-                    self.source_slot = selected
-                    self.source_stream = current
+                    self.source_slot = alternate
+                    self.source_stream = sources[alternate]
                     self.last_upstream_seq = None
                     self.last_switch = now
                     self.switches += bool(self.history)
-            if current is not None:
-                # Using commit=True only on the currently selected worker,
-                # never on standbys or other cabinets' playback cursors.
-                records = current.gateway.published()
-                records = [(seq, duration, current.gateway.segment(seq))
-                           for seq, duration in records]
-                records = [(seq, duration, data) for seq, duration, data in records if data]
-                if records:
-                    if self.last_upstream_seq is None:
-                        # New decoder epoch: start near the live edge, and mark
-                        # a discontinuity after the previous CDN's video.
-                        selected_records = records[-min(3, len(records)):]
-                        discontinuity = bool(self.history)
-                    else:
-                        if records[-1][0] < self.last_upstream_seq - 3:
-                            # Provider reset the HLS media sequence on the
-                            # same CDN. Begin a fresh decoder epoch rather
-                            # than freezing until its counter catches up.
-                            selected_records = records[-min(3, len(records)):]
-                            discontinuity = True
-                        else:
-                            selected_records = [row for row in records
-                                                if row[0] > self.last_upstream_seq]
-                            discontinuity = bool(
-                                selected_records
-                                and selected_records[0][0] > self.last_upstream_seq + 1)
-                    for index, (seq, duration, data) in enumerate(selected_records):
-                        self._append(seq, duration, data,
-                                     discontinuity=discontinuity and index == 0)
-                        self.last_upstream_seq = seq
-                        self.last_progress = now
+                    self._publish_from(self.source_stream, now)
 
             if not self.history:
                 return None
-            # HLS target duration must not fluctuate as older segments expire.
-            target = self.target_duration
+            target = self.target_duration  # Remain stable across HLS window changes.
             output = [
                 "#EXTM3U", "#EXT-X-VERSION:3",
                 f"#EXT-X-TARGETDURATION:{target}",
