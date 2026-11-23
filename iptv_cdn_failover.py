@@ -53,6 +53,7 @@ class FailoverMux:
         self.last_switch = 0.0
         self.last_progress = 0.0
         self.last_request = time.monotonic()
+        self.retired_source = None  # (old worker, last TV-published source sequence)
         self.slots_seen: list[int] = []
         self.source_health: dict[int, dict] = {}
 
@@ -104,6 +105,10 @@ class FailoverMux:
     def _retire_history(self):
         """Start a new viewing session without reusing stale video or sequence IDs."""
         self.discontinuity_sequence += sum(segment.discontinuity for segment in self.history)
+        # A still-running gateway can advertise its old published playlist
+        # after a viewer returns. Require a *new* source sequence from that
+        # same worker before reusing its video.
+        self.retired_source = (self.source_stream, self.last_upstream_seq)
         self.history.clear()
         self.source_slot = None
         self.source_stream = None
@@ -120,6 +125,12 @@ class FailoverMux:
         records = [(seq, duration, data) for seq, duration, data in records if data]
         if not records:
             return False
+        if self.last_upstream_seq is None and self.retired_source is not None:
+            old_stream, old_seq = self.retired_source
+            if old_stream is stream and old_seq is not None:
+                records = [row for row in records if row[0] > old_seq]
+                if not records:
+                    return False  # Never replay the old session's last window.
         if self.last_upstream_seq is None:
             selected_records = records[-min(3, len(records)):]
             discontinuity = bool(self.history)
@@ -136,6 +147,8 @@ class FailoverMux:
                          discontinuity=discontinuity and index == 0)
             self.last_upstream_seq = seq
             self.last_progress = now
+        if selected_records:
+            self.retired_source = None
         return bool(selected_records)
 
     def playlist(self, token: str, candidates: list[tuple[int, object]], *, now: float | None = None):
