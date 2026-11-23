@@ -188,7 +188,9 @@ class MultiGateway:
                     sid, old = min(disposable, key=lambda row: row[1].accessed)
                     old.close()
                     del self.active[sid]
-            if len(self.active) >= self.max_streams:
+            if len(self.active) >= self.max_streams and not standby:
+                # Only real viewers may reclaim idle sessions. A CDN mirror
+                # must never displace another cabin's selected channel.
                 # A channel-switching TV may keep two stopped channels in
                 # cache; reclaim only genuinely idle, unpinned sessions.
                 # Never steal from active viewers or pending warmups.
