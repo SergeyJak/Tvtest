@@ -43,7 +43,9 @@ def generate_for_slot(store: ProfileStore, slot: int, *, refresh_m3u: bool = Fal
             current_ids = [c.id for c in channels_from_text(source_path.read_text(encoding="utf-8-sig"))]
             if ids != current_ids:
                 record["revision"] += 1
-                store.epg_path(slot).unlink(missing_ok=True)
+                # Keep the last good EPG until a newly generated guide
+                # is atomically installed. M3U-only refresh must never
+                # remove a working TV guide.
             from iptv_profiles import atomic_private_write
             atomic_private_write(source_path, updated)
             atomic_private_write(store.path, json.dumps(latest, ensure_ascii=False))
