@@ -158,7 +158,7 @@
     target.replaceChildren();
     (current.sources || []).forEach(source => {
       const row = element("div", "cdn-source");
-      const name = element("strong", "", "CDN · кабинет " + source.cabinet);
+      const name = element("strong", "", "CDN · " + (source.name || "Кабинет " + source.cabinet));
       const state = element("span", "cdn-health " + (source.fresh ? "good" : source.ready ? "warn" : ""),
           source.fresh ? "● В эфире" : source.ready ? "● Нет новых сегментов" : "● Прогрев");
       const active = source.cabinet === current.selected_cabinet;
