@@ -50,6 +50,7 @@ class FailoverMux:
         self.discontinuity_sequence = 0
         self.target_duration = 1
         self.switches = 0
+        self.switch_events: list[dict] = []  # Last 20 choices, sanitized.
         self.last_switch = 0.0
         self.last_progress = 0.0
         self.last_request = time.monotonic()
@@ -72,6 +73,10 @@ class FailoverMux:
             "fresh": fresh,
             "age_seconds": age,
             "buffer_seconds": data.get("effective_buffer_delay_seconds"),
+            "contiguous_tail_seconds": data.get("contiguous_tail_seconds"),
+            "published_age_seconds": data.get("seconds_since_published_advance"),
+            "published_sequence": data.get("last_published_sequence"),
+            "downloaded_sequence": data.get("last_downloaded_sequence"),
             "cached_mib": data.get("cached_mib"),
             "errors": data.get("errors"),
             "slow_segments": data.get("slow_segments"),
@@ -108,7 +113,7 @@ class FailoverMux:
         self.last_switch = 0.0
         # next_sequence intentionally remains monotonic.
 
-    def _publish_from(self, slot, stream, now: float) -> bool:
+    def _publish_from(self, slot, stream, now: float, *, reason: str = "START") -> bool:
         """Select a worker only when it contributes playable, unseen video."""
         gateway = stream.gateway
         switching = stream is not self.source_stream
@@ -141,10 +146,22 @@ class FailoverMux:
             boundary = False
 
         if switching:
-            self.switches += self.source_slot is not None
+            prior = self.source_slot
+            if prior is not None:
+                self.switches += 1
             self.last_switch = now
             self.source_slot = slot
             self.source_stream = stream
+            # Never expose provider URLs, account tokens or worker IDs.
+            self.switch_events.append({
+                "at": round(time.time()),
+                "from_cabinet": prior,
+                "to_cabinet": slot,
+                "reason": reason if prior is not None else "START",
+                "kind": "switch" if prior is not None else "start",
+            })
+            if len(self.switch_events) > 20:
+                del self.switch_events[:-20]
         self.published_cursors[stream] = (epoch, last)
         self.last_progress = now
         return True
@@ -178,8 +195,11 @@ class FailoverMux:
             stalled = now - self.last_progress >= PUBLISH_STALL_SECONDS
             can_switch = current is None or now - self.last_switch >= SWITCH_COOLDOWN
             if can_switch and (not fresh or stalled):
+                reason = ("PUBLISH_STALL" if stalled else
+                          "SOURCE_RESTARTED" if current is None and selected is not None else
+                          "SOURCE_UNAVAILABLE")
                 for slot in self._alternates(sources):
-                    if self._publish_from(slot, sources[slot], now):
+                    if self._publish_from(slot, sources[slot], now, reason=reason):
                         break
 
             # A stale provider can still have minutes of playable local video.
@@ -217,6 +237,13 @@ class FailoverMux:
                 "selected_cabinet": self.source_slot,
                 "available_cabinets": list(self.slots_seen),
                 "switches": self.switches,
+                "switch_history": list(reversed(self.switch_events)),
+                "last_playlist_progress_seconds": (
+                    round(max(0.0, time.monotonic() - self.last_progress), 1)
+                    if self.last_progress else None),
+                "seconds_since_last_probe": round(max(0.0, time.monotonic() - self.last_request), 1),
+                "virtual_segment_sequence": self.history[-1].number if self.history else None,
+                "cached_video_seconds": round(sum(segment.duration for segment in self.history), 1),
                 "sources": [
                     {"cabinet": slot, **data}
                     for slot, data in sorted(self.source_health.items())
