@@ -135,7 +135,7 @@ class ProfileRegistry:
                      if is_pilot(channel.name)), None)
                 if matching_id is None:
                     continue
-                stream = manager.start(matching_id)
+                stream = manager.start(matching_id, standby=(slot != 1))
                 if stream is not None:
                     candidates.append((slot, stream))
             if len(candidates) < 2 and cid not in self.failovers:
