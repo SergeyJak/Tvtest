@@ -337,6 +337,8 @@
       card.append(track);
       const details = element("div", "cdn-source-facts");
       [
+        ["Телевизоров на CDN", streamLive && active?.source_viewer_load
+          ? n(active.source_viewer_load[String(slot)] || 0) + " / 2" : "—"],
         ["Видео в кэше", streamLive && video != null ? duration(video) : "—"],
         ["Новый сегмент", streamLive && source?.age_seconds != null
           ? duration(source.age_seconds) + " назад" : "—"],
