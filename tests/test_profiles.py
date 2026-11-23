@@ -300,12 +300,12 @@ class ThreeCabinetTests(unittest.TestCase):
         diagnostics = self.registry.pilot_diagnostics(owner_token)
         self.assertIsNotNone(diagnostics)
         self.assertTrue(diagnostics["enabled"])
-        self.assertFalse(diagnostics["primary_channel_found"])
+        self.assertTrue(diagnostics["primary_channel_found"])
         self.assertFalse(diagnostics["pilot_active"])
         self.assertIsNone(self.registry.pilot_diagnostics("invalid-token"))
 
-        # A similarly named, but non-pilot channel must be visible as a
-        # diagnostic hint rather than silently opening extra CDN streams.
+        # All channels are eligible; merely listing a channel never
+        # starts workers or exposes private source URLs.
         near_match = ("#EXTM3U\n"
                       "#EXTINF:-1,VF Теория большого взрыва HD\n"
                       "https://provider.example/PRIVATE_KEY\n")
@@ -313,15 +313,16 @@ class ThreeCabinetTests(unittest.TestCase):
             self.store.update(1, "Основной", "https://provider.example/catalog")
         self.registry.resolve(owner_token)
         diagnostics = self.registry.pilot_diagnostics(owner_token)
-        self.assertFalse(diagnostics["primary_channel_found"])
-        self.assertEqual(diagnostics["possible_names"], ["VF Теория большого взрыва HD"])
+        self.assertTrue(diagnostics["primary_channel_found"])
+        self.assertFalse(diagnostics["pilot_active"])
+        self.assertEqual(diagnostics["possible_names"], [])
         with self.request(owner_token, "status") as response:
             status = json.load(response)
         self.assertIn("multi_cdn_diagnostics", status)
         self.assertNotIn("PRIVATE_KEY", json.dumps(status))
         self.assertNotIn("provider.example", json.dumps(status))
-        self.assertEqual(status["multi_cdn_diagnostics"]["possible_names"],
-                         ["VF Теория большого взрыва HD"])
+        self.assertTrue(status["multi_cdn_diagnostics"]["primary_channel_found"])
+        self.assertEqual(status["multi_cdn_diagnostics"]["possible_names"], [])
 
     def test_cdn_diagnostics_show_configured_pilot_without_active_viewer(self):
         playlist = ("#EXTM3U\n"
