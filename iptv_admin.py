@@ -274,6 +274,17 @@ class AdminState:
                 # Gateways are trusted, but expose only labels and known metrics.
                 streams.append(dict(stream, profile_slot=profile["slot"],
                                     profile_name=profile["name"]))
+        # Number of active TV cabins currently routed through each source.
+        # This exposes distribution to the authenticated administrator,
+        # not through any family's public TV playlist token.
+        viewer_load = {str(slot): 0 for slot in (1, 2, 3)}
+        for report in multi_cdn:
+            slot = report.get("selected_cabinet")
+            age = report.get("seconds_since_last_probe")
+            if slot in (1, 2, 3) and isinstance(age, (int, float)) and 0 <= age < 35:
+                viewer_load[str(slot)] += 1
+        for report in multi_cdn:
+            report["source_viewer_load"] = dict(viewer_load)
         return {
             "channels": total("channels"),
             "active_streams": len(streams),
