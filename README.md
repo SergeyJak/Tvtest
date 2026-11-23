@@ -431,6 +431,14 @@ rotation. The first manifest request waits up to 18 seconds plus the reserve
 in this mode. Set `--startup-wait` to override that HTTP wait. The player's
 own timeout can be shorter, especially with a large reserve.
 
+## Тестирование трёх Edem CDN для VF Теория большого взрыва
+
+Для первого кабинета доступен экспериментальный multi-CDN резерв на базе трёх
+уже настроенных ТВ-кабинетов. Шлюз выбирает свежий поток, сохраняет ссылку
+телевизора и обозначает переключение HLS как `EXT-X-DISCONTINUITY`. Мониторинг
+выбранного CDN и резервов расположен в админке. Подготовка регионов,
+ограничения и быстрый откат: [MULTICDN.md](MULTICDN.md).
+
 ## Security
 
 Repository is currently **public**. **Never commit** actual `.m3u`, `.m3u8`, `.env`, or reports, and never paste subscription URLs into issues or PRs. This repository contains no IPTV subscriptions or channel source links. The experimental gateway serves only on localhost by default; LAN exposure requires explicit --host 0.0.0.0 and a random access token.
