@@ -343,6 +343,73 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertTrue(diagnostic["cabins"][0]["playing"])
         self.assertNotIn("SECRET_CDN", json.dumps(diagnostic))
 
+    def test_three_viewers_start_on_own_sources_and_one_may_fail_over(self):
+        """Each TV keeps its own token and begins on its own Edem CDN."""
+        from collections import OrderedDict
+        tokens = {}
+        ids = {}
+        for slot in (1, 2, 3):
+            playlist = ('#EXTM3U\n'
+                        '#EXTINF:-1,VF Теория большого взрыва\n'
+                        f'https://cdn{slot}.example/PRIVATE_CDN_{slot}\n')
+            with patch("iptv_profiles.download_playlist", return_value=playlist):
+                row, _ = self.store.update(
+                    slot, f"TV-{slot}", f"https://provider.example/PRIVATE_M3U_{slot}")
+            tokens[slot] = row["token"]
+        self.registry.resolve(tokens[1])
+        for slot in (1, 2, 3):
+            manager = self.registry.resolve(tokens[slot])[0]
+            ids[slot] = next(iter(manager.channels))
+        muxes = {}
+        for slot in (1, 2, 3):
+            mux, candidates = self.registry.failover_for(tokens[slot], ids[slot])
+            muxes[slot] = mux
+            self.assertEqual(mux.home_slot, slot)
+            self.assertEqual([item for item, _ in candidates], [slot] +
+                             [other for other in (1, 2, 3) if other != slot])
+            for source_slot, worker in candidates:
+                gw = worker.gateway
+                with gw.lock:
+                    gw.cache = OrderedDict(
+                        (seq, (6.0, f"CDN_{source_slot}_{seq}".encode()))
+                        for seq in range(100, 106))
+                    gw.latest = 105
+                    gw.target = 6.0
+                    gw.last_progress = gw.last_segment_download = time.time()
+                    gw._fast_start_at = time.monotonic() - 2
+        for slot in (1, 2, 3):
+            with self.request(tokens[slot], f"channel/{ids[slot]}/index.m3u8") as response:
+                playlist = response.read().decode()
+            self.assertIn(f"/{tokens[slot]}/channel/{ids[slot]}/segment/1.ts", playlist)
+            with self.request(tokens[slot], f"channel/{ids[slot]}/segment/1.ts") as response:
+                self.assertEqual(response.read(), f"CDN_{slot}_100".encode())
+            self.assertEqual(muxes[slot].source_slot, slot)
+            with self.request(tokens[slot], "status") as response:
+                status = json.load(response)
+            self.assertEqual(status["multi_cdn"][0]["home_cabinet"], slot)
+            self.assertEqual(status["multi_cdn"][0]["selected_cabinet"], slot)
+            self.assertEqual(status["multi_cdn"][0]["switches"], 0)
+            self.assertNotIn("PRIVATE_CDN_", json.dumps(status))
+            self.assertNotIn("PRIVATE_M3U_", json.dumps(status))
+
+        # Cabinet 1 fails. Its own viewers 2 and 3 remain on their home
+        # accounts, while viewer 1 can move to one of the ready backups.
+        first = self.registry.resolve(tokens[1])[0].active[ids[1]]
+        with first.gateway.lock:
+            first.gateway.last_progress -= 90
+            first.gateway.last_segment_download -= 90
+        muxes[1].last_switch -= 25
+        with self.request(tokens[1], f"channel/{ids[1]}/index.m3u8") as response:
+            self.assertEqual(response.status, 200)
+        self.assertIn(muxes[1].source_slot, (2, 3))
+        self.assertEqual(muxes[2].source_slot, 2)
+        self.assertEqual(muxes[3].source_slot, 3)
+        # A third TV requesting a different token cannot retrieve segments
+        # from someone else's virtual stream.
+        self.assertIsNot(muxes[1], muxes[2])
+        self.assertIsNot(muxes[2], muxes[3])
+        self.assertNotIn("PRIVATE_", json.dumps(muxes[1].status()))
+
     def test_primary_vf_channel_uses_three_cdns_without_changing_tv_links(self):
         """Real HTTP path keeps one TV link and never exposes CDN URLs."""
         from collections import OrderedDict
@@ -358,7 +425,10 @@ class ThreeCabinetTests(unittest.TestCase):
         backup_token = self.store.get(2)["token"]
         manager = self.registry.resolve(owner_token)[0]
         cid = next(iter(manager.channels))
-        self.assertIsNone(self.registry.failover_for(backup_token, cid))
+        secondary_id = next(iter(self.registry.resolve(backup_token)[0].channels))
+        secondary_pilot = self.registry.failover_for(backup_token, secondary_id)
+        self.assertIsNotNone(secondary_pilot)
+        self.assertEqual(secondary_pilot[0].home_slot, 2)
         pilot = self.registry.failover_for(owner_token, cid)
         self.assertIsNotNone(pilot)
         mux, candidates = pilot
