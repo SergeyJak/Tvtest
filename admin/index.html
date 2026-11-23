@@ -104,8 +104,8 @@
             </article>
           </div>
           <article class="panel cdn-panel" id="cdn-pilot-panel" hidden>
-            <div class="panel-heading"><div><div class="eyebrow">MULTI-CDN / EXPERIMENT</div><h2>Резервирование «VF Теория большого взрыва»</h2></div><span class="live-label">LIVE</span></div>
-            <p class="resource-note">Три кабинета Edem, одна ссылка ТВ. Переключение между целыми HLS-источниками, без смешивания сегментов.</p>
+            <div class="panel-heading"><div><div class="eyebrow">MULTI-CDN / EXPERIMENT</div><h2>Резервирование всех каналов</h2></div><span class="live-label">LIVE</span></div>
+            <p class="resource-note">Каждый телевизор использует свой Edem. При зависании канала шлюз выбирает свободный резерв с таким же каналом.</p>
             <div class="cdn-summary"><span>Основной источник: <strong id="cdn-selected">—</strong></span><span>Переключений: <strong id="cdn-switches">0</strong></span></div>
             <div class="cdn-sources" id="cdn-sources"></div>
             <button type="button" class="text-link" data-go="cdn">Открыть подробный монитор <span>↗</span></button>
@@ -114,7 +114,8 @@
 
         <section class="view" id="view-cdn" hidden>
           <div class="cdn-cabin-switch" id="cdn-cabin-switch" role="group" aria-label="Чей телевизор смотрим"></div>
-          <div class="view-heading"><div><div class="eyebrow">STREAM RELIABILITY / LIVE</div><h1>CDN-монитор<span class="accent">.</span></h1><p>Контроль трёх источников канала «VF Теория большого взрыва». Показывает, что реально отдаёт шлюз телевизору, а не только скорость скачивания с Edem.</p></div><span class="status-pill" id="cdn-monitor-status">Ожидание эфира</span></div>
+          <div class="view-heading"><div><div class="eyebrow">STREAM RELIABILITY / LIVE</div><h1>CDN-монитор<span class="accent">.</span></h1><p>Контроль резервирования всех ТВ-каналов. Выбери телевизор и текущий канал, чтобы видеть настоящую подачу HLS и состояние его резервов.</p></div><span class="status-pill" id="cdn-monitor-status">Ожидание эфира</span></div>
+          <div class="cdn-channel-picker"><label for="cdn-channel-select">Канал для диагностики</label><select id="cdn-channel-select" aria-label="Активный канал для просмотра CDN"></select><span id="cdn-channel-help">Данные появляются после включения канала на телевизоре.</span></div>
           <div class="cdn-monitor-stats">
             <article class="metric"><div class="metric-top">Выбранный источник <span>◉</span></div><div class="cdn-monitor-metric" id="cdn-monitor-selected">—</div><div class="metric-caption" id="cdn-monitor-selected-sub">Проверяем поток</div></article>
             <article class="metric"><div class="metric-top">Новых кадров для ТВ <span>↗</span></div><div class="cdn-monitor-metric" id="cdn-monitor-progress">—</div><div class="metric-caption">Прошло с последнего продвижения HLS</div></article>
@@ -122,13 +123,13 @@
             <article class="metric"><div class="metric-top">Переключения <span>⇄</span></div><div class="cdn-monitor-metric" id="cdn-monitor-switches">—</div><div class="metric-caption">С момента запуска видеошлюза</div></article>
           </div>
           <article class="panel cdn-detail-panel">
-            <div class="panel-heading"><div><div class="eyebrow">DIAGNOSTICS</div><h2>Почему монитор показывает пусто?</h2></div><span class="resource-refresh">Проверка конфигурации</span></div>
+            <div class="panel-heading"><div><div class="eyebrow">DIAGNOSTICS</div><h2>Диагностика резервирования</h2></div><span class="resource-refresh">Проверка конфигурации</span></div>
             <div class="cdn-monitor-diagnostic" id="cdn-monitor-diagnostic" role="status" aria-live="polite">Проверяем состояние мульти-CDN…</div>
           </article>
           <article class="panel cdn-detail-panel">
             <div class="panel-heading"><div><div class="eyebrow">UPSTREAM SOURCES</div><h2>Состояние трёх CDN</h2></div><span class="resource-refresh">Обновление каждые 15 с</span></div>
             <div class="cdn-monitor-sources" id="cdn-monitor-sources"><div class="empty-state">Подключаем данные источников…</div></div>
-            <p class="note">Названия берутся из кабинетов ТВ. Для удобства можно назвать их «Германия», «Амстердам» и «Англия». Зелёный статус означает поступление новых сегментов, а не гарантированно непрерывное воспроизведение.</p>
+            <p class="note">Названия берутся из кабинетов ТВ. Резерв доступен только когда этот канал найден в другом кабинете и там есть свободная ёмкость. Зелёный статус означает поступление новых сегментов, а не гарантированно непрерывное воспроизведение.</p>
           </article>
           <article class="panel cdn-detail-panel">
             <div class="panel-heading"><div><div class="eyebrow">EVENT HISTORY</div><h2>Последние переключения</h2></div><span class="resource-refresh" id="cdn-last-event">Нет событий</span></div>
