@@ -160,6 +160,76 @@ class ThreeCabinetTests(unittest.TestCase):
         # Refreshing provider URLs must never disclose the private source key.
         self.assertNotIn("https://example.org/playlist", str(result))
 
+    def test_m3u_only_keeps_previous_epg_on_channel_list_change_and_failure(self):
+        from iptv_profile_jobs import run_update
+        with patch("iptv_profiles.download_playlist", return_value=PLAYLIST):
+            self.store.update(2, "Резерв", "https://example.org/playlist")
+        old_guide = b"previous-successful-guide-content"
+        self.store.epg_path(2).write_bytes(old_guide)
+        previous_rev = self.store.get(2)["revision"]
+        new_playlist = PLAYLIST + (
+            '#EXTINF:-1 group-title="News",New Channel\n'
+            'https://provider.invalid/new-channel\n')
+        with patch("iptv_profile_jobs.download_playlist", return_value=new_playlist):
+            result = run_update(self.store, [2], refresh_m3u=True, m3u_only=True)
+        self.assertEqual(result[2], "refreshed_m3u")
+        self.assertEqual(self.store.get(2)["revision"], previous_rev + 1)
+        self.assertEqual(self.store.epg_path(2).read_bytes(), old_guide)
+        # Even a failed build after changing channel IDs cannot destroy the
+        # last good guide, which should be atomically replaced only on success.
+        with patch.object(self.store, "guide_source", return_value="https://example.org/guide"), \
+             patch("iptv_profile_jobs.validate_source_url", side_effect=lambda url: url), \
+             patch("iptv_epg_stream.build_epg", side_effect=OSError("source failure")):
+            failure = run_update(self.store, [2])
+        self.assertEqual(failure[2], "failed")
+        self.assertEqual(self.store.epg_path(2).read_bytes(), old_guide)
+        with patch.object(self.store, "guide_source", return_value="https://example.org/guide"), \
+             patch("iptv_profile_jobs.validate_source_url", side_effect=lambda url: url), \
+             patch("iptv_epg_stream.build_epg",
+                   side_effect=lambda playlist, urls, destination, opts:
+                   Path(destination).write_bytes(b"new-guide")):
+            success = run_update(self.store, [2])
+        self.assertEqual(success[2], "updated")
+        self.assertEqual(self.store.epg_path(2).read_bytes(), b"new-guide")
+
+    def test_vf_virtual_ids_survive_backup_becoming_available_during_playback(self):
+        from collections import OrderedDict
+        playlist = ('#EXTM3U\n#EXTINF:-1,VF Теория большого взрыва\n'
+                    'https://cdn1.example/private-video\n')
+        with patch("iptv_profiles.download_playlist", return_value=playlist):
+            self.store.update(1, "Основной", "https://provider.example/primary.m3u")
+        token = self.store.get(1)["token"]
+        manager = self.registry.resolve(token)[0]
+        cid = next(iter(manager.channels))
+        mux, candidates = self.registry.failover_for(token, cid)
+        self.assertEqual(len(candidates), 1)
+        primary = candidates[0][1]
+        with primary.gateway.lock:
+            primary.gateway.cache = OrderedDict(
+                (i, (6.0, f"PRIMARY-{i}".encode())) for i in range(100, 106))
+            primary.gateway.latest = 105
+            primary.gateway.target = 6.0
+            primary.gateway.last_progress = time.time()
+            primary.gateway.last_segment_download = time.time()
+            primary.gateway._fast_start_at = time.monotonic() - 1
+        with self.request(token, f"channel/{cid}/index.m3u8") as response:
+            baseline = response.read().decode()
+        self.assertIn("MEDIA-SEQUENCE:1", baseline)
+        with self.request(token, f"channel/{cid}/segment/1.ts") as response:
+            self.assertEqual(response.read(), b"PRIMARY-100")
+        # The other account is configured while the TV continues watching.
+        with patch("iptv_profiles.download_playlist", return_value=playlist):
+            self.store.update(2, "Резерв", "https://provider.example/backup.m3u")
+        self.registry.resolve(token)
+        updated_mux, expanded = self.registry.failover_for(token, cid)
+        self.assertIs(updated_mux, mux)
+        self.assertEqual(len(expanded), 2)
+        with self.request(token, f"channel/{cid}/index.m3u8") as response:
+            later = response.read().decode()
+        self.assertIn(f"/{token}/channel/{cid}/segment/1.ts", later)
+        with self.request(token, f"channel/{cid}/segment/1.ts") as response:
+            self.assertEqual(response.read(), b"PRIMARY-100")
+
     def test_rename_is_instant_and_does_not_restart_workers(self):
         with patch("iptv_profiles.download_playlist", return_value=OTHER):
             row, _ = self.store.update(2, "Old", "https://example.org/m3u")
