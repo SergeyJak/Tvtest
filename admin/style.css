@@ -214,3 +214,13 @@ td{padding:13px 23px;border-top:1px solid #233044;color:#95a7bd;font-size:12px}t
 .cdn-monitor-event span{color:#9aabc3}
 @media(max-width:1200px){.cdn-monitor-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.cdn-monitor-sources{grid-template-columns:1fr}}
 @media(max-width:650px){.cdn-monitor-stats{gap:9px}.cdn-monitor-stats .metric{padding:16px 13px}.cdn-monitor-metric{font-size:21px}.cdn-detail-panel{padding:18px 15px}.cdn-monitor-event{grid-template-columns:1fr;gap:6px}.cdn-monitor-event time{font-size:10px}}
+
+
+/* Multi-CDN activation diagnostics when the video works but the mux is inactive. */
+.cdn-monitor-diagnostic{padding:15px 17px;border:1px solid #33465c;background:#182638;border-radius:10px;color:#e7f0fc}
+.cdn-monitor-diagnostic.good{border-color:#337766;background:#18362e}
+.cdn-monitor-diagnostic.warn{border-color:#906f3d;background:#302719}
+.cdn-monitor-diagnostic strong{font-size:14px;line-height:1.5}
+.cdn-monitor-diagnostic p{color:#b2bfd0;margin:8px 0 0;font-size:12px;line-height:1.65}
+.cdn-diagnostic-cabins{display:flex;gap:8px 12px;flex-wrap:wrap;margin-top:14px}
+.cdn-diagnostic-cabin{font-size:11px;border:1px solid rgba(143,169,198,.25);padding:7px 9px;border-radius:8px;color:#c6d7e8}
