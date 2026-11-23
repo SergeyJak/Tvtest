@@ -391,6 +391,27 @@ class MultiChannelTests(unittest.TestCase):
         self.assertEqual(len(self.manager.active), 1)
         self.assertIsNotNone(self.manager.start(another.id))
 
+    def test_real_viewer_preempts_standby_without_allowing_standby_to_evict_viewer(self):
+        first, second = self.channels
+        self.manager.max_streams = 1
+        standby = self.manager.start(first.id, standby=True)
+        self.assertTrue(standby.standby)
+        # A background probe may not displace a real viewer.
+        real = self.manager.start(second.id, standby=False)
+        self.assertIsNotNone(real)
+        self.assertFalse(real.standby)
+        self.assertTrue(standby.gateway.stop.is_set())
+        self.assertNotIn(first.id, self.manager.active)
+        self.assertIsNone(self.manager.start(first.id, standby=True))
+        # A direct request for the same channel promotes a standby to viewer.
+        real.gateway.stop.set()
+        self.manager.active.clear()
+        standby = self.manager.start(first.id, standby=True)
+        promoted = self.manager.start(first.id, standby=False)
+        self.assertIs(promoted, standby)
+        self.assertFalse(promoted.standby)
+        self.assertIsNone(self.manager.start(second.id, standby=True))
+
     def test_pinned_stream_is_not_evicted(self):
         first = self.channels[0]
         stream = self.manager.start(first.id, pinned=True)
