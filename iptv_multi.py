@@ -172,7 +172,11 @@ class MultiGateway:
                 return None
             if cid in self.active:
                 stream = self.active[cid]
-                stream.accessed = time.monotonic()
+                # Background probes cannot extend a real viewer's lifetime.
+                # Otherwise an abandoned VF session fills the one-stream cap
+                # forever while the primary TV periodically probes backups.
+                if not standby or stream.standby:
+                    stream.accessed = time.monotonic()
                 if pinned:
                     stream.pinned = True
                 if not standby:
