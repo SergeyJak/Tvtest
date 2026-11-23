@@ -243,9 +243,11 @@ class AdminState:
         streams = []
         cabins = []
         multi_cdn = []
+        multi_cdn_diagnostics = None
         for profile, data in statuses:
             if profile["slot"] == 1:
                 multi_cdn = data.get("multi_cdn") or []
+                multi_cdn_diagnostics = data.get("multi_cdn_diagnostics")
             cabins.append({
                 "slot": profile["slot"], "name": profile["name"],
                 "active_streams": len(data.get("streams") or []),
@@ -267,6 +269,7 @@ class AdminState:
             "streams": streams,
             "cabins": cabins,
             "multi_cdn": multi_cdn,
+            "multi_cdn_diagnostics": multi_cdn_diagnostics,
         }
 
     def login(self, password: str, peer: str) -> str | None:
@@ -334,6 +337,7 @@ class AdminState:
             "stalled_streams": sum(1 for row in active if row.get("stalled")),
             "cabins": status.get("cabins", []) if status else [],
             "multi_cdn": status.get("multi_cdn", []) if status else [],
+            "multi_cdn_diagnostics": status.get("multi_cdn_diagnostics") if status else None,
             "channels": len(channels),
             "active_streams": len(active),
             "max_streams": status.get("max_streams") if status else None,
