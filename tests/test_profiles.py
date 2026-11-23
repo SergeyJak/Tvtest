@@ -145,6 +145,21 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertFalse(active.gateway.stop.is_set())
         self.assertEqual(updated.start(second).gateway._url, channels_from_text(rotated)[1].url)
 
+    def test_m3u_only_refresh_after_region_change_skips_epg_generation(self):
+        from iptv_profile_jobs import run_update
+        with patch("iptv_profiles.download_playlist", return_value=PLAYLIST):
+            row, _ = self.store.update(2, "Резерв", "https://example.org/playlist")
+        before = self.store.get(2)["revision"]
+        rotated = PLAYLIST.replace("PRIVATE_CHANNEL", "DIFFERENT_CDN")
+        with patch("iptv_profile_jobs.download_playlist", return_value=rotated), \
+             patch("iptv_epg_stream.build_epg", side_effect=AssertionError("EPG must not run")):
+            result = run_update(self.store, [2], refresh_m3u=True, m3u_only=True)
+        self.assertEqual(result[2], "refreshed_m3u")
+        self.assertEqual(self.store.get(2)["revision"], before)
+        self.assertIn("DIFFERENT_CDN", self.store.snapshot_path(2).read_text())
+        # Refreshing provider URLs must never disclose the private source key.
+        self.assertNotIn("https://example.org/playlist", str(result))
+
     def test_rename_is_instant_and_does_not_restart_workers(self):
         with patch("iptv_profiles.download_playlist", return_value=OTHER):
             row, _ = self.store.update(2, "Old", "https://example.org/m3u")
@@ -268,6 +283,10 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertEqual(live["multi_cdn"][0]["switches"], 1)
         self.assertNotIn("PRIVATE_", json.dumps(live))
         self.assertNotIn("M3U_KEY_", json.dumps(live))
+        # Operator can disable the pilot without deleting M3U or changing keys.
+        (self.store.directory / "multicdn.disabled").touch()
+        self.assertIsNone(self.registry.failover_for(owner_token, cid))
+        self.assertIsNone(self.registry.existing_failover(owner_token, cid))
 
 
 if __name__ == "__main__":
