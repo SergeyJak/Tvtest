@@ -196,6 +196,40 @@ class AdminTests(unittest.TestCase):
         self.assertNotIn(first_token, json.dumps(result))
         self.assertNotIn(second["token"], json.dumps(result))
 
+    def test_cdn_monitor_html_is_auth_safe_and_api_exposes_switches(self):
+        with self.request("/admin/") as response:
+            page = response.read().decode()
+        self.assertIn('id="view-cdn"', page)
+        self.assertIn('id="cdn-monitor-sources"', page)
+        self.assertIn('id="cdn-monitor-events"', page)
+        self.assertIn('data-target="cdn"', page)
+        self.assertNotIn("PRIVATE_SECRET_NEVER_EXPOSE", page)
+        with self.request("/admin/app.js") as response:
+            script = response.read().decode()
+        self.assertIn("renderCdnMonitor", script)
+        self.assertNotIn("SECRET_TOKEN", script)
+        self._status["multi_cdn"] = [{
+            "selected_cabinet": 2,
+            "switches": 1,
+            "virtual_segment_sequence": 5,
+            "cached_video_seconds": 24.0,
+            "last_playlist_progress_seconds": 2.0,
+            "switch_history": [{"at": 1795430000, "from_cabinet": 1,
+                                "to_cabinet": 2, "reason": "PUBLISH_STALL",
+                                "kind": "switch"}],
+            "sources": [{"cabinet": 1, "fresh": False, "buffer_seconds": 0.0},
+                        {"cabinet": 2, "fresh": True, "buffer_seconds": 22.0}]
+        }]
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            self.request("/admin/api/overview")
+        self.assertEqual(denied.exception.code, 401)
+        self.login().close()
+        with self.request("/admin/api/overview") as response:
+            data = json.load(response)
+        self.assertEqual(data["multi_cdn"][0]["selected_cabinet"], 2)
+        self.assertEqual(data["multi_cdn"][0]["switch_history"][0]["reason"], "PUBLISH_STALL")
+        self.assertNotIn("PRIVATE_SECRET_NEVER_EXPOSE", json.dumps(data))
+
     def test_tv_links_are_available_only_to_logged_in_admin(self):
         token = "private-playlist-token-for-test"
         self.state.gateway_token_file.write_text(token, encoding="ascii")
