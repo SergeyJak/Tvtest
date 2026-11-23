@@ -475,6 +475,50 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertIsNot(muxes[2], muxes[3])
         self.assertNotIn("PRIVATE_", json.dumps(muxes[1].status()))
 
+    def test_non_vf_channel_gets_virtual_hls_and_segments_over_original_tv_token(self):
+        """All-channel path works even if only the home Edem account is active."""
+        from collections import OrderedDict
+        token = self.store.get(1)["token"]
+        manager = self.registry.resolve(token)[0]
+        cid = manager.order[1]  # Channel B, not the former VF pilot.
+        mux, candidates = self.registry.failover_for(token, cid)
+        self.assertEqual(mux.channel_name, "Channel B")
+        self.assertEqual([slot for slot, _ in candidates], [1])
+        gw = candidates[0][1].gateway
+        with gw.lock:
+            gw.cache = OrderedDict(
+                (seq, (6.0, f"CHANNEL_B_{seq}".encode())) for seq in range(100, 106))
+            gw.latest = 105
+            gw.target = 6.0
+            gw.last_progress = gw.last_segment_download = time.time()
+            gw._fast_start_at = time.monotonic() - 2
+        with self.request(token, f"channel/{cid}/index.m3u8") as response:
+            manifest = response.read().decode()
+        self.assertIn("#EXT-X-MEDIA-SEQUENCE:1", manifest)
+        self.assertIn(f"/{token}/channel/{cid}/segment/1.ts", manifest)
+        with self.request(token, f"channel/{cid}/segment/1.ts") as response:
+            self.assertEqual(response.read(), b"CHANNEL_B_100")
+        with self.request(token, "status") as response:
+            report = json.load(response)["multi_cdn"][0]
+        self.assertEqual(report["channel"], "Channel B")
+        self.assertEqual(report["channel_id"], cid)
+        self.assertEqual(report["selected_cabinet"], 1)
+
+    def test_dedicated_cabin_can_switch_channels_without_waiting_for_old_stream(self):
+        with patch("iptv_profiles.download_playlist", return_value=PLAYLIST):
+            profile, _ = self.store.update(
+                2, "Вадим", "https://provider.example/private")
+        manager = self.registry.resolve(profile["token"])[0]
+        self.assertTrue(manager.prefer_owner_tuning)
+        self.assertEqual(manager.max_streams, 1)
+        first = manager.start(manager.order[0])
+        self.assertIsNotNone(first)
+        second = manager.start(manager.order[1])
+        self.assertIsNotNone(second)
+        self.assertTrue(first.gateway.stop.is_set())
+        self.assertNotIn(manager.order[0], manager.active)
+        self.assertIs(manager.active[manager.order[1]], second)
+
     def test_every_channel_is_eligible_and_uses_matching_backup_only(self):
         """A movie, news and UHD channel are equal citizens of failover."""
         primary = ("#EXTM3U\n"
