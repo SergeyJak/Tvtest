@@ -138,9 +138,9 @@ class ProfileRegistry:
         return candidate.id
 
     def _prune_failovers(self, now: float):
-        """Release old virtual segment buffers after the TV session ends."""
+        """Release old channel buffers after its TV session ends."""
         for key, mux in list(self.failovers.items()):
-            if now - mux.last_request > 180:
+            if now - mux.last_request > 70:
                 del self.failovers[key]
 
     def failover_for(self, token: str, cid: str):
@@ -216,6 +216,7 @@ class ProfileRegistry:
                 return None
             names = {row["slot"]: row["name"] for row in self.store.all()}
             result = []
+            self._prune_failovers(time.monotonic())
             for (owner_slot, _), mux in self.failovers.items():
                 if owner_slot != home:
                     continue
@@ -230,52 +231,52 @@ class ProfileRegistry:
             return result
 
     def pilot_diagnostics(self, token: str):
-        """Safe explanation of why the VF multi-CDN mux is not active.
+        """Read-only status for all-channel multi-CDN, without creating streams.
 
-        Read already loaded catalogues and workers, never fetch remote M3U,
-        start a stream, or return provider URLs, tokens, IPs or viewer data.
+        The method name is kept for compatibility with the gateway status
+        route. Public TV tokens reveal only their own viewing activity.
         """
         with self.lock:
             home = self._slot_for_token(token)
             if home is None:
                 return None
             disabled = (self.store.directory / "multicdn.disabled").exists()
+            recent = [
+                (mux.last_request, cid, mux)
+                for (slot, cid), mux in self.failovers.items() if slot == home
+            ]
+            selected = max(recent, default=None)
+            channel_id = selected[1] if selected is not None else None
+            owner = self.routes.get(token)
+            wanted = owner[0].channels.get(channel_id) if owner and channel_id else None
             cabins = []
-            possible_names = []
             for slot in (1, 2, 3):
                 profile = self.store.get(slot)
                 route = self.routes.get(profile["token"])
                 manager = route[0] if route else None
-                channels = manager.channels.values() if manager else ()
-                matched = next((channel for channel in channels if is_pilot(channel.name)), None)
+                match = (self._matching_channel_id(manager.channels, wanted)
+                         if manager and wanted else None)
                 cabin = {
                     "slot": slot,
                     "name": profile["name"] if slot == home else f"Кабинет {slot}",
                     "configured": manager is not None,
-                    "channel_found": matched is not None,
-                    "channel_name": matched.name if matched else None,
+                    "channel_found": match is not None if wanted else bool(manager and manager.channels),
+                    "channel_name": wanted.name if slot == home and wanted else None,
                 }
                 if slot == home:
-                    if not matched:
-                        possible_names = [
-                            channel.name[:100] for channel in channels
-                            if "теория" in channel.name.casefold()
-                            and "взрыва" in channel.name.casefold()
-                        ][:4]
                     cabin["playing"] = False
-                    if manager:
+                    if manager is not None:
                         with manager.lock:
                             cabin["playing"] = any(
-                                not stream.standby and is_pilot(stream.channel.name)
-                                for stream in manager.active.values())
+                                not stream.standby for stream in manager.active.values())
                 cabins.append(cabin)
-            mux_active = any(owner_slot == home for owner_slot, _ in self.failovers)
             return {
                 "enabled": not disabled,
                 "home_cabinet": home,
-                "pilot_active": mux_active,
-                "primary_channel_found": cabins[home - 1]["channel_found"],
-                "possible_names": possible_names,
+                "pilot_active": bool(recent),
+                "primary_channel_found": bool(owner and owner[0].channels),
+                "selected_channel": wanted.name if wanted else None,
+                "possible_names": [],
                 "cabins": cabins,
             }
 
