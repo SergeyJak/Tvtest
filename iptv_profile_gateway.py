@@ -6,13 +6,24 @@ random path tokens. Saving a profile swaps only that profile's manager.
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from iptv_profiles import ProfileStore
-from iptv_cdn_failover import FailoverMux, SESSION_IDLE_SECONDS
+from iptv_cdn_failover import FailoverMux, SESSION_IDLE_SECONDS, MAX_GUESTS_PER_SOURCE
+
+ARCHIVED_CHANNELS_PER_CABIN = 32
+
+
+@dataclass
+class ChannelHistory:
+    name: str
+    last_request: float
+    switches: int
+    events: list
 
 
 @dataclass
@@ -39,6 +50,7 @@ class ProfileRegistry:
         self.routes = {}
         self.failovers = {}  # (home cabin, channel ID) => isolated virtual HLS timeline
         self.tunings: dict[int, Tuning] = {}
+        self.history = {slot: {} for slot in (1, 2, 3)}
         self.next_sequences = {}  # Resume numbering after the video cache expires.
         self.closed = False
         self.legacy_detached = False
@@ -171,6 +183,12 @@ class ProfileRegistry:
                 self._end_tuning(home)
         for key, mux in list(self.failovers.items()):
             if now - mux.last_request > 70:
+                if mux.switch_events:
+                    archive = self.history[mux.home_slot]
+                    archive[mux.channel_id] = ChannelHistory(
+                        mux.channel_name, mux.last_request, mux.switches, mux.switch_events)
+                    if len(archive) > ARCHIVED_CHANNELS_PER_CABIN:
+                        del archive[min(archive, key=lambda cid: archive[cid].last_request)]
                 self.next_sequences[key] = mux.next_sequence
                 del self.failovers[key]
 
@@ -203,6 +221,10 @@ class ProfileRegistry:
                 if mux is None:
                     mux = FailoverMux(home_slot=home, channel_id=cid, channel_name=wanted.name,
                                       first_sequence=self.next_sequences.pop(key, 1))
+                    history = self.history[home].pop(cid, None)
+                    if history:
+                        mux.switches = history.switches
+                        mux.switch_events = history.events
                     self.failovers[key] = mux
                 else:
                     mux.restart_session(time.monotonic())
@@ -239,17 +261,17 @@ class ProfileRegistry:
             current = self.tunings.get(mux.home_slot)
             if current is None or current.mux is not mux:
                 return None  # An earlier manifest request finished warming after a retune.
-            usage: dict[int, int] = {}
-            for tuning in self.tunings.values():
-                other = tuning.mux
-                if other is mux:
-                    continue
-                with other.lock:
-                    slot = other.source_slot
-                    live = now - other.last_request < SESSION_IDLE_SECONDS and other.history
-                if slot is not None and live and slot != other.home_slot:
-                    usage[slot] = usage.get(slot, 0) + 1
-            return mux.playlist(token, current.candidates(), now=now, usage=usage)
+            return mux.playlist(token, current.candidates(), now=now, usage=self._guest_usage(mux, now))
+
+    def _guest_usage(self, mux, now):
+        usage = {}
+        for tuning in self.tunings.values():
+            other = tuning.mux
+            slot = other.source_slot
+            if (other is not mux and other.history and slot not in (None, other.home_slot)
+                    and now - other.last_request < SESSION_IDLE_SECONDS):
+                usage[slot] = usage.get(slot, 0) + 1
+        return usage
 
     def existing_failover(self, token: str, cid: str):
         """Return only the calling TV's private virtual HLS timeline."""
@@ -260,27 +282,85 @@ class ProfileRegistry:
             slot = self._slot_for_token(token)
             return self.failovers.get((slot, cid)) if slot is not None else None
 
+    def _reports_for_cabin(self, home, name):
+        result = []
+        tuning = self.tunings.get(home)
+        for (owner_slot, _), mux in self.failovers.items():
+            if owner_slot != home:
+                continue
+            status = mux.status()
+            status["tuned"] = tuning is not None and tuning.mux is mux
+            status["home_name"] = name
+            for source in status["sources"]:
+                if source["cabinet"] == home:
+                    source["name"] = name
+            result.append(status)
+        return result
+
     def failover_status(self, token: str):
+        """TV links only expose the calling cabinet's sessions and name."""
         with self.lock:
-            home = self._slot_for_token(token)
-            if home is None:
-                return None
-            names = {row["slot"]: row["name"] for row in self.store.all()}
-            result = []
             self._prune_failovers(time.monotonic())
-            for (owner_slot, _), mux in self.failovers.items():
-                if owner_slot != home:
+            for row in self.store.all():
+                if row["token"] == token:
+                    return self._reports_for_cabin(row["slot"], row["name"])
+            return None
+
+    def monitor_snapshot(self):
+        """Read all cabinets under the same routing lock. Requires the admin credential."""
+        with self.lock:
+            now = time.monotonic()
+            self._prune_failovers(now)
+            enabled = not (self.store.directory / "multicdn.disabled").exists()
+            viewers = {}
+            load = {slot: 0 for slot in (1, 2, 3)}
+            for home, tuning in self.tunings.items():
+                mux = tuning.mux
+                if enabled and mux.history and mux.source_slot is not None:
+                    load[mux.source_slot] += 1
+                    viewers.setdefault(mux.source_stream, []).append(home)
+
+            result = {}
+            health = {}
+            profiles = self.store.all()
+            for profile in profiles:
+                home, token = profile["slot"], profile["token"]
+                route = self.routes.get(token)
+                if route is None:
                     continue
-                status = mux.status()
+                manager = route[0]
+                with manager.lock:
+                    status = json.loads(manager.status(include_standby=True))
+                    for stream in status["streams"]:
+                        stream["viewers"] = sorted(viewers.get(manager.active[stream["id"]], []))
+                reports = self._reports_for_cabin(home, profile["name"])
                 tuning = self.tunings.get(home)
-                status["tuned"] = tuning is not None and tuning.mux is mux
-                status["home_name"] = names.get(home, "Кабинет")
-                # The bearer TV token must not reveal other family members'
-                # cabinet names. Authenticated admin enriches names locally.
-                for source in status["sources"]:
-                    if source["cabinet"] == home:
-                        source["name"] = names.get(home, "Кабинет")
-                result.append(status)
+                for report in reports:
+                    report["tuned"] = enabled and report["tuned"]
+                    report["source_viewer_load"] = load
+                    if report["tuned"]:
+                        usage = self._guest_usage(tuning.mux, now)
+                        sources = []
+                        for slot, worker in tuning.candidates():
+                            if worker not in health:
+                                health[worker] = FailoverMux._health(worker)
+                            sources.append(dict(health[worker], cabinet=slot, guest_full=(
+                                slot != home and usage.get(slot, 0) >= MAX_GUESTS_PER_SOURCE)))
+                        report["sources"] = sources
+                for cid, old in self.history[home].items():
+                    reports.append({
+                        "home_cabinet": home, "channel_id": cid, "channel": old.name,
+                        "tuned": False, "switches": old.switches, "switch_history": old.events[::-1],
+                        "seconds_since_last_probe": round(now - old.last_request, 1), "sources": [],
+                    })
+                status["multi_cdn"] = reports
+                diagnostic = self._diagnostics(token, home, profiles, enabled)
+                if enabled:
+                    for cabin in diagnostic["cabins"]:
+                        if cabin["slot"] == home:
+                            cabin["playing"] = tuning is not None
+                status["multi_cdn_diagnostics"] = diagnostic
+                result[home] = status
             return result
 
     def pilot_diagnostics(self, token: str):
@@ -290,49 +370,53 @@ class ProfileRegistry:
         route. Public TV tokens reveal only their own viewing activity.
         """
         with self.lock:
-            home = self._slot_for_token(token)
-            if home is None:
-                return None
-            disabled = (self.store.directory / "multicdn.disabled").exists()
-            recent = [
-                (mux.last_request, cid, mux)
-                for (slot, cid), mux in self.failovers.items() if slot == home
-            ]
-            selected = max(recent, default=None)
-            channel_id = selected[1] if selected is not None else None
-            owner = self.routes.get(token)
-            wanted = owner[0].channels.get(channel_id) if owner and channel_id else None
-            cabins = []
-            for slot in (1, 2, 3):
-                profile = self.store.get(slot)
-                route = self.routes.get(profile["token"])
-                manager = route[0] if route else None
-                match = None
-                if manager and wanted:
-                    match = wanted.id if slot == home else self._matching_channel_id(owner[0], manager, wanted)
-                cabin = {
-                    "slot": slot,
-                    "name": profile["name"] if slot == home else f"Кабинет {slot}",
-                    "configured": manager is not None,
-                    "channel_found": match is not None if wanted else bool(manager and manager.channels),
-                    "channel_name": wanted.name if slot == home and wanted else None,
-                }
-                if slot == home:
-                    cabin["playing"] = False
-                    if manager is not None:
-                        with manager.lock:
-                            cabin["playing"] = any(
-                                not stream.standby for stream in manager.active.values())
-                cabins.append(cabin)
-            return {
-                "enabled": not disabled,
-                "home_cabinet": home,
-                "pilot_active": bool(recent),
-                "primary_channel_found": bool(owner and owner[0].channels),
-                "selected_channel": wanted.name if wanted else None,
-                "possible_names": [],
-                "cabins": cabins,
+            profiles = self.store.all()
+            for row in profiles:
+                if row["token"] == token:
+                    enabled = not (self.store.directory / "multicdn.disabled").exists()
+                    return self._diagnostics(token, row["slot"], profiles, enabled)
+            return None
+
+    def _diagnostics(self, token, home, profiles, enabled):
+        recent = [
+            (mux.last_request, cid, mux)
+            for (slot, cid), mux in self.failovers.items() if slot == home
+        ]
+        selected = max(recent, default=None)
+        channel_id = selected[1] if selected is not None else None
+        owner = self.routes.get(token)
+        wanted = owner[0].channels.get(channel_id) if owner and channel_id else None
+        cabins = []
+        for profile in profiles:
+            slot = profile["slot"]
+            route = self.routes.get(profile["token"])
+            manager = route[0] if route else None
+            match = None
+            if manager and wanted:
+                match = wanted.id if slot == home else self._matching_channel_id(owner[0], manager, wanted)
+            cabin = {
+                "slot": slot,
+                "name": profile["name"] if slot == home else f"Кабинет {slot}",
+                "configured": manager is not None,
+                "channel_found": match is not None if wanted else bool(manager and manager.channels),
+                "channel_name": wanted.name if slot == home and wanted else None,
             }
+            if slot == home:
+                cabin["playing"] = False
+                if manager is not None:
+                    with manager.lock:
+                        cabin["playing"] = any(
+                            not stream.standby for stream in manager.active.values())
+            cabins.append(cabin)
+        return {
+            "enabled": enabled,
+            "home_cabinet": home,
+            "pilot_active": bool(recent),
+            "primary_channel_found": bool(owner and owner[0].channels),
+            "selected_channel": wanted.name if wanted else None,
+            "possible_names": [],
+            "cabins": cabins,
+        }
 
     def close(self):
         with self.lock:

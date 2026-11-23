@@ -58,19 +58,25 @@
       </header>
 
       <div class="content">
+        <p id="connection-error" class="connection-error" role="alert" hidden></p>
         <section class="view" id="view-overview">
           <div class="view-heading"><div><div class="eyebrow">СИСТЕМА МОНИТОРИНГА</div><h1>Обзор сервера<span class="accent">.</span></h1><p>Работа IPTV, подключённые трансляции и состояние телепрограммы.</p></div><span class="status-pill" id="overall-status">Проверка…</span></div>
 
           <div class="metrics">
             <article class="metric"><div class="metric-top">Каналы <span>▤</span></div><div class="metric-number" id="metric-channels">—</div><div class="metric-caption">В текущем плейлисте</div></article>
-            <article class="metric"><div class="metric-top">Активные потоки <span>◉</span></div><div class="metric-number"><span id="metric-streams">—</span><span class="metric-suffix" id="metric-capacity"></span></div><div class="metric-caption">Трансляции в работе</div></article>
+            <article class="metric"><div class="metric-top">Потоки CDN <span>◉</span></div><div class="metric-number"><span id="metric-streams">—</span><span class="metric-suffix" id="metric-capacity"></span></div><div class="metric-caption">Включая фоновые резервы</div></article>
             <article class="metric"><div class="metric-top">EPG покрытие <span>▦</span></div><div class="metric-number" id="metric-coverage">—</div><div class="metric-caption" id="metric-coverage-sub">Получаем телепрограмму</div></article>
             <article class="metric"><div class="metric-top">Телепрограмма <span>≋</span></div><div class="metric-number" id="metric-programmes">—</div><div class="metric-caption">Передач в XMLTV</div></article>
           </div>
 
+          <article class="panel cdn-panel" id="cdn-pilot-panel" hidden>
+            <div class="panel-heading"><h2>Сейчас смотрят</h2><span class="resource-refresh" id="cdn-viewer-count"></span></div>
+            <div class="cdn-sources" id="cdn-sources"></div>
+          </article>
+
           <div class="dashboard-grid">
             <article class="panel panel-main">
-              <div class="panel-heading"><div><div class="eyebrow">LIVE MONITOR</div><h2>Активные трансляции</h2></div><span class="live-label"><span class="live-dot"></span> LIVE</span></div>
+              <div class="panel-heading"><div><div class="eyebrow">LIVE MONITOR</div><h2>Потоки источников</h2></div><span class="live-label" id="streams-live" hidden><span class="live-dot"></span> LIVE</span></div>
               <div id="streams-list" class="streams-list"><div class="empty-state">Загрузка трансляций…</div></div>
             </article>
             <article class="panel coverage-panel">
@@ -103,13 +109,6 @@
               <div class="resource-cabins" id="service-cabins" aria-label="Использование кабинетов"></div>
             </article>
           </div>
-          <article class="panel cdn-panel" id="cdn-pilot-panel" hidden>
-            <div class="panel-heading"><div><div class="eyebrow">MULTI-CDN / EXPERIMENT</div><h2>Резервирование всех каналов</h2></div><span class="live-label">LIVE</span></div>
-            <p class="resource-note">Каждый телевизор использует свой Edem. При зависании канала шлюз выбирает свободный резерв с таким же каналом.</p>
-            <div class="cdn-summary"><span>Основной источник: <strong id="cdn-selected">—</strong></span><span>Переключений: <strong id="cdn-switches">0</strong></span></div>
-            <div class="cdn-sources" id="cdn-sources"></div>
-            <button type="button" class="text-link" data-go="cdn">Открыть подробный монитор <span>↗</span></button>
-          </article>
         </section>
 
         <section class="view" id="view-cdn" hidden>
@@ -120,7 +119,7 @@
             <article class="metric"><div class="metric-top">Выбранный источник <span>◉</span></div><div class="cdn-monitor-metric" id="cdn-monitor-selected">—</div><div class="metric-caption" id="cdn-monitor-selected-sub">Проверяем поток</div></article>
             <article class="metric"><div class="metric-top">Новых кадров для ТВ <span>↗</span></div><div class="cdn-monitor-metric" id="cdn-monitor-progress">—</div><div class="metric-caption">Прошло с последнего продвижения HLS</div></article>
             <article class="metric"><div class="metric-top">Запас в кэше <span>▥</span></div><div class="cdn-monitor-metric" id="cdn-monitor-cache">—</div><div class="metric-caption" id="cdn-monitor-cache-sub">Видео, сохранённое в мультиплексоре</div></article>
-            <article class="metric"><div class="metric-top">Переключения <span>⇄</span></div><div class="cdn-monitor-metric" id="cdn-monitor-switches">—</div><div class="metric-caption">С момента запуска видеошлюза</div></article>
+            <article class="metric"><div class="metric-top">Переключения <span>⇄</span></div><div class="cdn-monitor-metric" id="cdn-monitor-switches">—</div><div class="metric-caption">За сохранённую историю канала</div></article>
           </div>
           <article class="panel cdn-detail-panel">
             <div class="panel-heading"><div><div class="eyebrow">DIAGNOSTICS</div><h2>Диагностика резервирования</h2></div><span class="resource-refresh">Проверка конфигурации</span></div>
@@ -134,7 +133,7 @@
           <article class="panel cdn-detail-panel">
             <div class="panel-heading"><div><div class="eyebrow">EVENT HISTORY</div><h2>Последние переключения</h2></div><span class="resource-refresh" id="cdn-last-event">Нет событий</span></div>
             <div class="cdn-event-list" id="cdn-monitor-events"><div class="empty-state">История появится после выбора источника.</div></div>
-            <p class="note">Последние 20 событий хранятся в памяти шлюза. После его перезапуска журнал начинается заново. Логины, ссылки M3U и ключи Edem не сохраняются.</p>
+            <p class="note">Шлюз хранит по 20 последних событий на канал. После очистки видеокеша остаётся история 32 последних каналов каждого кабинета. Перезапуск шлюза очищает журнал.</p>
           </article>
         </section>
 

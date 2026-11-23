@@ -38,6 +38,9 @@
   }
   function showLogin() {
     state.overview = null;
+    state.cdnHome = null;
+    state.cdnChannelByHome = {};
+    $("connection-error").hidden = true;
     state.channels = [];
     $("profiles-container").replaceChildren();
     app.hidden = true;
@@ -50,10 +53,17 @@
     app.hidden = false;
   }
   async function api(path, options) {
-    const response = await fetch("/admin/api/" + path, Object.assign({credentials:"same-origin", cache:"no-store"}, options || {}));
-    if (response.status === 401 && path !== "login") { showLogin(); throw new Error("Требуется вход"); }
-    if (!response.ok) { const details = await response.json().catch(() => ({})); throw new Error(details.error && /[а-яА-Я]/.test(details.error) ? details.error : "HTTP " + response.status); }
-    return response.json();
+    const request = Object.assign({credentials:"same-origin", cache:"no-store"}, options || {});
+    const controller = new AbortController();
+    const timeout = request.method ? null : setTimeout(() => controller.abort(), 12000);
+    try {
+      const response = await fetch("/admin/api/" + path, {...request, signal: controller.signal});
+      if (response.status === 401 && path !== "login") { showLogin(); throw new Error("Требуется вход"); }
+      if (!response.ok) { const details = await response.json().catch(() => ({})); throw new Error(details.error && /[а-яА-Я]/.test(details.error) ? details.error : "HTTP " + response.status); }
+      return await response.json();
+    } finally {
+      clearTimeout(timeout);
+    }
   }
   function badge(id, value, isBad) {
     const node = $(id);
@@ -122,7 +132,7 @@
       ? (100 * gateway.rss_bytes / ram.total_bytes) : null;
     resourceBar("service-cpu-bar", gateway.cpu_percent);
     resourceBar("service-ram-bar", serviceShare);
-    text("service-cache", data.cached_mib === undefined ? "—" :
+    text("service-cache", !data.gateway_online || data.cached_mib == null ? "—" :
          Number(data.cached_mib).toLocaleString("ru-RU") + " МБ");
     text("service-stalled", n(data.stalled_streams));
     text("service-admin-ram", storage(admin.rss_bytes));
@@ -135,7 +145,7 @@
     text("sys-service-ram", storage(gateway.rss_bytes));
     const cabins = $("service-cabins");
     cabins.replaceChildren();
-    if (!data.cabins?.length) {
+    if (!data.gateway_online || !data.cabins?.length) {
       cabins.append(element("div", "resource-note", "Кабинеты недоступны для мониторинга"));
     } else {
       data.cabins.forEach(item => {
@@ -147,45 +157,45 @@
     }
   }
   function isLiveCdn(report) {
-    return !!report && report.tuned !== false &&
-      (report.seconds_since_last_probe == null || report.seconds_since_last_probe < 35);
+    return !!report && !!state.overview?.gateway_online &&
+      (report.tuned ?? (report.seconds_since_last_probe == null || report.seconds_since_last_probe < 35));
   }
-  function renderMultiCdn(rows) {
+  function renderMultiCdn(data) {
     const card = $("cdn-pilot-panel");
-    const pilots = Array.isArray(rows) ? rows.filter(isLiveCdn) : [];
-    card.hidden = pilots.length === 0;
-    if (!pilots.length) return;
-    const current = [...pilots].sort((a,b) =>
-      Number(a.seconds_since_last_probe ?? 1e9) - Number(b.seconds_since_last_probe ?? 1e9))[0];
-    text("cdn-selected", (current.channel || "Канал") + ": " +
-      (current.selected_cabinet ? "Кабинет " + current.selected_cabinet : "Накопление буфера"));
-    text("cdn-switches", n(current.switches || 0));
+    const sessions = (data.multi_cdn || []).filter(isLiveCdn)
+      .sort((a, b) => a.home_cabinet - b.home_cabinet);
+    card.hidden = sessions.length === 0;
+    text("cdn-viewer-count", "Телевизоров · " + n(sessions.length));
     const target = $("cdn-sources");
     target.replaceChildren();
-    (current.sources || []).forEach(source => {
-      const row = element("div", "cdn-source");
-      const name = element("strong", "", "CDN · " + (source.name || "Кабинет " + source.cabinet));
-      const state = element("span", "cdn-health " + (source.fresh ? "good" : source.ready ? "warn" : ""),
-          source.fresh ? "● В эфире" : source.ready ? "● Нет новых сегментов" : "● Прогрев");
-      const active = source.cabinet === current.selected_cabinet;
-      if (active) name.append(element("small", "cdn-selected-label", " ВЫБРАН"));
-      const note = element("small", "cdn-source-note",
-          "Буфер " + (source.buffer_seconds == null ? "—" : source.buffer_seconds + " с") +
-          " · последний сегмент " + (source.age_seconds == null ? "—" : source.age_seconds + " с назад"));
-      row.append(name, state, note);
+    const names = new Map((data.cabins || []).map(cabin => [cabin.slot, cabin.name]));
+    sessions.forEach(session => {
+      const row = element("button", "cdn-source cdn-session");
+      row.type = "button";
+      row.dataset.home = session.home_cabinet;
+      const source = session.selected_cabinet;
+      row.append(element("span", "cdn-source-note", session.home_name || "Кабинет " + session.home_cabinet),
+        element("strong", "", session.channel),
+        element("span", "cdn-source-note", source ? "Источник · " + (names.get(source) || "Кабинет " + source) : "Прогрев"));
       target.append(row);
     });
+  }
+  function availableReserve(report, source) {
+    return source.cabinet !== report.selected_cabinet && source.fresh && source.guest_full === false;
   }
   function renderCdnDiagnostics(data, active, home) {
     const target = $("cdn-monitor-diagnostic");
     target.replaceChildren();
     const diag = (data.multi_cdn_diagnostics_by_cabin || {})[String(home)] ||
       (home === 1 ? data.multi_cdn_diagnostics : null);
-    const tvStreams = Array.isArray(data.streams) ? data.streams : [];
     let message = "";
     let detail = "";
     let state = "neutral";
-    if (!data.gateway_online) {
+    if (data.connection_lost) {
+      message = "Нет связи с админкой.";
+      detail = "Текущее состояние телевизоров неизвестно.";
+      state = "warn";
+    } else if (!data.gateway_online) {
       message = "Шлюз IPTV недоступен.";
       detail = "Проверь iptv-gateway.service на VPS.";
       state = "warn";
@@ -205,17 +215,16 @@
       message = "Просмотр этого канала завершён.";
       detail = "Ниже показаны данные последнего просмотра.";
     } else if (!active) {
-      const own = tvStreams.find(stream => Number(stream.profile_slot) === home && !stream.standby);
-      if (own) {
+      if (diag.cabins?.some(cabin => cabin.slot === home && cabin.playing)) {
         message = "Есть активная трансляция, но её Multi-CDN ещё не активирован.";
         detail = "Проверь, что плеер открывает актуальную ссылку /channel/.../index.m3u8.";
       } else {
         message = "Этот телевизор пока не запрашивал канал.";
         detail = "Включи любой канал через M3U своего кабинета.";
       }
-    } else if (active?.sources?.length < 2) {
+    } else if (!active.sources?.some(source => availableReserve(active, source))) {
       message = "Сейчас у этого канала нет готового резерва.";
-      detail = "Другой кабинет не содержит точно совпадающего канала или его поток занят просмотром.";
+      detail = "Проверь состояние источников и свободное гостевое место ниже.";
       state = "warn";
     } else {
       message = "Multi-CDN активирован, данные о переключениях доступны.";
@@ -226,7 +235,7 @@
     target.classList.toggle("good", state === "good");
     target.append(element("strong", "", message));
     target.append(element("p", "", detail));
-    if (diag?.cabins?.length) {
+    if (data.gateway_online && (!active || isLiveCdn(active)) && diag?.cabins?.length) {
       const list = element("div", "cdn-diagnostic-cabins");
       diag.cabins.forEach(cabin => {
         const label = !cabin.configured ? "Кабинет не настроен" :
@@ -264,7 +273,7 @@
       switcher.append(button);
     });
     const homeRows = rows.filter(item => Number(item.home_cabinet) === state.cdnHome)
-      .sort((a,b) => Number(a.seconds_since_last_probe ?? 1e9) -
+      .sort((a,b) => Number(isLiveCdn(b)) - Number(isLiveCdn(a)) || Number(a.seconds_since_last_probe ?? 1e9) -
                       Number(b.seconds_since_last_probe ?? 1e9));
     const selectedId = state.cdnChannelByHome[state.cdnHome];
     const active = (selectedId && homeRows.find(item => item.channel_id === selectedId)) ||
@@ -287,7 +296,7 @@
       });
       picker.value = active.channel_id || "";
     }
-    text("cdn-channel-help", !active
+    text("cdn-channel-help", !data.gateway_online ? "Текущий канал неизвестен" : !active
       ? "Начни просмотр любого канала в этом кабинете."
       : isLiveCdn(active)
         ? "Сейчас смотрят: " + active.channel
@@ -304,19 +313,21 @@
     const selectedName = active?.selected_cabinet ? cabinName(active.selected_cabinet) : null;
     const progress = active?.last_playlist_progress_seconds;
     const delayed = streamLive && progress != null && Number(progress) >= 18;
-    badge("cdn-monitor-status", !data.gateway_online ? "● Шлюз недоступен" :
+    badge("cdn-monitor-status", data.connection_lost ? "● Нет связи с админкой" :
+      !data.gateway_online ? "● Шлюз недоступен" :
       !active ? "○ Ожидание просмотра" :
       !streamLive ? "○ Канал неактивен" :
       delayed ? "● Плейлист задерживается" :
       selectedName ? "● Источник выбран" : "○ Прогрев",
       !data.gateway_online || delayed);
     text("cdn-monitor-selected", streamLive ? (selectedName || "Прогрев") : "—");
-    text("cdn-monitor-selected-sub", !active ? "Включи любой канал в выбранном кабинете" :
+    text("cdn-monitor-selected-sub", !data.gateway_online ? "Нет актуальных данных" :
+      !active ? "Включи любой канал в выбранном кабинете" :
       !streamLive ? "Нет текущего просмотра" : "Источник сегментов для телевизора");
     text("cdn-monitor-progress", streamLive && progress != null ? duration(progress) : "—");
-    text("cdn-monitor-cache", active && Number.isFinite(Number(active.cached_video_seconds))
+    text("cdn-monitor-cache", streamLive && active.cached_video_seconds != null
       ? duration(active.cached_video_seconds) : "—");
-    text("cdn-monitor-cache-sub", active?.virtual_segment_sequence == null ?
+    text("cdn-monitor-cache-sub", !streamLive ? "Нет текущих данных о кеше" : active.virtual_segment_sequence == null ?
       "Нет опубликованных сегментов" : "Последний виртуальный сегмент № " + n(active.virtual_segment_sequence));
     text("cdn-monitor-switches", active ? n(active.switches || 0) : "—");
     const sourceContainer = $("cdn-monitor-sources");
@@ -330,14 +341,18 @@
       label.append(element("span", "eyebrow", "КАБИНЕТ " + slot));
       label.append(element("h3", "", cabinName(slot)));
       const healthy = streamLive && source?.fresh;
-      const statusText = !streamLive ? "Нет просмотра" :
+      const full = streamLive && !selected && source?.guest_full;
+      const ready = streamLive && source && availableReserve(active, source);
+      const statusText = !data.gateway_online ? "Нет данных" : !streamLive ? "Нет просмотра" :
         !source ? "Нет телеметрии" :
         selected && healthy ? "● Выбран" :
         selected ? "● Выбран · задержка" :
-        healthy ? "● Готовый резерв" :
+        full ? "Гостевое место занято" :
+        ready ? "● Готовый резерв" :
+        healthy ? "Ёмкость неизвестна" :
         source.ready ? "● Поток задерживается" : "○ Буферизация";
       top.append(label, element("span", "cdn-monitor-source-status " +
-        (healthy ? "good" : source?.ready && streamLive ? "warn" : ""), statusText));
+        (selected && healthy || ready ? "good" : full || source?.ready && streamLive ? "warn" : ""), statusText));
       card.append(top);
       const buffer = source?.buffer_seconds;
       const video = source?.contiguous_tail_seconds;
@@ -414,10 +429,13 @@
 
   function updateOverview(data) {
     state.overview = data;
+    $("connection-error").hidden = !data.connection_lost;
     const online = data.gateway_online;
-    text("side-state", online ? "Сервер работает" : "Нет связи со шлюзом");
+    text("side-state", data.connection_lost ? "Нет связи с админкой" :
+      online ? "Сервер работает" : "Нет связи со шлюзом");
     $("side-dot").classList.toggle("off", !online);
-    badge("overall-status", online ? "● Система работает" : "● Шлюз недоступен", !online);
+    badge("overall-status", data.connection_lost ? "● Нет связи с админкой" :
+      online ? "● Система работает" : "● Шлюз недоступен", !online);
     badge("system-badge", online ? "● На связи" : "● Нет связи", !online);
     text("metric-channels", n(data.channels));
     text("metric-streams", n(data.active_streams));
@@ -451,19 +469,27 @@
     text("sys-delay", data.delay_seconds === null ? "—" : data.delay_seconds + " с");
     text("sys-denials", n(data.stream_limit_denials));
     text("sys-timeouts", n(data.warmup_timeouts));
-    text("sys-online", online ? "Online" : "Offline");
+    text("sys-online", data.connection_lost ? "—" : online ? "Online" : "Offline");
     text("sys-catalog", n(data.catalog_requests));
-    text("sys-uptime", Math.floor(data.admin_uptime_seconds / 3600) + " ч " + Math.floor(data.admin_uptime_seconds % 3600 / 60) + " мин");
-    text("last-updated", "Обновлено в " + new Date().toLocaleTimeString("ru-RU", {hour:"2-digit",minute:"2-digit",second:"2-digit"}));
+    text("sys-uptime", data.admin_uptime_seconds == null ? "—" :
+      Math.floor(data.admin_uptime_seconds / 3600) + " ч " + Math.floor(data.admin_uptime_seconds % 3600 / 60) + " мин");
+    if (!data.connection_lost)
+      text("last-updated", "Обновлено в " + new Date().toLocaleTimeString("ru-RU", {hour:"2-digit",minute:"2-digit",second:"2-digit"}));
     text("footer-time", new Date().getFullYear());
     updateResources(data);
-    renderMultiCdn(data.multi_cdn);
+    renderMultiCdn(data);
     renderCdnMonitor(data);
-    renderStreams(data.streams);
+    renderStreams(data);
   }
-  function renderStreams(streams) {
+  function renderStreams(data) {
     const list = $("streams-list");
     list.replaceChildren();
+    $("streams-live").hidden = !data.gateway_online;
+    const streams = data.streams;
+    if (!data.gateway_online) {
+      list.append(element("div", "empty-state", "Нет данных о текущих потоках."));
+      return;
+    }
     if (!streams.length) {
       list.append(element("div", "empty-state", "Сейчас нет активных трансляций. Когда телевизор включит канал, он появится здесь."));
       return;
@@ -473,14 +499,18 @@
       row.append(element("div", "stream-avatar", "▶"));
       const info = element("div", "stream-details");
       info.append(element("div", "stream-name", stream.name || "Канал"));
-      const subtitle = [stream.pinned ? "Закреплён" : "По запросу",
+      const viewers = (stream.viewers || []).map(slot =>
+        (data.cabins || []).find(cabin => cabin.slot === slot)?.name || "Кабинет " + slot);
+      const subtitle = [stream.profile_name, stream.standby ? "Резервный поток" : stream.pinned ? "Закреплён" : "По запросу",
+                        viewers.length ? "Смотрят · " + viewers.join(", ") : "",
                         stream.cached_mib === null ? "" : "Кэш " + stream.cached_mib + " МБ",
                         stream.delay_seconds === null ? "" : "Буфер " + stream.delay_seconds + " с"].filter(Boolean).join(" · ");
       info.append(element("div", "stream-meta", subtitle));
       row.append(info);
       const mode = stream.stalled ? "error" : stream.ready ? "" : "warn";
       row.append(element("span", "stream-state " + mode,
-                         stream.stalled ? "Сбой" : stream.ready ? "В эфире" : "Буферизация"));
+                         stream.stalled ? "Сбой" : !stream.ready ? "Буферизация" :
+                           viewers.length ? "В эфире" : stream.standby ? "Резерв" : "Буфер готов"));
       list.append(row);
     });
   }
@@ -890,15 +920,25 @@
     if (state.busy || app.hidden) return;
     state.busy = true;
     $("refresh-button").disabled = true;
+    let received = false;
     try {
       const data = await api("overview");
       updateOverview(data);
+      received = true;
       await loadChannels(force || state.epgStatus !== data.epg.status);
       if (state.view === "history") await loadHistory();
       if (state.view === "incidents") await loadIncidents();
     } catch (error) {
-      text("last-updated", "Ошибка подключения");
-      if (!app.hidden) badge("overall-status", "● Нет связи с админкой", true);
+      if (!app.hidden && !received) {
+        const last = state.overview || {channels: null, epg: {covered: null}};
+        text("connection-error", "Нет связи с админкой. Текущие показатели недоступны.");
+        updateOverview({...last, connection_lost: true, gateway_online: false,
+          resources: {}, cached_mib: null, stalled_streams: null, active_streams: null,
+          max_streams: null, streams: [], delay_seconds: null, stream_limit_denials: null,
+          warmup_timeouts: null, catalog_requests: null, admin_uptime_seconds: null});
+      } else if (!app.hidden) {
+        text("last-updated", "Не удалось обновить дополнительные данные");
+      }
     } finally {
       state.busy = false;
       $("refresh-button").disabled = false;
@@ -916,8 +956,15 @@
     state.cdnHome = Number(button.dataset.slot);
     if (state.overview) {
       renderCdnMonitor(state.overview);
-      renderMultiCdn(state.overview.multi_cdn);
     }
+  });
+  $("cdn-sources").addEventListener("click", event => {
+    const button = event.target.closest("button[data-home]");
+    if (!button || !state.overview) return;
+    state.cdnHome = Number(button.dataset.home);
+    delete state.cdnChannelByHome[state.cdnHome];
+    view("cdn");
+    renderCdnMonitor(state.overview);
   });
   $("cdn-channel-select").addEventListener("change", event => {
     state.cdnChannelByHome[state.cdnHome] = event.target.value;

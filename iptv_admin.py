@@ -202,12 +202,19 @@ class AdminState:
                 continue
             try:
                 url = f"http://127.0.0.1:{self.gateway_port}/{token}/status"
+                if not statuses:
+                    url += "?scope=cabinets"
                 request = urllib.request.Request(url)
                 request.add_unredirected_header("Authorization", "Bearer " + self.profiles.monitor_token)
                 with urllib.request.urlopen(request, timeout=1.5) as response:
                     if response.status != 200:
                         continue
-                    item = json.loads(response.read(2 * 1024 * 1024))
+                    item = json.loads(response.read(8 * 1024 * 1024))
+                    if isinstance(item, dict) and "cabinet_statuses" in item:
+                        snapshot = item["cabinet_statuses"]
+                        statuses = [(p, snapshot[str(p["slot"])]) for p in profiles
+                                    if str(p["slot"]) in snapshot]
+                        break
                     if isinstance(item, dict):
                         statuses.append((profile, item))
             except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
@@ -270,7 +277,7 @@ class AdminState:
                     and isinstance(age, (int, float)) and 0 <= age < 35):
                 viewer_load[str(slot)] += 1
         for report in multi_cdn:
-            report["source_viewer_load"] = dict(viewer_load)
+            report.setdefault("source_viewer_load", viewer_load)
         return {
             "channels": total("channels"),
             "active_streams": len(streams),
@@ -337,6 +344,8 @@ class AdminState:
                     "profile_slot": stream.get("profile_slot"),
                     "ready": bool(stream.get("ready")),
                     "pinned": bool(stream.get("pinned")),
+                    "standby": bool(stream.get("standby")),
+                    "viewers": stream.get("viewers", []),
                     "stalled": bool(stream.get("upstream_stalled")),
                     "buffer_state": stream.get("buffer_state"),
                     "cached_mib": stream.get("cached_mib"),

@@ -751,6 +751,66 @@ class ThreeCabinetTests(unittest.TestCase):
         return AdminState(self.legacy, self.legacy_epg, self.server.server_port,
                           self.legacy_token, "admin-test-password", profiles_dir=self.store.directory)
 
+    def test_monitor_attributes_shared_source_to_its_viewers_and_respects_guest_place(self):
+        tokens = [self.store.get(1)["token"], self.configure_backup(2), self.configure_backup(3)]
+        cid = self.base_manager.order[0]
+        _, workers = self.registry.failover_for(tokens[1], cid)
+        self.fill_cache(dict(workers)[3], "third")
+        route = f"channel/{cid}/index.m3u8"
+        with self.request(tokens[1], route):
+            pass
+        self.fill_cache(dict(workers)[1], "first")
+        with self.request(tokens[0], route):
+            pass
+        admin = self.admin_state()
+        for expected_viewers in ([2], [2, 3]):
+            if 3 in expected_viewers:
+                with self.request(tokens[2], route):
+                    pass
+            data = admin.overview()
+            first = next(row for row in data["multi_cdn"] if row["home_cabinet"] == 1)
+            third = next(s for s in first["sources"] if s["cabinet"] == 3)
+            self.assertTrue(third["guest_full"])
+            self.assertTrue(third["fresh"])
+            self.assertEqual(first["source_viewer_load"]["3"], len(expected_viewers))
+            stream = next(s for s in data["streams"] if s["profile_slot"] == 3)
+            self.assertEqual(stream["viewers"], expected_viewers)
+            self.assertEqual(stream["standby"], 3 not in expected_viewers)
+        with self.request(tokens[0], "status?scope=cabinets") as response:
+            private = json.load(response)
+        self.assertNotIn("cabinet_statuses", private)
+        self.assertNotIn("guest_full", json.dumps(private))
+
+    def test_admin_channel_history_outlives_video_and_resumes_without_duplicate_events(self):
+        token = self.store.get(1)["token"]
+        self.configure_backup(2)
+        cid = self.base_manager.order[0]
+        mux, workers = self.registry.failover_for(token, cid)
+        for _, worker in workers:
+            self.fill_cache(worker, "video")
+        route = f"channel/{cid}/index.m3u8"
+        with self.request(token, route):
+            pass
+        workers[0][1].gateway.last_segment_download -= 60
+        mux.last_switch -= 30
+        with self.request(token, route):
+            pass
+        admin = self.admin_state()
+        before = admin.overview()["multi_cdn"][0]
+        self.assertEqual(before["switches"], 1)
+        mux.last_request -= 71
+        rows = admin.overview()["multi_cdn"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["switch_history"], before["switch_history"])
+        self.assertFalse(rows[0]["tuned"])
+        self.assertIsNone(self.registry.existing_failover(token, cid))
+        self.fill_cache(workers[0][1], "new")
+        with self.request(token, route):
+            pass
+        current, = admin.overview()["multi_cdn"]
+        self.assertEqual(current["switches"], 1)
+        self.assertEqual(current["switch_history"][1:], before["switch_history"])
+
     def test_old_channel_mux_is_reclaimed_to_limit_cache_growth(self):
         playlist = ("#EXTM3U\n"
                     "#EXTINF:-1,News\nhttps://cdn.example/news\n"

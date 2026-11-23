@@ -484,6 +484,10 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 credential = self.headers.get("Authorization", "")
                 include_standby = (profile_registry is not None and credential.isascii()
                                    and hmac.compare_digest(credential, "Bearer " + profile_registry.store.monitor_token))
+                if include_standby and urllib.parse.urlsplit(self.path).query == "scope=cabinets":
+                    snapshot = {"cabinet_statuses": profile_registry.monitor_snapshot()}
+                    return self.respond(200, json.dumps(snapshot, ensure_ascii=False).encode("utf-8"),
+                                        "application/json", head)
                 data = json.loads(request_manager.status(include_standby=include_standby))
                 if profile_registry is not None:
                     pilot = profile_registry.failover_status(active_token)
