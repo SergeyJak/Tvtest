@@ -149,6 +149,7 @@ class Gateway:
         self._fast_start_at = time.monotonic() + 3.0 if fast_start and not require_startup_reserve else None
         self.max_bytes, self.max_segment = max_bytes, max_segment
         self.lock = threading.RLock()
+        self.cache_epoch = 0
         self.cache: OrderedDict[int, tuple[float, bytes]] = OrderedDict()
         self.total_bytes = 0
         self.latest = None
@@ -294,6 +295,7 @@ class Gateway:
                 if self._pending_source_reset:
                     # Never mix identical HLS sequence numbers from two
                     # upstream URLs. The old cache is kept until validation.
+                    self.cache_epoch += 1
                     self.cache.clear()
                     self.total_bytes = 0
                     self.latest = None
@@ -308,6 +310,7 @@ class Gateway:
                 self.manifest_failure_streak = 0
                 self.manifest_backoff_until = 0.0
                 if self.latest is not None and listed[-1].sequence < self.latest - 10:
+                    self.cache_epoch += 1
                     self.cache.clear()
                     self.total_bytes = 0
                     self.last_published_seq = None

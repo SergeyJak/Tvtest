@@ -10,6 +10,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass
+from weakref import WeakKeyDictionary
 
 PILOT_NAME = "vf теория большого взрыва"
 WINDOW_SEGMENTS = 12
@@ -44,7 +45,6 @@ class FailoverMux:
         self.lock = threading.RLock()
         self.source_slot = None
         self.source_stream = None
-        self.last_upstream_seq = None
         self.next_sequence = 1
         self.history: list[VirtualSegment] = []
         self.discontinuity_sequence = 0
@@ -53,7 +53,8 @@ class FailoverMux:
         self.last_switch = 0.0
         self.last_progress = 0.0
         self.last_request = time.monotonic()
-        self.retired_source = None  # (old worker, last TV-published source sequence)
+        # Keep cursors across switches and idle sessions, without retaining old caches.
+        self.published_cursors = WeakKeyDictionary()  # worker -> (cache epoch, sequence)
         self.slots_seen: list[int] = []
         self.source_health: dict[int, dict] = {}
 
@@ -76,22 +77,17 @@ class FailoverMux:
             "slow_segments": data.get("slow_segments"),
         }
 
-    def _candidate(self, streams: dict[int, object], *, exclude: int | None = None):
-        eligible = [slot for slot, info in self.source_health.items()
-                    if info["fresh"] and slot in streams and slot != exclude]
-        if not eligible:
-            return None
-        if self.source_slot in eligible and self.source_stream is streams[self.source_slot]:
-            return self.source_slot
-        if self.source_slot is None and 1 in eligible:
-            return 1  # Prefer the viewer's own account for a fresh session.
-        return max(eligible, key=lambda slot: (
+    def _alternates(self, streams):
+        eligible = [slot for slot, stream in streams.items()
+                    if stream is not self.source_stream and self.source_health[slot]["fresh"]]
+        return sorted(eligible, key=lambda slot: (
+            self.source_slot is None and slot == 1,
             self.source_health[slot]["buffer_seconds"] or 0,
             -(self.source_health[slot]["age_seconds"] or 0),
             -slot
-        ))
+        ), reverse=True)
 
-    def _append(self, sequence: int, duration: float, payload: bytes, *, discontinuity: bool):
+    def _append(self, duration: float, payload: bytes, *, discontinuity: bool):
         self.history.append(VirtualSegment(self.next_sequence, duration, payload, discontinuity))
         self.target_duration = max(self.target_duration, math.ceil(duration))
         self.next_sequence += 1
@@ -105,51 +101,53 @@ class FailoverMux:
     def _retire_history(self):
         """Start a new viewing session without reusing stale video or sequence IDs."""
         self.discontinuity_sequence += sum(segment.discontinuity for segment in self.history)
-        # A still-running gateway can advertise its old published playlist
-        # after a viewer returns. Require a *new* source sequence from that
-        # same worker before reusing its video.
-        self.retired_source = (self.source_stream, self.last_upstream_seq)
         self.history.clear()
         self.source_slot = None
         self.source_stream = None
-        self.last_upstream_seq = None
         self.last_progress = 0.0
         self.last_switch = 0.0
         # next_sequence intentionally remains monotonic.
 
-    def _publish_from(self, stream, now: float) -> bool:
-        """Copy newly offered video from the selected Gateway into our timeline."""
-        records = stream.gateway.published()
-        records = [(seq, duration, stream.gateway.segment(seq))
-                   for seq, duration in records]
-        records = [(seq, duration, data) for seq, duration, data in records if data]
+    def _publish_from(self, slot, stream, now: float) -> bool:
+        """Select a worker only when it contributes playable, unseen video."""
+        gateway = stream.gateway
+        switching = stream is not self.source_stream
+        with gateway.lock:
+            epoch = gateway.cache_epoch
+            previous_epoch, last = self.published_cursors.get(stream, (epoch, None))
+            reset = epoch != previous_epoch
+            if reset:
+                last = None
+            if switching and last is not None:
+                # Looking at a previously used standby must not move its player's cursor.
+                window = gateway.published(commit=False)
+                if not window or window[-1][0] <= last:
+                    return False
+            window = gateway.published()
+            if last is not None:
+                window = [row for row in window if row[0] > last]
+            if switching or reset:
+                window = window[-3:]
+            records = [(seq, duration, gateway.segment(seq)) for seq, duration in window]
+
         if not records:
             return False
-        if self.last_upstream_seq is None and self.retired_source is not None:
-            old_stream, old_seq = self.retired_source
-            if old_stream is stream and old_seq is not None:
-                records = [row for row in records if row[0] > old_seq]
-                if not records:
-                    return False  # Never replay the old session's last window.
-        if self.last_upstream_seq is None:
-            selected_records = records[-min(3, len(records)):]
-            discontinuity = bool(self.history)
-        elif records[-1][0] < self.last_upstream_seq - 3:
-            # Same upstream restarted its media-sequence numbering.
-            selected_records = records[-min(3, len(records)):]
-            discontinuity = True
-        else:
-            selected_records = [row for row in records if row[0] > self.last_upstream_seq]
-            discontinuity = bool(
-                selected_records and selected_records[0][0] > self.last_upstream_seq + 1)
-        for index, (seq, duration, data) in enumerate(selected_records):
-            self._append(seq, duration, data,
-                         discontinuity=discontinuity and index == 0)
-            self.last_upstream_seq = seq
-            self.last_progress = now
-        if selected_records:
-            self.retired_source = None
-        return bool(selected_records)
+        boundary = switching or reset
+        for seq, duration, payload in records:
+            gap = last is not None and seq != last + 1
+            self._append(duration, payload,
+                         discontinuity=self.next_sequence > 1 and (boundary or gap))
+            last = seq
+            boundary = False
+
+        if switching:
+            self.switches += self.source_slot is not None
+            self.last_switch = now
+            self.source_slot = slot
+            self.source_stream = stream
+        self.published_cursors[stream] = (epoch, last)
+        self.last_progress = now
+        return True
 
     def playlist(self, token: str, candidates: list[tuple[int, object]], *, now: float | None = None):
         """Emit one stable HLS timeline, failing over on *published* video stalls.
@@ -173,26 +171,20 @@ class FailoverMux:
             if current is not self.source_stream:
                 current = None
 
-            if current is not None and self.source_health.get(selected, {}).get("fresh"):
-                self._publish_from(current, now)
+            fresh = current is not None and self.source_health[selected]["fresh"]
+            if fresh:
+                self._publish_from(selected, current, now)
 
-            stalled = bool(self.history and self.last_progress
-                           and now - self.last_progress >= PUBLISH_STALL_SECONDS)
-            healthy = (current is not None
-                       and self.source_health.get(selected, {}).get("fresh")
-                       and not stalled)
-            can_switch = (selected is None or now - self.last_switch >= SWITCH_COOLDOWN)
-            if not healthy and can_switch:
-                # Never reselect a source merely because it downloads segments
-                # if its published TV playlist stopped advancing.
-                alternate = self._candidate(sources, exclude=selected if stalled else None)
-                if alternate is not None and (alternate != selected or current is None):
-                    self.source_slot = alternate
-                    self.source_stream = sources[alternate]
-                    self.last_upstream_seq = None
-                    self.last_switch = now
-                    self.switches += bool(self.history)
-                    self._publish_from(self.source_stream, now)
+            stalled = now - self.last_progress >= PUBLISH_STALL_SECONDS
+            can_switch = current is None or now - self.last_switch >= SWITCH_COOLDOWN
+            if can_switch and (not fresh or stalled):
+                for slot in self._alternates(sources):
+                    if self._publish_from(slot, sources[slot], now):
+                        break
+
+            # A stale provider can still have minutes of playable local video.
+            if not fresh and current is not None and current is self.source_stream:
+                self._publish_from(selected, current, now)
 
             if not self.history:
                 return None

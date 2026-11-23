@@ -1,18 +1,23 @@
 """Three-CDN VF pilot: no private URLs, no cross-account paths, no HLS mixing."""
 import json
+import threading
 import unittest
+from unittest.mock import patch
 
 from iptv_cdn_failover import FailoverMux, is_pilot
+from iptv_gateway import Gateway
 
 
 class FakeGateway:
     def __init__(self, label):
+        self.lock = threading.RLock()
+        self.cache_epoch = 0
         self.label = label
         self.fresh = True
         self.segments = [(100, 6.0), (101, 6.0), (102, 6.0)]
         self.payload = {seq: f"{label}-{seq}".encode() for seq, _ in self.segments}
 
-    def published(self):
+    def published(self, commit=True):
         return list(self.segments)
 
     def segment(self, seq, record_miss=False):
@@ -150,6 +155,80 @@ class MultiCdnTests(unittest.TestCase):
         self.assertIn(b"#EXT-X-MEDIA-SEQUENCE:4", manifest)
         self.assertEqual(mux.segment(4), b"fresh-103")
         self.assertNotIn(b"old-100", [value.content for value in mux.history])
+
+    def test_two_stalled_workers_cannot_republish_old_windows(self):
+        mux = FailoverMux()
+        a, b, c = [FakeStream(label) for label in ("A", "B", "C")]
+        sources = [(1, a), (2, b), (3, c)]
+        mux.playlist("tv", sources, now=100)
+        mux.playlist("tv", sources, now=120)
+        self.assertEqual(mux.source_slot, 2)
+        c.gateway.segments.append((103, 6.0))
+        c.gateway.payload[103] = b"C-103"
+        mux.playlist("tv", sources, now=140)
+        self.assertEqual(mux.source_slot, 3)
+        self.assertEqual(mux.history[-1].content, b"C-103")
+        # A recovered backup may return, but only its unseen video is added.
+        a.gateway.segments.append((103, 6.0))
+        a.gateway.payload[103] = b"A-103"
+        mux.playlist("tv", sources, now=160)
+        self.assertEqual(mux.source_slot, 1)
+        self.assertEqual(mux.next_sequence, 11)
+        self.assertEqual(mux.segment(10), b"A-103")
+        self.assertTrue(mux.history[-1].discontinuity)
+
+    def test_buffer_keeps_advancing_during_outage_without_backup(self):
+        mux = FailoverMux()
+        stream = FakeStream("primary")
+        gw = stream.gateway = Gateway("https://example.test/live", delay=90)
+        for sequence in range(100, 118):
+            gw.cache[sequence] = (6.0, str(sequence).encode())
+        gw.latest = 117
+        gw.last_progress = gw.last_segment_download = 100.0
+        with patch("time.time") as wall, patch("time.monotonic") as clock:
+            for now in range(100, 191, 6):
+                wall.return_value = clock.return_value = now
+                mux.playlist("tv", [(1, stream)], now=now)
+        self.assertFalse(mux.source_health[1]["fresh"])
+        self.assertEqual(mux.segment(18), b"117")
+
+    def test_idle_resume_tries_backup_in_same_poll_when_primary_repeats(self):
+        mux = FailoverMux()
+        a, b = FakeStream("A"), FakeStream("B")
+        mux.playlist("tv", [(1, a)], now=100)
+        manifest = mux.playlist("tv", [(1, a), (2, b)], now=160)
+        self.assertIsNotNone(manifest)
+        self.assertEqual(mux.source_slot, 2)
+        self.assertIsNone(mux.segment(1))
+        self.assertEqual(mux.segment(4), b"B-100")
+
+    def test_new_worker_in_stalled_slot_can_publish_overlapping_sequence(self):
+        mux = FailoverMux()
+        a, replacement = FakeStream("A"), FakeStream("replacement")
+        mux.playlist("tv", [(1, a)], now=100)
+        mux.playlist("tv", [(1, a)], now=120)
+        mux.playlist("tv", [(1, replacement)], now=121)
+        self.assertEqual(mux.segment(4), b"replacement-100")
+        self.assertTrue(mux.history[3].discontinuity)
+
+    def test_source_rotation_with_same_worker_and_sequence_starts_new_epoch(self):
+        mux = FailoverMux()
+        first, second = "https://a.example/live", "https://b.example/live"
+        stream = FakeStream("primary")
+        gateway = stream.gateway = Gateway(first, delay=0, source_refresher=lambda: second)
+        manifest = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:100\n" + "".join(
+            f"#EXTINF:6,\n{i}.ts\n" for i in range(100, 103))
+        for now, url, video in [(100, first, b"A"), (106, second, b"B")]:
+            if url == second:
+                self.assertTrue(gateway.refresh_source())
+            with patch("iptv_gateway.media_manifest", return_value=(manifest, url)), \
+                 patch("iptv_gateway.fetch_segment", return_value=video):
+                gateway.cycle()
+            mux.playlist("tv", [(1, stream)], now=now)
+        self.assertEqual(mux.segment(3), b"A")
+        self.assertEqual(mux.segment(4), b"B")
+        self.assertTrue(mux.history[3].discontinuity)
+        self.assertEqual(mux.switches, 0)
 
     def test_no_switch_when_backup_is_stale(self):
         mux = FailoverMux()
