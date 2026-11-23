@@ -150,7 +150,8 @@ class ProfileRegistry:
         """Serialize CDN placement decisions across users for stable capacity.
 
         The usage snapshot never counts inactive TV sessions. A healthy
-        home CDN always takes priority; fallback source has a two-TV cap.
+        home CDN always takes priority; each source may carry only one
+        guest TV, preserving space for its owner's own playback.
         """
         with self.lock:
             now = time.monotonic()
@@ -161,7 +162,7 @@ class ProfileRegistry:
                 with other.lock:
                     slot = other.source_slot
                     live = now - other.last_request < 45.0 and other.history
-                if slot is not None and live:
+                if slot is not None and live and slot != other.home_slot:
                     usage[slot] = usage.get(slot, 0) + 1
             return mux.playlist(token, candidates, now=now, usage=usage)
 
