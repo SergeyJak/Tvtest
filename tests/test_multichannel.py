@@ -403,6 +403,9 @@ class MultiChannelTests(unittest.TestCase):
         self.assertTrue(standby.gateway.stop.is_set())
         self.assertNotIn(first.id, self.manager.active)
         self.assertIsNone(self.manager.start(first.id, standby=True))
+        self.manager.idle_seconds = 90
+        real.accessed -= 25  # Past grace period but still within real-viewer TTL.
+        self.assertIsNone(self.manager.start(first.id, standby=True))
         # A direct request for the same channel promotes a standby to viewer.
         real.gateway.stop.set()
         self.manager.active.clear()
