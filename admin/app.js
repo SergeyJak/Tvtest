@@ -170,7 +170,80 @@
       target.append(row);
     });
   }
+  function renderCdnDiagnostics(data) {
+    const target = $("cdn-monitor-diagnostic");
+    target.replaceChildren();
+    const diag = data.multi_cdn_diagnostics;
+    const live = Array.isArray(data.multi_cdn) && data.multi_cdn.length > 0;
+    const tvStreams = Array.isArray(data.streams) ? data.streams : [];
+    const similarStreams = tvStreams.filter(stream => {
+      const label = String(stream.name || "").toLocaleLowerCase("ru-RU");
+      return label.includes("теория") && label.includes("взрыва");
+    });
+    let message = "";
+    let detail = "";
+    let state = "neutral";
+    if (!data.gateway_online) {
+      message = "Шлюз IPTV недоступен.";
+      detail = "Проверь iptv-gateway.service на VPS.";
+      state = "warn";
+    } else if (!diag) {
+      message = "Шлюз не отдаёт данные диагностики CDN.";
+      detail = "Возможны разные версии админки и IPTV-шлюза. Обнови код на VPS и перезапусти iptv-gateway.service.";
+      state = "warn";
+    } else if (!diag.enabled) {
+      message = "Эксперимент Multi-CDN отключён.";
+      detail = "На VPS существует .iptv_profiles/multicdn.disabled.";
+      state = "warn";
+    } else if (!diag.primary_channel_found) {
+      message = "«VF Теория большого взрыва» не найден в каталоге первого кабинета.";
+      detail = diag.possible_names?.length
+        ? "Похожие названия: " + diag.possible_names.join(", ") + ". Нужно сверить название пилотного канала."
+        : "Проверь M3U основного кабинета и наличие точного названия VF Теория большого взрыва.";
+      state = "warn";
+    } else if (!live) {
+      const other = similarStreams.find(stream => Number(stream.profile_slot) !== 1);
+      const primary = similarStreams.find(stream => Number(stream.profile_slot) === 1);
+      if (other) {
+        message = "Похоже, канал открыт через кабинет " + n(other.profile_slot) + ", а пилот работает только в основном.";
+        detail = "Включи «VF Теория большого взрыва» из M3U первого кабинета, чтобы проверить переключение трёх CDN.";
+      } else if (primary) {
+        message = "Основной канал запущен, но Multi-CDN пока не активировался.";
+        detail = "Проверь, что телевизор открывает актуальную ссылку /channel/.../index.m3u8 и шлюз обновлён.";
+      } else {
+        message = "Монитор ждёт запрос пилотного канала из первого кабинета.";
+        detail = "При просмотре другого канала или через другой кабинет эти показатели не заполняются.";
+      }
+    } else if (diag.cabins.filter(item => item.channel_found).length < 2) {
+      message = "Пилот запущен, но резервный канал найден менее чем в двух кабинетах.";
+      detail = "Проверь названия «VF Теория большого взрыва» в M3U оставшихся кабинетов.";
+      state = "warn";
+    } else {
+      message = "Multi-CDN активирован, данные о переключениях доступны.";
+      detail = "Источник и буфер обновляются при запросах плейлиста телевизором.";
+      state = "good";
+    }
+    target.classList.toggle("warn", state === "warn");
+    target.classList.toggle("good", state === "good");
+    target.append(element("strong", "", message));
+    target.append(element("p", "", detail));
+    if (diag?.cabins?.length) {
+      const list = element("div", "cdn-diagnostic-cabins");
+      diag.cabins.forEach(cabin => {
+        const label = !cabin.configured ? "Кабинет не настроен" :
+          !cabin.channel_found ? "Канал VF не найден" :
+          cabin.playing ? "Поток VF запущен" : "VF найден в каталоге";
+        const row = element("div", "cdn-diagnostic-cabin");
+        row.append(element("span", "", (cabin.name || "Кабинет " + cabin.slot) +
+                   " · " + label));
+        list.append(row);
+      });
+      target.append(list);
+    }
+  }
+
   function renderCdnMonitor(data) {
+    renderCdnDiagnostics(data);
     const active = Array.isArray(data.multi_cdn) && data.multi_cdn.length
       ? data.multi_cdn[0] : null;
     const streamLive = !!data.gateway_online && !!active
