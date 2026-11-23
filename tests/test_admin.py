@@ -196,6 +196,56 @@ class AdminTests(unittest.TestCase):
         self.assertNotIn(first_token, json.dumps(result))
         self.assertNotIn(second["token"], json.dumps(result))
 
+    def test_monitor_aggregates_three_independent_cdn_sessions(self):
+        tokens = {1: self.state.profiles.get(1)["token"]}
+        for slot, name in ((2, "Вадим"), (3, "Кристина")):
+            with patch("iptv_profiles.download_playlist", return_value=PLAYLIST):
+                row, _ = self.state.profiles.update(
+                    slot, name, f"https://provider.example/SECRET_{slot}")
+            tokens[slot] = row["token"]
+
+        def fake_status(slot):
+            return {
+                "channels": 2, "max_streams": 1,
+                "delay_seconds": 60, "streams": [],
+                "multi_cdn": [{
+                    "home_cabinet": slot,
+                    "selected_cabinet": slot,
+                    "switches": 0,
+                    "sources": [{"cabinet": slot, "fresh": True}],
+                }],
+                "multi_cdn_diagnostics": {
+                    "enabled": True, "home_cabinet": slot,
+                    "primary_channel_found": True, "cabins": [
+                        {"slot": other, "configured": True, "channel_found": True}
+                        for other in (1, 2, 3)],
+                },
+            }
+
+        class Response(io.BytesIO):
+            status = 200
+
+        def fake_open(url, timeout):
+            token = url.split("/")[3]
+            slot = next(slot for slot, own in tokens.items() if own == token)
+            return Response(json.dumps(fake_status(slot)).encode())
+
+        with patch("iptv_admin.urllib.request.urlopen", side_effect=fake_open):
+            data = self.state.gateway_status()
+        self.assertEqual({row["home_cabinet"] for row in data["multi_cdn"]},
+                         {1, 2, 3})
+        self.assertEqual({row["selected_cabinet"] for row in data["multi_cdn"]},
+                         {1, 2, 3})
+        self.assertEqual(data["multi_cdn_diagnostics_by_cabin"]["2"]["home_cabinet"], 2)
+        self.assertEqual(data["multi_cdn_diagnostics_by_cabin"]["3"]["cabins"][1]["name"],
+                         "Вадим")
+        self.assertNotIn("SECRET_", json.dumps(data))
+        for token in tokens.values():
+            self.assertNotIn(token, json.dumps(data))
+        with self.request("/admin/") as response:
+            page = response.read().decode()
+        self.assertIn('id="cdn-cabin-switch"', page)
+
     def test_cdn_monitor_html_is_auth_safe_and_api_exposes_switches(self):
         with self.request("/admin/") as response:
             page = response.read().decode()
