@@ -84,6 +84,7 @@ class ProfileRegistry:
                     opts["max_streams"] = self.options["max_streams"] if slot == 1 else 1
                     opts["telemetry"] = self.options.get("telemetry")
                     opts["profile_slot"] = slot
+                    opts["prefer_owner_tuning"] = True  # Dedicated TV per Edem cabinet.
                     manager = MultiGateway(channels, snapshot, row["source_url"], **opts)
                     self.managers[slot] = (row["revision"], manager)
                     thread = threading.Thread(target=manager.cleanup_loop,
