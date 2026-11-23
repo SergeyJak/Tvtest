@@ -224,8 +224,8 @@
       const list = element("div", "cdn-diagnostic-cabins");
       diag.cabins.forEach(cabin => {
         const label = !cabin.configured ? "Кабинет не настроен" :
-          !cabin.channel_found ? "Канал VF не найден" :
-          cabin.playing ? "Поток VF запущен" : "VF найден в каталоге";
+          !cabin.channel_found ? "Канал не найден" :
+          cabin.playing ? "Идёт просмотр" : "Канал доступен";
         const row = element("div", "cdn-diagnostic-cabin");
         row.append(element("span", "", (cabin.name || "Кабинет " + cabin.slot) +
                    " · " + label));
@@ -310,7 +310,7 @@
       selectedName ? "● Источник выбран" : "○ Прогрев",
       !data.gateway_online || delayed);
     text("cdn-monitor-selected", streamLive ? (selectedName || "Прогрев") : "—");
-    text("cdn-monitor-selected-sub", !active ? "Включи VF в выбранном кабинете" :
+    text("cdn-monitor-selected-sub", !active ? "Включи любой канал в выбранном кабинете" :
       !streamLive ? "Нет текущего просмотра" : "Источник сегментов для телевизора");
     text("cdn-monitor-progress", streamLive && progress != null ? duration(progress) : "—");
     text("cdn-monitor-cache", active && Number.isFinite(Number(active.cached_video_seconds))
@@ -386,7 +386,7 @@
     text("cdn-last-event", history.length ? "Событий: " + n(history.length) : "Нет событий");
     if (!active || !history.length) {
       events.append(element("div", "empty-state", !active
-        ? "История появится после первого просмотра пилотного канала."
+        ? "История появится после первого просмотра любого канала."
         : "Пока переключений не было."));
       return;
     }
