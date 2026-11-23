@@ -231,7 +231,7 @@ class AdminTests(unittest.TestCase):
             return Response(json.dumps(fake_status(slot)).encode())
 
         with patch("iptv_admin.urllib.request.urlopen", side_effect=fake_open):
-            data = self.state.gateway_status()
+            data = admin.AdminState.gateway_status(self.state)
         self.assertEqual({row["home_cabinet"] for row in data["multi_cdn"]},
                          {1, 2, 3})
         self.assertEqual({row["selected_cabinet"] for row in data["multi_cdn"]},
