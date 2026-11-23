@@ -1,6 +1,6 @@
-"""Pilot HLS CDN failover: one local virtual timeline, three existing TV profiles.
+"""Per-channel HLS CDN failover: one virtual timeline per TV and channel.
 
-Each TV cabinet has its own timeline for the explicitly matched pilot channel.
+Every on-demand channel uses its TV cabin's own upstream as the primary source.
 Each source is pulled by its own existing Gateway worker/cache; never splice
 upstream HLS sequence numbers, timestamps or provider URLs together.
 """
@@ -51,10 +51,13 @@ class FailoverMux:
     No attempt is made to align programme timestamps across separate CDNs.
     """
 
-    def __init__(self, home_slot: int = 1):
+    def __init__(self, home_slot: int = 1, *, channel_id: str | None = None,
+                 channel_name: str = "VF Теория большого взрыва"):
         if home_slot not in (1, 2, 3):
             raise ValueError("Unknown home cabin")
         self.home_slot = home_slot
+        self.channel_id = channel_id
+        self.channel_name = channel_name
         self.lock = threading.RLock()
         self.source_slot = None
         self.source_stream = None
@@ -289,7 +292,8 @@ class FailoverMux:
         with self.lock:
             return {
                 "enabled": True,
-                "channel": "VF Теория большого взрыва",
+                "channel": self.channel_name,
+                "channel_id": self.channel_id,
                 "home_cabinet": self.home_slot,
                 "selected_cabinet": self.source_slot,
                 "available_cabinets": list(self.slots_seen),
