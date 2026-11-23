@@ -212,6 +212,7 @@ class AdminTests(unittest.TestCase):
                     "home_cabinet": slot,
                     "selected_cabinet": slot,
                     "switches": 0,
+                    "seconds_since_last_probe": 2.0,
                     "sources": [{"cabinet": slot, "fresh": True}],
                 }],
                 "multi_cdn_diagnostics": {
@@ -236,6 +237,8 @@ class AdminTests(unittest.TestCase):
                          {1, 2, 3})
         self.assertEqual({row["selected_cabinet"] for row in data["multi_cdn"]},
                          {1, 2, 3})
+        self.assertEqual(data["multi_cdn"][0]["source_viewer_load"],
+                         {"1": 1, "2": 1, "3": 1})
         self.assertEqual(data["multi_cdn_diagnostics_by_cabin"]["2"]["home_cabinet"], 2)
         self.assertEqual(data["multi_cdn_diagnostics_by_cabin"]["3"]["cabins"][1]["name"],
                          "Вадим")
