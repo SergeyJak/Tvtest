@@ -4,7 +4,7 @@
   const fmt = new Intl.NumberFormat("ru-RU");
   const app = $("app");
   const loginScreen = $("login-screen");
-  const state = {overview: null, channels: [], epgStatus: "", page: 0, size: 50, lastCatalog: 0, view: "overview", busy: false, cdnHome: null};
+  const state = {overview: null, channels: [], epgStatus: "", page: 0, size: 50, lastCatalog: 0, view: "overview", busy: false, cdnHome: null, cdnChannelByHome: {}};
   const views = {overview:"ОБЗОР", cdn:"CDN-МОНИТОР", channels:"КАНАЛЫ", epg:"ТЕЛЕПРОГРАММА", tv:"КАБИНЕТЫ ТВ", history:"ПРОСМОТРЫ", incidents:"ОШИБКИ И ЗАВИСАНИЯ", system:"ДИАГНОСТИКА"};
 
   function text(id, value) {
@@ -151,9 +151,10 @@
     const pilots = Array.isArray(rows) ? rows : [];
     card.hidden = pilots.length === 0;
     if (!pilots.length) return;
-    const current = pilots.find(item => Number(item.home_cabinet) === state.cdnHome) ||
-      pilots.find(item => item.seconds_since_last_probe < 35) || pilots[0];
-    text("cdn-selected", current.selected_cabinet ? "Кабинет " + current.selected_cabinet : "Накопление буфера");
+    const current = [...pilots].sort((a,b) =>
+      Number(a.seconds_since_last_probe ?? 1e9) - Number(b.seconds_since_last_probe ?? 1e9))[0];
+    text("cdn-selected", (current.channel || "Канал") + ": " +
+      (current.selected_cabinet ? "Кабинет " + current.selected_cabinet : "Накопление буфера"));
     text("cdn-switches", n(current.switches || 0));
     const target = $("cdn-sources");
     target.replaceChildren();
@@ -178,10 +179,6 @@
       (home === 1 ? data.multi_cdn_diagnostics : null);
     const live = !!active;
     const tvStreams = Array.isArray(data.streams) ? data.streams : [];
-    const similarStreams = tvStreams.filter(stream => {
-      const label = String(stream.name || "").toLocaleLowerCase("ru-RU");
-      return label.includes("теория") && label.includes("взрыва");
-    });
     let message = "";
     let detail = "";
     let state = "neutral";
@@ -198,23 +195,21 @@
       detail = "На VPS существует .iptv_profiles/multicdn.disabled.";
       state = "warn";
     } else if (!diag.primary_channel_found) {
-      message = "«VF Теория большого взрыва» не найден в каталоге выбранного кабинета.";
-      detail = diag.possible_names?.length
-        ? "Похожие названия: " + diag.possible_names.join(", ") + ". Нужно сверить название пилотного канала."
-        : "Проверь M3U этого кабинета и наличие точного названия VF Теория большого взрыва.";
+      message = "Каталог выбранного кабинета пуст.";
+      detail = "Проверь M3U-ссылку и обновление списка каналов в этом кабинете.";
       state = "warn";
     } else if (!live) {
-      const own = similarStreams.find(stream => Number(stream.profile_slot) === home);
+      const own = tvStreams.find(stream => Number(stream.profile_slot) === home && !stream.standby);
       if (own) {
-        message = "Канал запущен, но Multi-CDN ещё не активировался для этого кабинета.";
+        message = "Есть активная трансляция, но её Multi-CDN ещё не активирован.";
         detail = "Проверь, что плеер открывает актуальную ссылку /channel/.../index.m3u8.";
       } else {
-        message = "Этот телевизор ещё не запрашивал пилотный канал.";
-        detail = "Включи «VF Теория большого взрыва» через ссылку M3U выбранного кабинета.";
+        message = "Этот телевизор пока не запрашивал канал.";
+        detail = "Включи любой канал через M3U своего кабинета.";
       }
-    } else if (diag.cabins.filter(item => item.channel_found).length < 2) {
-      message = "Пилот запущен, но резервный канал найден менее чем в двух кабинетах.";
-      detail = "Проверь названия «VF Теория большого взрыва» в M3U оставшихся кабинетов.";
+    } else if (active?.sources?.length < 2) {
+      message = "Сейчас у этого канала нет готового резерва.";
+      detail = "Другой кабинет не содержит точно совпадающего канала или его поток занят просмотром.";
       state = "warn";
     } else {
       message = "Multi-CDN активирован, данные о переключениях доступны.";
@@ -264,7 +259,35 @@
       }
       switcher.append(button);
     });
-    const active = rows.find(item => Number(item.home_cabinet) === state.cdnHome) || null;
+    const homeRows = rows.filter(item => Number(item.home_cabinet) === state.cdnHome)
+      .sort((a,b) => Number(a.seconds_since_last_probe ?? 1e9) -
+                      Number(b.seconds_since_last_probe ?? 1e9));
+    const selectedId = state.cdnChannelByHome[state.cdnHome];
+    const active = (selectedId && homeRows.find(item => item.channel_id === selectedId)) ||
+      homeRows[0] || null;
+    const picker = $("cdn-channel-select");
+    picker.replaceChildren();
+    if (!homeRows.length) {
+      const option = element("option", "", "Нет просмотренных каналов");
+      option.value = "";
+      picker.append(option);
+      picker.disabled = true;
+    } else {
+      picker.disabled = false;
+      homeRows.forEach(item => {
+        const option = element("option", "",
+          (item.seconds_since_last_probe < 35 ? "● " : "○ ") +
+          (item.channel || "Без названия"));
+        option.value = item.channel_id || "";
+        picker.append(option);
+      });
+      picker.value = active.channel_id || "";
+    }
+    text("cdn-channel-help", !active
+      ? "Начни просмотр любого канала в этом кабинете."
+      : active.seconds_since_last_probe < 35
+        ? "Сейчас смотрят: " + active.channel
+        : "Последний просмотр: " + active.channel + " (неактивен)");
     renderCdnDiagnostics(data, active, state.cdnHome);
     const streamLive = !!data.gateway_online && !!active
       && (active.seconds_since_last_probe === null
@@ -894,6 +917,10 @@
       renderCdnMonitor(state.overview);
       renderMultiCdn(state.overview.multi_cdn);
     }
+  });
+  $("cdn-channel-select").addEventListener("change", event => {
+    state.cdnChannelByHome[state.cdnHome] = event.target.value;
+    if (state.overview) renderCdnMonitor(state.overview);
   });
   $("refresh-button").addEventListener("click", () => refresh(true));
   $("profiles-container").addEventListener("click", event => {
