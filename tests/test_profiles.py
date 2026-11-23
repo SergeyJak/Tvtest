@@ -295,6 +295,54 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertEqual(self.legacy_token.read_text(), "stable-original-token-abcdef")
 
 
+    def test_cdn_diagnostics_explain_empty_monitor_before_pilot_activation(self):
+        owner_token = self.store.get(1)["token"]
+        diagnostics = self.registry.pilot_diagnostics(owner_token)
+        self.assertIsNotNone(diagnostics)
+        self.assertTrue(diagnostics["enabled"])
+        self.assertFalse(diagnostics["primary_channel_found"])
+        self.assertFalse(diagnostics["pilot_active"])
+        self.assertIsNone(self.registry.pilot_diagnostics("invalid-token"))
+
+        # A similarly named, but non-pilot channel must be visible as a
+        # diagnostic hint rather than silently opening extra CDN streams.
+        near_match = ("#EXTM3U\\n"
+                      "#EXTINF:-1,VF Теория большого взрыва HD\\n"
+                      "https://provider.example/PRIVATE_KEY\\n").replace("\\\\n", "\\n")
+        with patch("iptv_profiles.download_playlist", return_value=near_match):
+            self.store.update(1, "Основной", "https://provider.example/catalog")
+        self.registry.resolve(owner_token)
+        diagnostics = self.registry.pilot_diagnostics(owner_token)
+        self.assertFalse(diagnostics["primary_channel_found"])
+        self.assertEqual(diagnostics["possible_names"], ["VF Теория большого взрыва HD"])
+        with self.request(owner_token, "status") as response:
+            status = json.load(response)
+        self.assertIn("multi_cdn_diagnostics", status)
+        self.assertNotIn("PRIVATE_KEY", json.dumps(status))
+        self.assertNotIn("provider.example", json.dumps(status))
+        self.assertEqual(status["multi_cdn_diagnostics"]["possible_names"],
+                         ["VF Теория большого взрыва HD"])
+
+    def test_cdn_diagnostics_show_configured_pilot_without_active_viewer(self):
+        playlist = ("#EXTM3U\\n"
+                    "#EXTINF:-1,VF Теория большого взрыва\\n"
+                    "https://provider.example/SECRET_CDN\\n").replace("\\\\n", "\\n")
+        with patch("iptv_profiles.download_playlist", return_value=playlist):
+            self.store.update(1, "Основной", "https://provider.example/catalog")
+        owner_token = self.store.get(1)["token"]
+        self.registry.resolve(owner_token)
+        diagnostic = self.registry.pilot_diagnostics(owner_token)
+        self.assertTrue(diagnostic["primary_channel_found"])
+        self.assertFalse(diagnostic["pilot_active"])
+        self.assertFalse(diagnostic["cabins"][0]["playing"])
+        first_manager = self.registry.resolve(owner_token)[0]
+        channel = next(iter(first_manager.channels))
+        self.registry.failover_for(owner_token, channel)
+        diagnostic = self.registry.pilot_diagnostics(owner_token)
+        self.assertTrue(diagnostic["pilot_active"])
+        self.assertTrue(diagnostic["cabins"][0]["playing"])
+        self.assertNotIn("SECRET_CDN", json.dumps(diagnostic))
+
     def test_primary_vf_channel_uses_three_cdns_without_changing_tv_links(self):
         """Real HTTP path keeps one TV link and never exposes CDN URLs."""
         from collections import OrderedDict
