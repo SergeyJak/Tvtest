@@ -306,9 +306,9 @@ class ThreeCabinetTests(unittest.TestCase):
 
         # A similarly named, but non-pilot channel must be visible as a
         # diagnostic hint rather than silently opening extra CDN streams.
-        near_match = ("#EXTM3U\\n"
-                      "#EXTINF:-1,VF Теория большого взрыва HD\\n"
-                      "https://provider.example/PRIVATE_KEY\\n").replace("\\\\n", "\\n")
+        near_match = ("#EXTM3U\n"
+                      "#EXTINF:-1,VF Теория большого взрыва HD\n"
+                      "https://provider.example/PRIVATE_KEY\n")
         with patch("iptv_profiles.download_playlist", return_value=near_match):
             self.store.update(1, "Основной", "https://provider.example/catalog")
         self.registry.resolve(owner_token)
@@ -324,9 +324,9 @@ class ThreeCabinetTests(unittest.TestCase):
                          ["VF Теория большого взрыва HD"])
 
     def test_cdn_diagnostics_show_configured_pilot_without_active_viewer(self):
-        playlist = ("#EXTM3U\\n"
-                    "#EXTINF:-1,VF Теория большого взрыва\\n"
-                    "https://provider.example/SECRET_CDN\\n").replace("\\\\n", "\\n")
+        playlist = ("#EXTM3U\n"
+                    "#EXTINF:-1,VF Теория большого взрыва\n"
+                    "https://provider.example/SECRET_CDN\n")
         with patch("iptv_profiles.download_playlist", return_value=playlist):
             self.store.update(1, "Основной", "https://provider.example/catalog")
         owner_token = self.store.get(1)["token"]
