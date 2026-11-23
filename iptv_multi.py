@@ -440,7 +440,13 @@ def make_multi_handler(manager: MultiGateway, token: str,
             if route == ["epg.xml.gz"] and active_epg_file is not None:
                 return self.serve_epg(head, active_epg_file)
             if route == ["status"]:
-                return self.respond(200, request_manager.status(), "application/json", head)
+                data = json.loads(request_manager.status())
+                if profile_registry is not None:
+                    pilot = profile_registry.failover_status(active_token)
+                    if pilot is not None:
+                        data["multi_cdn"] = pilot
+                return self.respond(200, json.dumps(data, ensure_ascii=False).encode("utf-8"),
+                                    "application/json", head)
             if route == ["channels.m3u"]:
                 host = self.headers.get("Host", "")
                 if not re.fullmatch(r"[A-Za-z0-9.:\-\[\]]{1,255}", host):
@@ -471,6 +477,8 @@ def make_multi_handler(manager: MultiGateway, token: str,
             if cid not in request_manager.channels:
                 return self.respond(404, b"Unknown channel", "text/plain", head)
             if len(route) == 3 and resource == "index.m3u8":
+                pilot = (profile_registry.failover_for(active_token, cid)
+                         if profile_registry is not None else None)
                 stream = request_manager.start(cid)
                 if stream is None:
                     self.track_client_failure(cid, "STREAM_LIMIT", 503)
@@ -483,7 +491,8 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 with request_manager.lock:
                     stream.pending_requests += 1
                 try:
-                    raw = stream.gateway.playlist(active_token)
+                    raw = (pilot[0].playlist(active_token, pilot[1])
+                           if pilot else stream.gateway.playlist(active_token))
                     waited = False
                     deadline = time.monotonic() + request_manager.startup_wait
                     while raw is None and not request_manager.stop.is_set():
@@ -493,7 +502,8 @@ def make_multi_handler(manager: MultiGateway, token: str,
                         waited = True
                         if stream.gateway.stop.wait(min(0.25, remaining)):
                             break
-                        raw = stream.gateway.playlist(active_token)
+                        raw = (pilot[0].playlist(active_token, pilot[1])
+                               if pilot else stream.gateway.playlist(active_token))
                     with request_manager.lock:
                         if waited:
                             if raw is not None:
@@ -528,7 +538,12 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 if stream is None:
                     self.track_client_failure(cid, "STREAM_EXPIRED", 404)
                     return self.respond(404, b"Stream expired", "text/plain", head)
-                data = stream.gateway.segment(seq, record_miss=True)
+                pilot_mux = (profile_registry.existing_failover(active_token, cid)
+                             if profile_registry is not None else None)
+                if pilot_mux is not None:
+                    data = pilot_mux.segment(seq)
+                else:
+                    data = stream.gateway.segment(seq, record_miss=True)
                 if data is None:
                     self.track_client_failure(cid, "SEGMENT_CACHE_MISS", 404)
                     return self.respond(404, b"Segment not in cache", "text/plain", head)
