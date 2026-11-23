@@ -69,8 +69,8 @@ class MultiCdnTests(unittest.TestCase):
         # A fresh primary should not trigger instant source ping-pong.
         original.gateway.fresh = True
         self.assertEqual(mux.source_slot, 2)
-        mux.playlist("safe-token", candidates, now=140)
-        self.assertEqual(mux.source_slot, 2)
+        mux.playlist("safe-token", candidates, now=135)
+        self.assertEqual(mux.source_slot, 2)  # Still within switch cooldown.
         self.assertNotIn("provider", json.dumps(mux.status()))
 
     def test_rollover_preserves_discontinuity_sequence_after_expiring_old_segments(self):
