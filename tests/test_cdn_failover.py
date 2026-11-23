@@ -135,6 +135,22 @@ class MultiCdnTests(unittest.TestCase):
         self.assertEqual(mux.segment(old_last), b"new-video")
         self.assertNotIn(b"previous", new)
 
+    def test_idle_resume_with_same_worker_requires_a_new_source_segment(self):
+        mux = FailoverMux()
+        gateway = FakeStream("old")
+        mux.playlist("tv", [(1, gateway)], now=100)
+        self.assertEqual(mux.segment(1), b"old-100")
+        # Same worker remains nominally READY but still advertises 100..102.
+        self.assertIsNone(mux.playlist("tv", [(1, gateway)], now=160))
+        self.assertIsNone(mux.segment(1))
+        self.assertEqual(mux.next_sequence, 4)
+        gateway.gateway.segments.append((103, 6.0))
+        gateway.gateway.payload[103] = b"fresh-103"
+        manifest = mux.playlist("tv", [(1, gateway)], now=165)
+        self.assertIn(b"#EXT-X-MEDIA-SEQUENCE:4", manifest)
+        self.assertEqual(mux.segment(4), b"fresh-103")
+        self.assertNotIn(b"old-100", [value.content for value in mux.history])
+
     def test_no_switch_when_backup_is_stale(self):
         mux = FailoverMux()
         a = FakeStream("A")
