@@ -186,8 +186,11 @@ class ProfileRegistry:
                     continue
                 status = mux.status()
                 status["home_name"] = names.get(home, "Кабинет")
+                # The bearer TV token must not reveal other family members'
+                # cabinet names. Authenticated admin enriches names locally.
                 for source in status["sources"]:
-                    source["name"] = names.get(source["cabinet"], "Кабинет")
+                    if source["cabinet"] == home:
+                        source["name"] = names.get(home, "Кабинет")
                 result.append(status)
             return result
 
@@ -209,7 +212,7 @@ class ProfileRegistry:
                 route = self.routes.get(profile["token"])
                 manager = route[0] if route else None
                 if manager is None:
-                    cabins.append({"slot": slot, "name": profile["name"],
+                    cabins.append({"slot": slot, "name": profile["name"] if slot == home else f"Кабинет {slot}",
                                    "configured": False, "channel_found": False,
                                    "playing": False})
                     continue
@@ -227,7 +230,7 @@ class ProfileRegistry:
                         stream = manager.active.get(matched.id)
                 cabins.append({
                     "slot": slot,
-                    "name": profile["name"],
+                    "name": profile["name"] if slot == home else f"Кабинет {slot}",
                     "configured": True,
                     "channel_found": matched is not None,
                     "channel_name": matched.name if matched else None,
