@@ -18,7 +18,7 @@ MAX_VIRTUAL_BYTES = 64 * 1024 * 1024
 SWITCH_COOLDOWN = 18.0
 PUBLISH_STALL_SECONDS = 18.0
 SESSION_IDLE_SECONDS = 45.0
-MAX_VIEWERS_PER_SOURCE = 2  # Never concentrate three TV cabins on one CDN.
+MAX_GUESTS_PER_SOURCE = 1  # Reserve capacity for the source's owner.
 
 
 def is_pilot(name: str) -> bool:
@@ -96,7 +96,7 @@ class FailoverMux:
                     if stream is not self.source_stream
                     and self.source_health[slot]["fresh"]
                     and (slot == self.home_slot or
-                         usage.get(slot, 0) < MAX_VIEWERS_PER_SOURCE)]
+                         usage.get(slot, 0) < MAX_GUESTS_PER_SOURCE)]
         return sorted(eligible, key=lambda slot: (
             slot == self.home_slot,
             -usage.get(slot, 0),
