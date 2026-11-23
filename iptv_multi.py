@@ -513,7 +513,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 with request_manager.lock:
                     stream.pending_requests += 1
                 try:
-                    raw = (pilot[0].playlist(active_token, pilot[1])
+                    raw = (profile_registry.publish_failover(pilot[0], active_token, pilot[1])
                            if pilot else stream.gateway.playlist(active_token))
                     waited = False
                     deadline = time.monotonic() + request_manager.startup_wait
@@ -524,7 +524,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                         waited = True
                         if stream.gateway.stop.wait(min(0.25, remaining)):
                             break
-                        raw = (pilot[0].playlist(active_token, pilot[1])
+                        raw = (profile_registry.publish_failover(pilot[0], active_token, pilot[1])
                                if pilot else stream.gateway.playlist(active_token))
                     with request_manager.lock:
                         if waited:
