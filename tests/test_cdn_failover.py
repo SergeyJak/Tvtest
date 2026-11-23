@@ -85,12 +85,55 @@ class MultiCdnTests(unittest.TestCase):
         for last in range(103, 119):
             b.gateway.segments = [(last, 6.0)]
             b.gateway.payload[last] = f"B-{last}".encode()
-            text = mux.playlist("private", candidates, now=140 + last).decode()
+            text = mux.playlist("private", candidates, now=126 + 6 * (last - 103)).decode()
         self.assertEqual(mux.discontinuity_sequence, 1)
         self.assertIn("#EXT-X-DISCONTINUITY-SEQUENCE:1", text)
         self.assertNotIn("#EXT-X-DISCONTINUITY\n", text)
         self.assertIsNone(mux.segment(1))
         self.assertLessEqual(len(mux.history), 12)
+
+    def test_ready_downloader_but_frozen_tv_playlist_uses_healthy_backup(self):
+        """CDN still fetches new fragments while published TV HLS is stuck."""
+        mux = FailoverMux()
+        primary = FakeStream("primary")
+        backup = FakeStream("backup")
+        mux.playlist("tv-token", [(1, primary), (2, backup)], now=100)
+        self.assertEqual(mux.source_slot, 1)
+        # The provider download remains fresh but gateway.published()
+        # keeps offering segment 102, even after upstream reached 122.
+        primary.gateway.payload[122] = b"downloaded-not-published"
+        primary.gateway.fresh = True
+        primary.gateway.segments = [(100, 6.0), (101, 6.0), (102, 6.0)]
+        mux.playlist("tv-token", [(1, primary), (2, backup)], now=110)
+        self.assertEqual(mux.source_slot, 1)
+        new_manifest = mux.playlist("tv-token", [(1, primary), (2, backup)], now=120)
+        self.assertEqual(mux.source_slot, 2)
+        self.assertEqual(mux.last_progress, 120)
+        self.assertIn(b"#EXT-X-DISCONTINUITY", new_manifest)
+        self.assertEqual(mux.segment(4), b"backup-100")
+        self.assertEqual(mux.switches, 1)
+
+    def test_new_viewer_after_idle_never_gets_last_sessions_video(self):
+        mux = FailoverMux()
+        old = FakeStream("previous")
+        first = mux.playlist("tv-token", [(1, old)], now=100)
+        self.assertIn(b"#EXT-X-MEDIA-SEQUENCE:1", first)
+        old_last = mux.next_sequence
+        expired = FakeStream("new")
+        expired.gateway.fresh = False
+        # Both upstreams expired while no TV was polling the channel.
+        self.assertIsNone(mux.playlist("tv-token", [(1, expired)], now=160))
+        self.assertIsNone(mux.segment(1))
+        self.assertEqual(mux.next_sequence, old_last)
+        self.assertIsNone(mux.source_slot)
+        # Fresh video after warmup has the same TV token but never rewinds IDs.
+        expired.gateway.fresh = True
+        expired.gateway.segments = [(200, 6.0), (201, 6.0), (202, 6.0)]
+        expired.gateway.payload = {seq: b"new-video" for seq, _ in expired.gateway.segments}
+        new = mux.playlist("tv-token", [(1, expired)], now=165)
+        self.assertIn(f"#EXT-X-MEDIA-SEQUENCE:{old_last}".encode(), new)
+        self.assertEqual(mux.segment(old_last), b"new-video")
+        self.assertNotIn(b"previous", new)
 
     def test_no_switch_when_backup_is_stale(self):
         mux = FailoverMux()
