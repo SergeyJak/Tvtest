@@ -244,10 +244,27 @@ class AdminState:
         cabins = []
         multi_cdn = []
         multi_cdn_diagnostics = None
+        diagnostics_by_cabin = {}
+        names = {profile["slot"]: profile["name"] for profile in profiles}
         for profile, data in statuses:
-            if profile["slot"] == 1:
-                multi_cdn = data.get("multi_cdn") or []
-                multi_cdn_diagnostics = data.get("multi_cdn_diagnostics")
+            for item in data.get("multi_cdn") or []:
+                report = dict(item)
+                report["home_name"] = names.get(profile["slot"], "Кабинет")
+                report["sources"] = [
+                    dict(source, name=names.get(source.get("cabinet"), "Кабинет"))
+                    for source in item.get("sources") or []
+                ]
+                multi_cdn.append(report)
+            diagnostic = data.get("multi_cdn_diagnostics")
+            if isinstance(diagnostic, dict):
+                report = dict(diagnostic)
+                report["cabins"] = [
+                    dict(cabin, name=names.get(cabin.get("slot"), "Кабинет"))
+                    for cabin in diagnostic.get("cabins") or []
+                ]
+                diagnostics_by_cabin[str(profile["slot"])] = report
+                if profile["slot"] == 1:
+                    multi_cdn_diagnostics = report
             cabins.append({
                 "slot": profile["slot"], "name": profile["name"],
                 "active_streams": len(data.get("streams") or []),
@@ -270,6 +287,7 @@ class AdminState:
             "cabins": cabins,
             "multi_cdn": multi_cdn,
             "multi_cdn_diagnostics": multi_cdn_diagnostics,
+            "multi_cdn_diagnostics_by_cabin": diagnostics_by_cabin,
         }
 
     def login(self, password: str, peer: str) -> str | None:
@@ -338,6 +356,8 @@ class AdminState:
             "cabins": status.get("cabins", []) if status else [],
             "multi_cdn": status.get("multi_cdn", []) if status else [],
             "multi_cdn_diagnostics": status.get("multi_cdn_diagnostics") if status else None,
+            "multi_cdn_diagnostics_by_cabin": (
+                status.get("multi_cdn_diagnostics_by_cabin", {}) if status else {}),
             "channels": len(channels),
             "active_streams": len(active),
             "max_streams": status.get("max_streams") if status else None,
