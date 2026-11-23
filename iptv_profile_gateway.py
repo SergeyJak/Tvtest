@@ -138,9 +138,9 @@ class ProfileRegistry:
                 stream = manager.start(matching_id, standby=(slot != 1))
                 if stream is not None:
                     candidates.append((slot, stream))
-            if len(candidates) < 2 and cid not in self.failovers:
-                # Do not change the baseline route until a backup exists.
-                return None
+            # The primary TV URL must use virtual segment IDs from its
+            # FIRST manifest request, even if all backups are absent/busy.
+            # Turning failover on later must never change segment addressing.
             mux = self.failovers.setdefault(cid, FailoverMux())
             return mux, candidates
 
