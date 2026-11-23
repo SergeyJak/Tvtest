@@ -138,11 +138,17 @@ class ProfileRegistry:
                 stream = manager.start(matching_id)
                 if stream is not None:
                     candidates.append((slot, stream))
-            if len(candidates) < 2:
-                # No alternate source: fall back to the original video route.
+            if len(candidates) < 2 and cid not in self.failovers:
+                # Do not change the baseline route until a backup exists.
                 return None
             mux = self.failovers.setdefault(cid, FailoverMux())
             return mux, candidates
+
+    def existing_failover(self, token: str, cid: str):
+        """Only original cabinet may access previously published virtual segments."""
+        with self.lock:
+            row = self.store.get(1)
+            return self.failovers.get(cid) if token == row["token"] else None
 
     def failover_status(self, token: str):
         with self.lock:
