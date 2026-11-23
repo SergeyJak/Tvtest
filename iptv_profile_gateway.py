@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from iptv_profiles import ProfileStore
+from iptv_cdn_failover import FailoverMux, is_pilot
 
 
 class ProfileRegistry:
@@ -25,6 +26,7 @@ class ProfileRegistry:
         self.last_mtime = -1
         self.managers = {}  # slot -> (revision, manager)
         self.routes = {}
+        self.failovers = {}  # Channel ID => virtual HLS mux, primary cabin only.
         self.closed = False
         self.legacy_detached = False
         self._reload()
@@ -102,6 +104,52 @@ class ProfileRegistry:
         self._reload()
         with self.lock:
             return self.routes.get(token)
+
+    def failover_for(self, token: str, cid: str):
+        """Warm matching VF channel across three configured source accounts.
+
+        Only the original cabinet token can access the shared failover stream.
+        Alternative cabinet tokens never expose or consume each other's media
+        and a busy alternative is never evicted for this experiment.
+        """
+        if self.closed:
+            return None
+        with self.lock:
+            row = self.store.get(1)
+            if token != row["token"]:
+                return None
+            owner = self.routes.get(token)
+            if owner is None or cid not in owner[0].channels:
+                return None
+            if not is_pilot(owner[0].channels[cid].name):
+                return None
+            candidates = []
+            for slot in (1, 2, 3):
+                profile = self.store.get(slot)
+                route = self.routes.get(profile["token"])
+                if not route:
+                    continue
+                manager = route[0]
+                matching_id = next(
+                    (channel.id for channel in manager.channels.values()
+                     if is_pilot(channel.name)), None)
+                if matching_id is None:
+                    continue
+                stream = manager.start(matching_id)
+                if stream is not None:
+                    candidates.append((slot, stream))
+            if len(candidates) < 2:
+                # No alternate source: fall back to the original video route.
+                return None
+            mux = self.failovers.setdefault(cid, FailoverMux())
+            return mux, candidates
+
+    def failover_status(self, token: str):
+        with self.lock:
+            row = self.store.get(1)
+            if token != row["token"]:
+                return None
+            return [mux.status() for mux in self.failovers.values()]
 
     def close(self):
         with self.lock:
