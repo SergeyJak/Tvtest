@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 PILOT_NAME = "vf теория большого взрыва"
 WINDOW_SEGMENTS = 12
+MAX_VIRTUAL_BYTES = 64 * 1024 * 1024
 SWITCH_COOLDOWN = 18.0
 
 
@@ -45,6 +46,7 @@ class FailoverMux:
         self.next_sequence = 1
         self.history: list[VirtualSegment] = []
         self.discontinuity_sequence = 0
+        self.target_duration = 1
         self.switches = 0
         self.last_switch = 0.0
         self.last_progress = 0.0
@@ -88,8 +90,11 @@ class FailoverMux:
 
     def _append(self, sequence: int, duration: float, payload: bytes, *, discontinuity: bool):
         self.history.append(VirtualSegment(self.next_sequence, duration, payload, discontinuity))
+        self.target_duration = max(self.target_duration, math.ceil(duration))
         self.next_sequence += 1
-        while len(self.history) > WINDOW_SEGMENTS:
+        while (len(self.history) > WINDOW_SEGMENTS
+               or (len(self.history) > 3 and
+                   sum(len(item.content) for item in self.history) > MAX_VIRTUAL_BYTES)):
             removed = self.history.pop(0)
             if removed.discontinuity:
                 self.discontinuity_sequence += 1
@@ -155,7 +160,8 @@ class FailoverMux:
 
             if not self.history:
                 return None
-            target = max(1, math.ceil(max(row.duration for row in self.history)))
+            # HLS target duration must not fluctuate as older segments expire.
+            target = self.target_duration
             output = [
                 "#EXTM3U", "#EXT-X-VERSION:3",
                 f"#EXT-X-TARGETDURATION:{target}",
