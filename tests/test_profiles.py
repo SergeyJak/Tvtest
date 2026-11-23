@@ -475,6 +475,84 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertIsNot(muxes[2], muxes[3])
         self.assertNotIn("PRIVATE_", json.dumps(muxes[1].status()))
 
+    def test_every_channel_is_eligible_and_uses_matching_backup_only(self):
+        """A movie, news and UHD channel are equal citizens of failover."""
+        primary = ("#EXTM3U\n"
+                   "#EXTINF:-1,Первый канал UHD\nhttps://cdn1.example/uhd\n"
+                   "#EXTINF:-1,Кинокомедия HD\nhttps://cdn1.example/movies\n"
+                   "#EXTINF:-1,Channel Not Shared\nhttps://cdn1.example/unique\n")
+        second = ("#EXTM3U\n"
+                  "#EXTINF:-1,Первый канал UHD\nhttps://cdn2.example/uhd\n"
+                  "#EXTINF:-1,Кинокомедия HD\nhttps://cdn2.example/movies\n"
+                  "#EXTINF:-1,Channel Not Shared (not same show)\nhttps://cdn2.example/unique\n")
+        third = ("#EXTM3U\n"
+                 "#EXTINF:-1,Первый канал UHD\nhttps://cdn3.example/uhd\n"
+                 "#EXTINF:-1,Кинокомедия HD (SD)\nhttps://cdn3.example/movies\n")
+        for slot, playlist in enumerate((primary, second, third), start=1):
+            with patch("iptv_profiles.download_playlist", return_value=playlist):
+                self.store.update(slot, f"TV {slot}", f"https://provider.example/account{slot}")
+        token = self.store.get(1)["token"]
+        manager = self.registry.resolve(token)[0]
+        by_name = {channel.name: channel.id for channel in manager.channels.values()}
+
+        # All channels, not just VF, receive a private virtual HLS timeline.
+        for name in ("Первый канал UHD", "Кинокомедия HD", "Channel Not Shared"):
+            cid = by_name[name]
+            mux, candidate_streams = self.registry.failover_for(token, cid)
+            self.assertEqual(mux.channel_name, name)
+            self.assertEqual(mux.channel_id, cid)
+            self.assertEqual(mux.home_slot, 1)
+            self.assertIn(1, [slot for slot, _ in candidate_streams])
+        self.assertEqual(
+            self.registry._matching_channel_id(
+                self.registry.resolve(self.store.get(2)["token"])[0].channels,
+                manager.channels[by_name["Кинокомедия HD"]]),
+            by_name["Кинокомедия HD"])
+        self.assertIsNone(self.registry._matching_channel_id(
+            self.registry.resolve(self.store.get(3)["token"])[0].channels,
+            manager.channels[by_name["Кинокомедия HD"]]))
+        self.assertIsNone(self.registry._matching_channel_id(
+            self.registry.resolve(self.store.get(2)["token"])[0].channels,
+            manager.channels[by_name["Channel Not Shared"]]))
+        # No upstream URL leaves the status interface.
+        with self.request(token, "status") as response:
+            data = json.load(response)
+        self.assertEqual({row["channel"] for row in data["multi_cdn"]},
+                         {"Первый канал UHD", "Кинокомедия HD", "Channel Not Shared"})
+        self.assertNotIn("cdn1.example", json.dumps(data))
+
+    def test_duplicate_names_with_different_groups_never_select_random_backup(self):
+        from iptv_multi import channels_from_entries
+        source = channels_from_entries([
+            ("Кино", "HD", "https://example.org/1"),
+            ("Кино", "SD", "https://example.org/2"),
+        ])
+        target = source[0]
+        ambiguous = channels_from_entries([
+            ("Кино", "Other", "https://example.org/3"),
+            ("Кино", "Other", "https://example.org/4"),
+        ])
+        mapping = {channel.id: channel for channel in ambiguous}
+        self.assertIsNone(self.registry._matching_channel_id(mapping, target))
+        same = {channel.id: channel for channel in source}
+        self.assertEqual(self.registry._matching_channel_id(same, target), target.id)
+
+    def test_old_channel_mux_is_reclaimed_to_limit_cache_growth(self):
+        playlist = ("#EXTM3U\n"
+                    "#EXTINF:-1,News\nhttps://cdn.example/news\n"
+                    "#EXTINF:-1,Movies\nhttps://cdn.example/movies\n")
+        with patch("iptv_profiles.download_playlist", return_value=playlist):
+            self.store.update(1, "Основной", "https://provider.example/playlist")
+        token = self.store.get(1)["token"]
+        manager = self.registry.resolve(token)[0]
+        ids = list(manager.channels)
+        old_mux, _ = self.registry.failover_for(token, ids[0])
+        old_mux.last_request -= 100
+        new_mux, _ = self.registry.failover_for(token, ids[1])
+        self.assertIsNot(new_mux, old_mux)
+        self.assertIsNone(self.registry.existing_failover(token, ids[0]))
+        self.assertIs(self.registry.existing_failover(token, ids[1]), new_mux)
+
     def test_primary_vf_channel_uses_three_cdns_without_changing_tv_links(self):
         """Real HTTP path keeps one TV link and never exposes CDN URLs."""
         from collections import OrderedDict
