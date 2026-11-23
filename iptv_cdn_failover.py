@@ -1,16 +1,17 @@
-"""Pilot HLS CDN failover: one local virtual timeline, three existing TV profiles.
+"""Per-channel HLS CDN failover: one virtual timeline per TV and channel.
 
-Only the explicitly matched channel in the primary TV cabinet participates.
+Every on-demand channel uses its TV cabin's own upstream as the primary source.
 Each source is pulled by its own existing Gateway worker/cache; never splice
 upstream HLS sequence numbers, timestamps or provider URLs together.
 """
 from __future__ import annotations
 
 import math
+import secrets
 import threading
 import time
 from dataclasses import dataclass
-from weakref import WeakKeyDictionary
+from weakref import ReferenceType, WeakKeyDictionary, ref
 
 PILOT_NAME = "vf теория большого взрыва"
 WINDOW_SEGMENTS = 12
@@ -18,6 +19,7 @@ MAX_VIRTUAL_BYTES = 64 * 1024 * 1024
 SWITCH_COOLDOWN = 18.0
 PUBLISH_STALL_SECONDS = 18.0
 SESSION_IDLE_SECONDS = 45.0
+MAX_GUESTS_PER_SOURCE = 1  # Reserve capacity for the source's owner.
 
 
 def is_pilot(name: str) -> bool:
@@ -32,6 +34,15 @@ class VirtualSegment:
     discontinuity: bool
 
 
+@dataclass
+class HomeProgress:
+    worker: ReferenceType
+    epoch: int
+    sequence: int
+    since: float
+    last_advance: float
+
+
 class FailoverMux:
     """Emit monotonic virtual HLS sequences across complete source switches.
 
@@ -41,11 +52,19 @@ class FailoverMux:
     No attempt is made to align programme timestamps across separate CDNs.
     """
 
-    def __init__(self):
+    def __init__(self, home_slot: int = 1, *, channel_id: str | None = None,
+                 channel_name: str = "VF Теория большого взрыва", first_sequence: int = 1):
+        if home_slot not in (1, 2, 3):
+            raise ValueError("Unknown home cabin")
+        self.home_slot = home_slot
+        self.channel_id = channel_id
+        self.channel_name = channel_name
         self.lock = threading.RLock()
         self.source_slot = None
         self.source_stream = None
-        self.next_sequence = 1
+        self.home_progress = None
+        self.generation = secrets.token_hex(12)
+        self.next_sequence = first_sequence
         self.history: list[VirtualSegment] = []
         self.discontinuity_sequence = 0
         self.target_duration = 1
@@ -82,15 +101,50 @@ class FailoverMux:
             "slow_segments": data.get("slow_segments"),
         }
 
-    def _alternates(self, streams):
+    def _alternates(self, streams, usage: dict[int, int]):
+        """Prefer the viewer's own source, otherwise choose an underused backup.
+
+        A reserve already serving two TV cabins cannot attract a third,
+        even if it has more buffer or faster recent downloads.
+        """
         eligible = [slot for slot, stream in streams.items()
-                    if stream is not self.source_stream and self.source_health[slot]["fresh"]]
+                    if stream is not self.source_stream
+                    and self.source_health[slot]["fresh"]
+                    and (slot == self.home_slot or
+                         usage.get(slot, 0) < MAX_GUESTS_PER_SOURCE)]
         return sorted(eligible, key=lambda slot: (
-            self.source_slot is None and slot == 1,
+            slot == self.home_slot,
+            -usage.get(slot, 0),
             self.source_health[slot]["buffer_seconds"] or 0,
             -(self.source_health[slot]["age_seconds"] or 0),
             -slot
         ), reverse=True)
+
+    def _home_recovered(self, home, now: float) -> bool:
+        """Observe the playable edge without moving the home gateway's cursor."""
+        if (home is None or self.source_slot in (None, self.home_slot)
+                or not self.source_health[self.home_slot]["fresh"]):
+            self.home_progress = None
+            return False
+        with home.gateway.lock:
+            epoch = home.gateway.cache_epoch
+            window = home.gateway.published(commit=False)
+        if not window:
+            self.home_progress = None
+            return False
+
+        sequence = window[-1][0]
+        progress = self.home_progress
+        if (progress is None or home is not progress.worker() or epoch != progress.epoch
+                or sequence < progress.sequence
+                or now - progress.last_advance >= PUBLISH_STALL_SECONDS):
+            self.home_progress = HomeProgress(ref(home), epoch, sequence, now, now)
+            return False
+        if sequence == progress.sequence:
+            return False
+        progress.sequence = sequence
+        progress.last_advance = now
+        return now - progress.since >= SWITCH_COOLDOWN
 
     def _append(self, duration: float, payload: bytes, *, discontinuity: bool):
         self.history.append(VirtualSegment(self.next_sequence, duration, payload, discontinuity))
@@ -103,15 +157,18 @@ class FailoverMux:
             if removed.discontinuity:
                 self.discontinuity_sequence += 1
 
-    def _retire_history(self):
+    def restart_session(self, now: float):
         """Start a new viewing session without reusing stale video or sequence IDs."""
-        self.discontinuity_sequence += sum(segment.discontinuity for segment in self.history)
-        self.history.clear()
-        self.source_slot = None
-        self.source_stream = None
-        self.last_progress = 0.0
-        self.last_switch = 0.0
-        # next_sequence intentionally remains monotonic.
+        with self.lock:
+            self.discontinuity_sequence += sum(segment.discontinuity for segment in self.history)
+            self.history.clear()
+            self.source_slot = None
+            self.source_stream = None
+            self.home_progress = None
+            self.last_progress = 0.0
+            self.last_switch = 0.0
+            self.last_request = now
+            # Keep next_sequence and each worker's last published cursor.
 
     def _publish_from(self, slot, stream, now: float, *, reason: str = "START") -> bool:
         """Select a worker only when it contributes playable, unseen video."""
@@ -166,7 +223,8 @@ class FailoverMux:
         self.last_progress = now
         return True
 
-    def playlist(self, token: str, candidates: list[tuple[int, object]], *, now: float | None = None):
+    def playlist(self, token: str, candidates: list[tuple[int, object]], *,
+                 now: float | None = None, usage: dict[int, int] | None = None):
         """Emit one stable HLS timeline, failing over on *published* video stalls.
 
         A CDN can continue downloading while the TV-facing HLS playlist is
@@ -175,11 +233,12 @@ class FailoverMux:
         """
         now = time.monotonic() if now is None else now
         sources = {slot: stream for slot, stream in candidates}
+        usage = usage or {}
         with self.lock:
             if (self.history and now >= self.last_request
                     and now - self.last_request >= SESSION_IDLE_SECONDS):
                 # A stopped TV must not be served segments from the old session.
-                self._retire_history()
+                self.restart_session(now)
             self.last_request = now
             self.slots_seen = sorted(sources)
             self.source_health = {slot: self._health(stream) for slot, stream in sources.items()}
@@ -194,13 +253,17 @@ class FailoverMux:
 
             stalled = now - self.last_progress >= PUBLISH_STALL_SECONDS
             can_switch = current is None or now - self.last_switch >= SWITCH_COOLDOWN
+            home = sources.get(self.home_slot)
+            home_recovered = self._home_recovered(home, now)
             if can_switch and (not fresh or stalled):
                 reason = ("SOURCE_RESTARTED" if current is None and selected is not None else
                           "SOURCE_UNAVAILABLE" if not fresh else
                           "PUBLISH_STALL")
-                for slot in self._alternates(sources):
+                for slot in self._alternates(sources, usage):
                     if self._publish_from(slot, sources[slot], now, reason=reason):
                         break
+            elif can_switch and home_recovered:
+                self._publish_from(self.home_slot, home, now, reason="HOME_RECOVERED")
 
             # A stale provider can still have minutes of playable local video.
             if not fresh and current is not None and current is self.source_stream:
@@ -219,7 +282,7 @@ class FailoverMux:
                 if entry.discontinuity:
                     output.append("#EXT-X-DISCONTINUITY")
                 output.append(f"#EXTINF:{entry.duration:.3f},")
-                output.append(f"/{token}/segment/{entry.number}.ts")
+                output.append(f"/{token}/segment/{self.generation}.{entry.number}.ts")
             return ("\n".join(output) + "\n").encode("utf-8")
 
     def segment(self, sequence: int) -> bytes | None:
@@ -233,7 +296,9 @@ class FailoverMux:
         with self.lock:
             return {
                 "enabled": True,
-                "channel": "VF Теория большого взрыва",
+                "channel": self.channel_name,
+                "channel_id": self.channel_id,
+                "home_cabinet": self.home_slot,
                 "selected_cabinet": self.source_slot,
                 "available_cabinets": list(self.slots_seen),
                 "switches": self.switches,

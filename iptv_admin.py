@@ -61,34 +61,8 @@ def read_or_create_password(path: Path) -> str:
 
 
 def catalogue(playlist_file: Path) -> list[dict]:
-    """Read labels and M3U group-title while retaining the gateway's stable IDs.
-
-    The gateway currently ignores group-title when calculating IDs. Changing
-    that would break saved TV/EPG links, so the admin only uses it for display.
-    """
-    from urllib.parse import urlsplit
-
-    raw = playlist_file.read_text(encoding="utf-8-sig")
-    entries = channels_from_text(raw)
-    display_groups: list[str] = []
-    pending = False
-    group = ""
-    for source_line in raw.splitlines():
-        line = source_line.strip()
-        if line.startswith("#EXTINF:"):
-            pending = True
-            match = re.search(r'group-title\s*=\s*"([^"]*)"', line, flags=re.I)
-            group = match.group(1) if match else ""
-        elif line.startswith("#EXTGRP:") and pending:
-            group = line[len("#EXTGRP:"):].strip()
-        elif line and not line.startswith("#") and pending:
-            if urlsplit(line).scheme in ("http", "https"):
-                display_groups.append(group)
-            pending = False
-    return [
-        {"id": c.id, "name": c.name, "group": display_groups[index] or c.group}
-        for index, c in enumerate(entries)
-    ]
+    entries = channels_from_text(playlist_file.read_text(encoding="utf-8-sig"))
+    return [{"id": c.id, "name": c.name, "group": c.group} for c in entries]
 
 
 def scan_epg(path: Path) -> dict:
@@ -228,10 +202,19 @@ class AdminState:
                 continue
             try:
                 url = f"http://127.0.0.1:{self.gateway_port}/{token}/status"
-                with urllib.request.urlopen(url, timeout=1.5) as response:
+                if not statuses:
+                    url += "?scope=cabinets"
+                request = urllib.request.Request(url)
+                request.add_unredirected_header("Authorization", "Bearer " + self.profiles.monitor_token)
+                with urllib.request.urlopen(request, timeout=1.5) as response:
                     if response.status != 200:
                         continue
-                    item = json.loads(response.read(2 * 1024 * 1024))
+                    item = json.loads(response.read(8 * 1024 * 1024))
+                    if isinstance(item, dict) and "cabinet_statuses" in item:
+                        snapshot = item["cabinet_statuses"]
+                        statuses = [(p, snapshot[str(p["slot"])]) for p in profiles
+                                    if str(p["slot"]) in snapshot]
+                        break
                     if isinstance(item, dict):
                         statuses.append((profile, item))
             except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError):
@@ -244,10 +227,31 @@ class AdminState:
         cabins = []
         multi_cdn = []
         multi_cdn_diagnostics = None
+        diagnostics_by_cabin = {}
+        playing_by_slot = {}
+        names = {profile["slot"]: profile["name"] for profile in profiles}
         for profile, data in statuses:
-            if profile["slot"] == 1:
-                multi_cdn = data.get("multi_cdn") or []
-                multi_cdn_diagnostics = data.get("multi_cdn_diagnostics")
+            for item in data.get("multi_cdn") or []:
+                report = dict(item)
+                report["home_name"] = names.get(profile["slot"], "Кабинет")
+                report["sources"] = [
+                    dict(source, name=names.get(source.get("cabinet"), "Кабинет"))
+                    for source in item.get("sources") or []
+                ]
+                multi_cdn.append(report)
+            diagnostic = data.get("multi_cdn_diagnostics")
+            if isinstance(diagnostic, dict):
+                report = dict(diagnostic)
+                report["cabins"] = [
+                    dict(cabin, name=names.get(cabin.get("slot"), "Кабинет"))
+                    for cabin in diagnostic.get("cabins") or []
+                ]
+                for cabin in report["cabins"]:
+                    if cabin["slot"] == profile["slot"] and "playing" in cabin:
+                        playing_by_slot[profile["slot"]] = cabin["playing"]
+                diagnostics_by_cabin[str(profile["slot"])] = report
+                if profile["slot"] == 1:
+                    multi_cdn_diagnostics = report
             cabins.append({
                 "slot": profile["slot"], "name": profile["name"],
                 "active_streams": len(data.get("streams") or []),
@@ -257,6 +261,23 @@ class AdminState:
                 # Gateways are trusted, but expose only labels and known metrics.
                 streams.append(dict(stream, profile_slot=profile["slot"],
                                     profile_name=profile["name"]))
+        # Each TV reports its own activity. Join the authenticated profiles here.
+        for diagnostic in diagnostics_by_cabin.values():
+            for cabin in diagnostic["cabins"]:
+                if cabin["slot"] in playing_by_slot:
+                    cabin["playing"] = playing_by_slot[cabin["slot"]]
+        # Number of active TV cabins currently routed through each source.
+        # This exposes distribution to the authenticated administrator,
+        # not through any family's public TV playlist token.
+        viewer_load = {str(slot): 0 for slot in (1, 2, 3)}
+        for report in multi_cdn:
+            slot = report.get("selected_cabinet")
+            age = report.get("seconds_since_last_probe")
+            if (report.get("tuned", True) and slot in (1, 2, 3)
+                    and isinstance(age, (int, float)) and 0 <= age < 35):
+                viewer_load[str(slot)] += 1
+        for report in multi_cdn:
+            report.setdefault("source_viewer_load", viewer_load)
         return {
             "channels": total("channels"),
             "active_streams": len(streams),
@@ -270,6 +291,7 @@ class AdminState:
             "cabins": cabins,
             "multi_cdn": multi_cdn,
             "multi_cdn_diagnostics": multi_cdn_diagnostics,
+            "multi_cdn_diagnostics_by_cabin": diagnostics_by_cabin,
         }
 
     def login(self, password: str, peer: str) -> str | None:
@@ -322,6 +344,8 @@ class AdminState:
                     "profile_slot": stream.get("profile_slot"),
                     "ready": bool(stream.get("ready")),
                     "pinned": bool(stream.get("pinned")),
+                    "standby": bool(stream.get("standby")),
+                    "viewers": stream.get("viewers", []),
                     "stalled": bool(stream.get("upstream_stalled")),
                     "buffer_state": stream.get("buffer_state"),
                     "cached_mib": stream.get("cached_mib"),
@@ -338,6 +362,8 @@ class AdminState:
             "cabins": status.get("cabins", []) if status else [],
             "multi_cdn": status.get("multi_cdn", []) if status else [],
             "multi_cdn_diagnostics": status.get("multi_cdn_diagnostics") if status else None,
+            "multi_cdn_diagnostics_by_cabin": (
+                status.get("multi_cdn_diagnostics_by_cabin", {}) if status else {}),
             "channels": len(channels),
             "active_streams": len(active),
             "max_streams": status.get("max_streams") if status else None,

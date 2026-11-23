@@ -170,11 +170,13 @@ class ProfileStore:
 
     def _init_profiles(self) -> None:
         with self._locked():
-            if not self.path.exists():
-                atomic_private_write(self.path, json.dumps(self._default(), ensure_ascii=False))
-            else:
-                # Do not regenerate or rotate tokens when code is deployed.
-                self._read()
+            data = self._read() if self.path.exists() else self._default()
+            if "monitor_token" not in data:
+                data["monitor_token"] = secrets.token_urlsafe(32)
+                atomic_private_write(self.path, json.dumps(data, ensure_ascii=False))
+            self.monitor_token = data["monitor_token"]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", self.monitor_token):
+                raise ProfileError("Некорректный ключ мониторинга")
 
     def _read(self) -> dict:
         if self.path.is_symlink() or self.path.stat().st_mode & 0o077:

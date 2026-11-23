@@ -39,11 +39,146 @@ class FakeStream:
 
 
 class MultiCdnTests(unittest.TestCase):
+    def test_soak_three_tvs_and_overlapping_cdn_outages(self):
+        """Simulate 12 minutes of HLS polling with two overlapping CDN failures.
+
+        Real provider traffic and TV decoders are out of scope. Validate that
+        each viewer keeps a monotonic HLS timeline, no CDN gets two guests,
+        the home source remains preferred, and healthy homes are reclaimed.
+        """
+        sources = {slot: FakeStream(f"CDN-{slot}") for slot in (1, 2, 3)}
+        viewers = {home: FailoverMux(home_slot=home, channel_name=f"TV-{home}")
+                   for home in (1, 2, 3)}
+        last_sequence = {home: 0 for home in viewers}
+        out_count = {home: 0 for home in viewers}
+        for step in range(121):
+            now = 100 + step * 6
+            down = ({1} if 20 <= step < 35 else set()) | (
+                {2} if 24 <= step < 39 else set())
+            for slot, stream in sources.items():
+                gateway = stream.gateway
+                gateway.fresh = slot not in down
+                if gateway.fresh and step:
+                    seq = 102 + step
+                    gateway.segments.append((seq, 6.0))
+                    gateway.payload[seq] = f"{slot}-{seq}".encode()
+                    gateway.segments = gateway.segments[-25:]
+
+            # Mirrors the registry's serial placement decision: only guests
+            # count toward MAX_GUESTS_PER_SOURCE, owners reserve their place.
+            for home, mux in viewers.items():
+                usage = {}
+                for other_home, other in viewers.items():
+                    if other_home == home:
+                        continue
+                    if other.source_slot not in (None, other_home):
+                        usage[other.source_slot] = usage.get(other.source_slot, 0) + 1
+                manifest = mux.playlist(
+                    f"viewer-{home}", list(sources.items()), now=now, usage=usage)
+                self.assertIsNotNone(manifest, f"viewer {home}, tick {step}")
+                self.assertLessEqual(len(mux.history), 12)
+                self.assertNotIn(b"https://", manifest)
+                if mux.history[-1].number > last_sequence[home]:
+                    last_sequence[home] = mux.history[-1].number
+                    out_count[home] += 1
+
+            selected = [mux.source_slot for mux in viewers.values()]
+            self.assertLessEqual(max(selected.count(slot) for slot in sources), 2,
+                                 f"Three TVs collapsed onto one CDN at tick {step}")
+            for slot in sources:
+                self.assertLessEqual(sum(
+                    viewer.source_slot == slot and home != slot
+                    for home, viewer in viewers.items()), 1)
+            if step < 20 or step >= 45:
+                # No intermittent failure: after 18s verified recovery,
+                # all viewers should be back on their own subscription.
+                if step >= 45:
+                    self.assertEqual(selected, [1, 2, 3])
+            for home, mux in viewers.items():
+                if step < 20:
+                    self.assertEqual(mux.source_slot, home)
+        self.assertEqual([mux.source_slot for mux in viewers.values()], [1, 2, 3])
+        self.assertTrue(all(mux.switches >= 2 for home, mux in viewers.items()
+                            if home in (1, 2)))
+        self.assertTrue(all(count >= 90 for count in out_count.values()))
+
     def test_pilot_is_exact_and_case_insensitive(self):
         self.assertTrue(is_pilot("  VF  Теория большого взрыва  "))
         self.assertFalse(is_pilot("Теория большого взрыва"))
         self.assertFalse(is_pilot("VF Теория большого взрыва 2"))
         self.assertFalse(is_pilot("VF Кинокомедия HD"))
+
+    def test_each_cabin_prefers_its_own_cdn_even_if_backup_has_more_buffer(self):
+        for home_slot in (1, 2, 3):
+            mux = FailoverMux(home_slot=home_slot)
+            sources = [(slot, FakeStream("CDN-" + str(slot))) for slot in (1, 2, 3)]
+            sources[(home_slot % 3)][1].gateway.status = lambda: json.dumps({
+                "ready": True, "upstream_stalled": False,
+                "seconds_since_segment_download": 0.1,
+                "effective_buffer_delay_seconds": 90.0,
+                "contiguous_tail_seconds": 180.0,
+                "errors": 0, "slow_segments": 0,
+            }).encode()
+            mux.playlist("owner-token", sources, now=100)
+            self.assertEqual(mux.source_slot, home_slot)
+            self.assertEqual(mux.home_slot, home_slot)
+            self.assertEqual(mux.switches, 0)
+
+    def test_one_guest_per_source_blocks_collapsing_three_viewers(self):
+        mux = FailoverMux(home_slot=1)
+        home = FakeStream("owner")
+        two = FakeStream("two")
+        three = FakeStream("three")
+        home.gateway.fresh = False
+        mux.playlist("tv", [(1, home), (2, two), (3, three)],
+                     now=100, usage={2: 1, 3: 0})
+        self.assertEqual(mux.source_slot, 3, "The occupied CDN cannot take another guest")
+        self.assertEqual(mux.segment(1), b"three-100")
+        # When every backup is already carrying another guest, it is safer
+        # to keep buffering than to move three users onto a single account.
+        mux2 = FailoverMux(home_slot=1)
+        self.assertIsNone(mux2.playlist("tv", [(1, home), (2, two), (3, three)],
+                                         now=100, usage={2: 1, 3: 1}))
+        self.assertIsNone(mux2.source_slot)
+
+    def test_warming_home_reclaims_viewer_after_sustained_playable_progress(self):
+        mux = FailoverMux(home_slot=2)
+        backup, home = FakeStream("backup"), FakeStream("home")
+        sources = [(1, backup), (2, home)]
+        home.gateway.fresh = False
+        mux.playlist("tv", sources, now=100)
+        self.assertEqual(mux.source_slot, 1)
+        home.gateway.fresh = True
+        for step in range(1, 10):
+            seq = 102 + step
+            backup.gateway.segments.append((seq, 6.0))
+            backup.gateway.payload[seq] = b"backup"
+            # Fresh download status alone cannot establish home recovery.
+            if step > 5:
+                home.gateway.segments.append((seq, 6.0))
+                home.gateway.payload[seq] = b"home"
+            mux.playlist("tv", sources, now=100 + 6 * step)
+            if step <= 5:
+                self.assertEqual(mux.source_slot, 1)
+        self.assertEqual(mux.source_slot, 2)
+        self.assertEqual(mux.switches, 1)
+        self.assertEqual(mux.switch_events[-1]["reason"], "HOME_RECOVERED")
+        self.assertEqual(mux.history[-1].content, b"home")
+
+    def test_good_owner_is_sticky_not_switched_for_faster_backup(self):
+        mux = FailoverMux(home_slot=2)
+        sources = [(slot, FakeStream("CDN-" + str(slot))) for slot in (1, 2, 3)]
+        mux.playlist("tv", sources, now=100)
+        self.assertEqual(mux.source_slot, 2)
+        sources[1][1].gateway.fresh = True
+        sources[0][1].gateway.segments.append((103, 6.0))
+        sources[0][1].gateway.payload[103] = b"fast-new-103"
+        sources[1][1].gateway.segments.append((103, 6.0))
+        sources[1][1].gateway.payload[103] = b"own-new-103"
+        mux.playlist("tv", sources, now=112)
+        self.assertEqual(mux.source_slot, 2)
+        self.assertEqual(mux.switches, 0)
+        self.assertEqual(mux.history[-1].content, b"own-new-103")
 
     def test_failover_keeps_monotonic_sequence_and_discontinuity(self):
         mux = FailoverMux()
@@ -53,7 +188,7 @@ class MultiCdnTests(unittest.TestCase):
         candidates = [(1, original), (2, backup), (3, third)]
         playlist = mux.playlist("safe-token", candidates, now=100).decode()
         self.assertIn("#EXT-X-MEDIA-SEQUENCE:1", playlist)
-        self.assertIn("/safe-token/segment/1.ts", playlist)
+        self.assertIn(f"/safe-token/segment/{mux.generation}.1.ts", playlist)
         self.assertNotIn("#EXT-X-DISCONTINUITY\n", playlist)
         self.assertEqual(mux.source_slot, 1)
         self.assertEqual(mux.segment(1), b"CDN-1-100")
@@ -66,7 +201,7 @@ class MultiCdnTests(unittest.TestCase):
         self.assertEqual(mux.source_slot, 2)
         self.assertEqual(mux.switches, 1)
         self.assertIn("#EXT-X-DISCONTINUITY\n", swapped)
-        self.assertIn("/safe-token/segment/4.ts", swapped)
+        self.assertIn(f"/safe-token/segment/{mux.generation}.4.ts", swapped)
         self.assertEqual(mux.segment(1), b"CDN-1-100")
         self.assertEqual(mux.segment(4), b"CDN-2-100")
         self.assertEqual(mux.segment(6), b"CDN-2-102")
