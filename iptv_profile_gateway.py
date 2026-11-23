@@ -166,6 +166,57 @@ class ProfileRegistry:
                 result.append(status)
             return result
 
+    def pilot_diagnostics(self, token: str):
+        """Safe explanation of why the VF multi-CDN mux is not active.
+
+        Read already loaded catalogues and workers, never fetch remote M3U,
+        start a stream, or return provider URLs, tokens, IPs or viewer data.
+        """
+        with self.lock:
+            owner = self.store.get(1)
+            if token != owner["token"]:
+                return None
+            disabled = (self.store.directory / "multicdn.disabled").exists()
+            cabins = []
+            possible_names = []
+            for slot in (1, 2, 3):
+                profile = self.store.get(slot)
+                route = self.routes.get(profile["token"])
+                manager = route[0] if route else None
+                if manager is None:
+                    cabins.append({"slot": slot, "name": profile["name"],
+                                   "configured": False, "channel_found": False,
+                                   "playing": False})
+                    continue
+                matched = next((channel for channel in manager.channels.values()
+                                if is_pilot(channel.name)), None)
+                if slot == 1 and not matched:
+                    possible_names = [
+                        channel.name[:100] for channel in manager.channels.values()
+                        if "теория" in channel.name.casefold()
+                        and "взрыва" in channel.name.casefold()
+                    ][:4]
+                stream = None
+                if matched:
+                    with manager.lock:
+                        stream = manager.active.get(matched.id)
+                cabins.append({
+                    "slot": slot,
+                    "name": profile["name"],
+                    "configured": True,
+                    "channel_found": matched is not None,
+                    "channel_name": matched.name if matched else None,
+                    "playing": bool(stream and not stream.standby),
+                })
+            mux_active = bool(self.failovers)
+            return {
+                "enabled": not disabled,
+                "pilot_active": mux_active,
+                "primary_channel_found": cabins[0]["channel_found"],
+                "possible_names": possible_names,
+                "cabins": cabins,
+            }
+
     def close(self):
         with self.lock:
             self.closed = True
