@@ -108,9 +108,11 @@ class MultiGateway:
                  max_streams: int = 3, idle_seconds: float = 90,
                  startup_wait: float = 18, switch_grace: float = 20,
                  startup_reserve: float = 30, telemetry: Telemetry | None = None,
-                 profile_slot: int = 1, require_startup_reserve: bool = False):
+                 profile_slot: int = 1, require_startup_reserve: bool = False,
+                 prefer_owner_tuning: bool = False):
         self.telemetry = telemetry
         self.profile_slot = profile_slot
+        self.prefer_owner_tuning = prefer_owner_tuning
         self.channels = {c.id: c for c in channels}
         self.order = [c.id for c in channels]
         self.path = playlist_path
@@ -201,7 +203,8 @@ class MultiGateway:
                 now = time.monotonic()
                 stale = [(sid, item) for sid, item in self.active.items()
                          if not item.pinned and item.pending_requests == 0
-                         and now - item.accessed >= self.switch_grace]
+                         and (self.prefer_owner_tuning or
+                              now - item.accessed >= self.switch_grace)]
                 if stale:
                     oldest_id, oldest = min(stale, key=lambda row: row[1].accessed)
                     oldest.close()
