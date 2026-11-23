@@ -210,5 +210,65 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertEqual(self.legacy_token.read_text(), "stable-original-token-abcdef")
 
 
+    def test_primary_vf_channel_uses_three_cdns_without_changing_tv_links(self):
+        """Real HTTP path keeps one TV link and never exposes CDN URLs."""
+        from collections import OrderedDict
+        for slot in (1, 2, 3):
+            playlist = ("#EXTM3U\n"
+                        "#EXTINF:-1 group-title=\"VF\",VF Теория большого взрыва\n"
+                        f"https://cdn{slot}.example/PRIVATE_{slot}/index.m3u8\n")
+            with patch("iptv_profiles.download_playlist", return_value=playlist):
+                row, changed = self.store.update(
+                    slot, f"CDN-{slot}", f"https://provider{slot}.example/M3U_KEY_{slot}")
+            self.assertTrue(changed)
+        owner_token = self.store.get(1)["token"]
+        backup_token = self.store.get(2)["token"]
+        manager = self.registry.resolve(owner_token)[0]
+        cid = next(iter(manager.channels))
+        self.assertIsNone(self.registry.failover_for(backup_token, cid))
+        pilot = self.registry.failover_for(owner_token, cid)
+        self.assertIsNotNone(pilot)
+        mux, candidates = pilot
+        self.assertEqual([slot for slot, _ in candidates], [1, 2, 3])
+        for slot, stream in candidates:
+            gateway = stream.gateway
+            now = time.time()
+            with gateway.lock:
+                gateway.cache = OrderedDict(
+                    (i, (6.0, f"VIDEO_CDN_{slot}_{i}".encode()))
+                    for i in range(100, 106))
+                gateway.latest = 105
+                gateway.target = 6.0
+                gateway.last_progress = now
+                gateway.last_segment_download = now
+                gateway._fast_start_at = time.monotonic() - 2
+        with self.request(owner_token, f"channel/{cid}/index.m3u8") as response:
+            first_manifest = response.read().decode()
+        self.assertIn(f"/{owner_token}/channel/{cid}/segment/1.ts", first_manifest)
+        self.assertNotIn("PRIVATE_1", first_manifest)
+        self.assertNotIn("M3U_KEY_1", first_manifest)
+        with self.request(owner_token, f"channel/{cid}/segment/1.ts") as response:
+            self.assertEqual(response.read(), b"VIDEO_CDN_1_100")
+        self.assertEqual(mux.source_slot, 1)
+        # Trigger a source stall and verify a stable virtual media sequence.
+        with candidates[0][1].gateway.lock:
+            candidates[0][1].gateway.last_progress -= 90
+            candidates[0][1].gateway.last_segment_download -= 90
+        mux.last_switch = time.monotonic() - 25
+        with self.request(owner_token, f"channel/{cid}/index.m3u8") as response:
+            next_manifest = response.read().decode()
+        self.assertIn("#EXT-X-DISCONTINUITY", next_manifest)
+        self.assertIn(f"/{owner_token}/channel/{cid}/segment/4.ts", next_manifest)
+        with self.request(owner_token, f"channel/{cid}/segment/4.ts") as response:
+            self.assertEqual(response.read(), b"VIDEO_CDN_2_100")
+        self.assertEqual(mux.source_slot, 2)
+        with self.request(owner_token, "status") as response:
+            live = json.load(response)
+        self.assertEqual(live["multi_cdn"][0]["selected_cabinet"], 2)
+        self.assertEqual(live["multi_cdn"][0]["switches"], 1)
+        self.assertNotIn("PRIVATE_", json.dumps(live))
+        self.assertNotIn("M3U_KEY_", json.dumps(live))
+
+
 if __name__ == "__main__":
     unittest.main()
