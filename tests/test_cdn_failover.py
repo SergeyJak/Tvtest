@@ -39,6 +39,69 @@ class FakeStream:
 
 
 class MultiCdnTests(unittest.TestCase):
+    def test_soak_three_tvs_and_overlapping_cdn_outages(self):
+        """Simulate 12 minutes of HLS polling with two overlapping CDN failures.
+
+        Real provider traffic and TV decoders are out of scope. Validate that
+        each viewer keeps a monotonic HLS timeline, no CDN gets two guests,
+        the home source remains preferred, and healthy homes are reclaimed.
+        """
+        sources = {slot: FakeStream(f"CDN-{slot}") for slot in (1, 2, 3)}
+        viewers = {home: FailoverMux(home_slot=home, channel_name=f"TV-{home}")
+                   for home in (1, 2, 3)}
+        last_sequence = {home: 0 for home in viewers}
+        out_count = {home: 0 for home in viewers}
+        for step in range(121):
+            now = 100 + step * 6
+            down = ({1} if 20 <= step < 35 else set()) | (
+                {2} if 24 <= step < 39 else set())
+            for slot, stream in sources.items():
+                gateway = stream.gateway
+                gateway.fresh = slot not in down
+                if gateway.fresh and step:
+                    seq = 102 + step
+                    gateway.segments.append((seq, 6.0))
+                    gateway.payload[seq] = f"{slot}-{seq}".encode()
+                    gateway.segments = gateway.segments[-25:]
+
+            # Mirrors the registry's serial placement decision: only guests
+            # count toward MAX_GUESTS_PER_SOURCE, owners reserve their place.
+            for home, mux in viewers.items():
+                usage = {}
+                for other_home, other in viewers.items():
+                    if other_home == home:
+                        continue
+                    if other.source_slot not in (None, other_home):
+                        usage[other.source_slot] = usage.get(other.source_slot, 0) + 1
+                manifest = mux.playlist(
+                    f"viewer-{home}", list(sources.items()), now=now, usage=usage)
+                self.assertIsNotNone(manifest, f"viewer {home}, tick {step}")
+                self.assertLessEqual(len(mux.history), 12)
+                self.assertNotIn(b"https://", manifest)
+                if mux.history[-1].number > last_sequence[home]:
+                    last_sequence[home] = mux.history[-1].number
+                    out_count[home] += 1
+
+            selected = [mux.source_slot for mux in viewers.values()]
+            self.assertLessEqual(max(selected.count(slot) for slot in sources), 2,
+                                 f"Three TVs collapsed onto one CDN at tick {step}")
+            for slot in sources:
+                self.assertLessEqual(sum(
+                    viewer.source_slot == slot and home != slot
+                    for home, viewer in viewers.items()), 1)
+            if step < 20 or step >= 45:
+                # No intermittent failure: after 18s verified recovery,
+                # all viewers should be back on their own subscription.
+                if step >= 45:
+                    self.assertEqual(selected, [1, 2, 3])
+            for home, mux in viewers.items():
+                if step < 20:
+                    self.assertEqual(mux.source_slot, home)
+        self.assertEqual([mux.source_slot for mux in viewers.values()], [1, 2, 3])
+        self.assertTrue(all(mux.switches >= 2 for home, mux in viewers.items()
+                            if home in (1, 2)))
+        self.assertTrue(all(count >= 90 for count in out_count.values()))
+
     def test_pilot_is_exact_and_case_insensitive(self):
         self.assertTrue(is_pilot("  VF  Теория большого взрыва  "))
         self.assertFalse(is_pilot("Теория большого взрыва"))
