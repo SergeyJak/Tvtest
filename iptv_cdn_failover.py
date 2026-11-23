@@ -18,6 +18,7 @@ MAX_VIRTUAL_BYTES = 64 * 1024 * 1024
 SWITCH_COOLDOWN = 18.0
 PUBLISH_STALL_SECONDS = 18.0
 SESSION_IDLE_SECONDS = 45.0
+MAX_VIEWERS_PER_SOURCE = 2  # Never concentrate three TV cabins on one CDN.
 
 
 def is_pilot(name: str) -> bool:
@@ -41,7 +42,10 @@ class FailoverMux:
     No attempt is made to align programme timestamps across separate CDNs.
     """
 
-    def __init__(self):
+    def __init__(self, home_slot: int = 1):
+        if home_slot not in (1, 2, 3):
+            raise ValueError("Unknown home cabin")
+        self.home_slot = home_slot
         self.lock = threading.RLock()
         self.source_slot = None
         self.source_stream = None
@@ -82,11 +86,20 @@ class FailoverMux:
             "slow_segments": data.get("slow_segments"),
         }
 
-    def _alternates(self, streams):
+    def _alternates(self, streams, usage: dict[int, int]):
+        """Prefer the viewer's own source, otherwise choose an underused backup.
+
+        A reserve already serving two TV cabins cannot attract a third,
+        even if it has more buffer or faster recent downloads.
+        """
         eligible = [slot for slot, stream in streams.items()
-                    if stream is not self.source_stream and self.source_health[slot]["fresh"]]
+                    if stream is not self.source_stream
+                    and self.source_health[slot]["fresh"]
+                    and (slot == self.home_slot or
+                         usage.get(slot, 0) < MAX_VIEWERS_PER_SOURCE)]
         return sorted(eligible, key=lambda slot: (
-            self.source_slot is None and slot == 1,
+            slot == self.home_slot,
+            -usage.get(slot, 0),
             self.source_health[slot]["buffer_seconds"] or 0,
             -(self.source_health[slot]["age_seconds"] or 0),
             -slot
@@ -166,7 +179,8 @@ class FailoverMux:
         self.last_progress = now
         return True
 
-    def playlist(self, token: str, candidates: list[tuple[int, object]], *, now: float | None = None):
+    def playlist(self, token: str, candidates: list[tuple[int, object]], *,
+                 now: float | None = None, usage: dict[int, int] | None = None):
         """Emit one stable HLS timeline, failing over on *published* video stalls.
 
         A CDN can continue downloading while the TV-facing HLS playlist is
@@ -175,6 +189,7 @@ class FailoverMux:
         """
         now = time.monotonic() if now is None else now
         sources = {slot: stream for slot, stream in candidates}
+        usage = usage or {}
         with self.lock:
             if (self.history and now >= self.last_request
                     and now - self.last_request >= SESSION_IDLE_SECONDS):
@@ -198,7 +213,7 @@ class FailoverMux:
                 reason = ("SOURCE_RESTARTED" if current is None and selected is not None else
                           "SOURCE_UNAVAILABLE" if not fresh else
                           "PUBLISH_STALL")
-                for slot in self._alternates(sources):
+                for slot in self._alternates(sources, usage):
                     if self._publish_from(slot, sources[slot], now, reason=reason):
                         break
 
@@ -234,6 +249,7 @@ class FailoverMux:
             return {
                 "enabled": True,
                 "channel": "VF Теория большого взрыва",
+                "home_cabinet": self.home_slot,
                 "selected_cabinet": self.source_slot,
                 "available_cabinets": list(self.slots_seen),
                 "switches": self.switches,
