@@ -177,6 +177,45 @@ class MultiCdnTests(unittest.TestCase):
         self.assertEqual(mux.segment(10), b"A-103")
         self.assertTrue(mux.history[-1].discontinuity)
 
+    def test_cdn_monitor_shows_switch_reason_liveness_and_no_secrets(self):
+        mux = FailoverMux()
+        first = FakeStream("primary")
+        backup = FakeStream("backup")
+        manifest = mux.playlist("SECRET_TV_TOKEN", [(1, first), (2, backup)], now=100)
+        self.assertIsNotNone(manifest)
+        first.gateway.fresh = False
+        mux.playlist("SECRET_TV_TOKEN", [(1, first), (2, backup)], now=120)
+        data = mux.status()
+        self.assertEqual(data["selected_cabinet"], 2)
+        self.assertEqual(data["switches"], 1)
+        self.assertEqual(data["virtual_segment_sequence"], 6)
+        self.assertEqual(data["cached_video_seconds"], 36.0)
+        self.assertEqual(data["switch_history"][0]["reason"], "SOURCE_UNAVAILABLE")
+        self.assertEqual(data["switch_history"][0]["from_cabinet"], 1)
+        self.assertEqual(data["switch_history"][0]["to_cabinet"], 2)
+        self.assertEqual(data["switch_history"][1]["reason"], "START")
+        self.assertIn("published_age_seconds", data["sources"][0])
+        self.assertIn("downloaded_sequence", data["sources"][0])
+        self.assertNotIn("SECRET_TV_TOKEN", json.dumps(data))
+        self.assertNotIn("provider", json.dumps(data))
+
+    def test_cdn_monitor_event_log_is_bounded(self):
+        mux = FailoverMux()
+        a, b = FakeStream("A"), FakeStream("B")
+        sources = [(1, a), (2, b)]
+        mux.playlist("tv", sources, now=100)
+        for n in range(25):
+            current = a if n % 2 else b
+            current.gateway.segments.append((103+n, 6.0))
+            current.gateway.payload[103+n] = b"fresh-video"
+            # The current source is frozen but an alternate keeps advancing.
+            mux.last_progress -= 30
+            mux.last_switch -= 30
+            mux.playlist("tv", sources, now=120+n*20)
+        status = mux.status()
+        self.assertLessEqual(len(status["switch_history"]), 20)
+        self.assertEqual(len(status["switch_history"]), 20)
+
     def test_buffer_keeps_advancing_during_outage_without_backup(self):
         mux = FailoverMux()
         stream = FakeStream("primary")
