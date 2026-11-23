@@ -164,3 +164,19 @@ td{padding:13px 23px;border-top:1px solid #233044;color:#95a7bd;font-size:12px}t
 .resource-cabin strong{font-variant-numeric:tabular-nums;white-space:nowrap}
 @media(max-width:1050px){.resource-grid{grid-template-columns:1fr}}
 @media(max-width:600px){.resource-panel{padding:19px 17px}.resource-refresh{font-size:10px}.resource-foot{flex-direction:column;gap:8px}}
+
+
+/* Three-CDN pilot: source status is read-only and never displays provider URLs. */
+.cdn-panel{margin-top:18px;padding:22px 24px}
+.cdn-panel .panel-heading{margin-bottom:12px}
+.cdn-summary{display:flex;gap:20px;flex-wrap:wrap;margin:14px 0;color:var(--muted);font-size:13px}
+.cdn-summary strong{color:#f0f6ff;font-variant-numeric:tabular-nums}
+.cdn-sources{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:11px;margin-top:16px}
+.cdn-source{min-width:0;background:#192536;border:1px solid #29384b;border-radius:11px;display:flex;flex-direction:column;gap:9px;padding:15px}
+.cdn-source strong{font-size:13px;color:#f0f5ff}
+.cdn-source-note{font-size:11px;color:var(--muted);line-height:1.5}
+.cdn-selected-label{font-size:9px;color:var(--accent);letter-spacing:1px;vertical-align:1px}
+.cdn-health{font-size:11px;color:#9fadc1}
+.cdn-health.good{color:#73e7d0}.cdn-health.warn{color:#e8b96a}
+@media(max-width:950px){.cdn-sources{grid-template-columns:1fr}}
+@media(max-width:600px){.cdn-panel{padding:18px}}
