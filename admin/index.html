@@ -194,7 +194,8 @@
         <section class="view" id="view-history" hidden>
           <div class="view-heading">
             <div><div class="eyebrow">VIEWING ANALYTICS</div><h1>История просмотров<span class="accent">.</span></h1><p>Какие каналы запрашивались и приблизительное время просмотра.</p></div>
-            <select id="history-days" aria-label="Период истории просмотров"><option value="1">За 24 часа</option><option value="7" selected>За 7 дней</option><option value="30">За 30 дней</option></select>
+            <div class="period-controls"><label>Кабинет <select id="history-slot"><option value="1">Основной</option><option value="0">Все кабинеты</option></select></label>
+            <select id="history-days" aria-label="Период истории просмотров"><option value="1">За 24 часа</option><option value="7" selected>За 7 дней</option><option value="30">За 30 дней</option></select></div>
           </div>
           <div class="notice" id="history-notice">Сведения основаны на запросах HLS-сегментов. Время приблизительное и может отличаться от фактического просмотра.</div>
           <div class="metrics history-metrics">
@@ -203,14 +204,33 @@
             <article class="metric"><div class="metric-top">Каналы <span>▤</span></div><div class="metric-number" id="history-channels">—</div><div class="metric-caption">За выбранный период</div></article>
             <article class="metric"><div class="metric-top">Запись данных <span>●</span></div><div class="metric-number metric-word" id="history-recording">—</div><div class="metric-caption">Текущий сбор событий шлюза</div></article>
           </div>
+          <section id="history-events" class="panel history-events" aria-labelledby="history-event-title" hidden>
+            <div class="panel-heading"><h2 id="history-event-title" tabindex="-1">События просмотра</h2>
+              <button class="text-link" id="history-event-close" type="button">Закрыть</button></div>
+            <p id="history-event-scope" class="resource-note"></p>
+            <div id="history-event-list" aria-live="polite"></div>
+            <div class="history-event-pages" hidden id="history-event-pages">
+              <button id="history-event-prev" type="button">Назад</button>
+              <span id="history-event-page"></span>
+              <button id="history-event-next" type="button">Далее</button>
+            </div>
+          </section>
           <div class="dashboard-grid">
             <article class="panel panel-main">
               <div class="panel-heading"><div><div class="eyebrow">TOP CHANNELS</div><h2>По времени просмотра</h2></div></div>
               <div id="history-ranking" class="history-ranking"><div class="empty-state">Загрузка истории…</div></div>
+              <div class="history-event-pages" id="history-rank-pages" hidden>
+                <button id="history-rank-prev" type="button">Назад</button><span id="history-rank-page"></span>
+                <button id="history-rank-next" type="button">Далее</button>
+              </div>
             </article>
             <article class="panel">
               <div class="panel-heading"><div><div class="eyebrow">RECENT ACTIVITY</div><h2>Последние подключения</h2></div></div>
               <div id="history-recent" class="history-recent"><div class="empty-state">Загрузка истории…</div></div>
+              <div class="history-event-pages" id="history-recent-pages" hidden>
+                <button id="history-recent-prev" type="button">Назад</button><span id="history-recent-page"></span>
+                <button id="history-recent-next" type="button">Далее</button>
+              </div>
             </article>
           </div>
           <p class="section-footnote">Время рассчитывается по запросам видеофрагментов, с паузами и ограничением интервала между запросами. Данные не восстанавливаются задним числом и автоматически удаляются спустя 30 дней.</p>

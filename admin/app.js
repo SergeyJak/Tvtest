@@ -44,6 +44,10 @@
     state.channels = [];
     $("profiles-container").replaceChildren();
     app.hidden = true;
+    historyPages.rank = historyPages.recent = 0;
+    historyRequest++;
+    historySelection = null;
+    $("history-events").hidden = true;
     loginScreen.hidden = false;
     $("password").value = "";
     $("password").focus();
@@ -765,12 +769,94 @@
     setTimeout(() => { if (button.isConnected) button.textContent = original; }, 1800);
   }
 
+  let historyRequest = 0;
+  let historySelection = null;
+  const historyPages = {rank: 0, recent: 0};
+
+  function resetHistorySelection() {
+    historySelection = null;
+    $("history-events").hidden = true;
+    $("history-rank-pages").hidden = $("history-recent-pages").hidden = true;
+    text("history-ranking", "Загрузка истории…");
+    $("history-recent").replaceChildren();
+    for (const id of ["history-total-time", "history-sessions", "history-channels"]) text(id, "—");
+    loadHistory();
+  }
+
+  function eventControl(row, cabin) {
+    if (!row.event_count) return element("span", "activity-sub", "Событий нет");
+    const button = element("button", "history-event-link", "События · " + n(row.event_count));
+    button.type = "button";
+    button.setAttribute("aria-label", "События · " + cabin + " · " + row.channel_name +
+      (row.id ? " · " + localTime(row.started_at) : ""));
+    button.addEventListener("click", () => {
+      historySelection = {channel: row.channel_id, session: row.id || 0, page: 0,
+        title: cabin + " · " + row.channel_name,
+        scope: row.id ? "Сеанс " + localTime(row.started_at) + " — " + localTime(row.last_seen)
+                      : "Все сеансы за выбранный период"};
+      $("history-events").hidden = false;
+      text("history-event-title", historySelection.title);
+      text("history-event-scope", historySelection.scope);
+      text("history-event-list", "Загрузка событий…");
+      $("history-event-pages").hidden = true;
+      $("history-event-title").focus();
+      loadHistory();
+    });
+    return button;
+  }
+
+  function renderHistoryEvents(data) {
+    const list = $("history-event-list");
+    const selection = historySelection;
+    if (!selection) return;
+    const page = data.event_page;
+    list.replaceChildren();
+    const scope = page?.interval ? "Сеанс " + localTime(page.interval.started_at) + " — " + localTime(page.interval.last_seen) : selection.scope;
+    text("history-event-scope", scope + " · Записи канала между первым и последним запросами видео.");
+    if (!page || !page.rows.length) {
+      list.append(element("p", "empty-state", page ? "На этой странице событий нет." : "Журнал недоступен."));
+    }
+    for (const event of page?.rows || []) {
+      const item = element("div", "history-event-row");
+      const kind = incidentLabels[event.kind] || [event.kind, "neutral"];
+      item.append(element("time", "", new Date(event.occurred_at * 1000).toLocaleString("ru-RU")),
+        element("span", "incident-type " + kind[1], kind[0]),
+        element("span", "incident-details", event.detail || "—"),
+        element("span", "", event.duration_seconds == null ? "" : duration(event.duration_seconds)));
+      list.append(item);
+    }
+    $("history-event-pages").hidden = !selection.page && !page?.more;
+    $("history-event-prev").disabled = selection.page === 0;
+    $("history-event-next").disabled = !page?.more;
+    text("history-event-page", "Страница " + (selection.page + 1));
+  }
+
   async function loadHistory() {
     const days = $("history-days").value;
+    const slot = $("history-slot").value;
+    const request = ++historyRequest;
+    const params = new URLSearchParams({days, slot, rank_page: historyPages.rank, recent_page: historyPages.recent});
+    if (historySelection) {
+      for (const key of ["channel", "session", "page"]) params.set(key, historySelection[key]);
+    }
     const ranking = $("history-ranking");
     const recent = $("history-recent");
     try {
-      const data = await api("history?days=" + encodeURIComponent(days));
+      const data = await api("history?" + params);
+      if (request !== historyRequest || app.hidden) return;
+      const cabins = new Map(data.cabins.map(cabin => [cabin.slot, cabin.name]));
+      const selector = $("history-slot");
+      selector.replaceChildren(new Option("Все кабинеты", "0"),
+        ...data.cabins.map(cabin => new Option(cabin.name, String(cabin.slot))));
+      selector.value = slot;
+      for (const [list, size, total] of [["rank", 20, data.unique_channels], ["recent", 12, data.total_sessions]]) {
+        const index = historyPages[list];
+        $("history-" + list + "-pages").hidden = index === 0 && total <= size;
+        $("history-" + list + "-prev").disabled = index === 0;
+        $("history-" + list + "-next").disabled = (index + 1) * size >= total;
+        text("history-" + list + "-page", "Страница " + (index + 1));
+      }
+      renderHistoryEvents(data);
       text("history-total-time", duration(data.total_seconds));
       text("history-sessions", n(data.total_sessions));
       text("history-channels", n(data.unique_channels));
@@ -784,15 +870,17 @@
       const longest = Math.max(1, ...data.channels.map(row => row.seconds));
       data.channels.slice(0, 20).forEach((row, i) => {
         const wrapper = element("div", "rank-row");
-        wrapper.append(element("span", "rank-number", String(i + 1).padStart(2, "0")));
+        wrapper.append(element("span", "rank-number", String(i + 1 + historyPages.rank * 20).padStart(2, "0")));
         const info = element("div", "");
+        const cabin = cabins.get(row.slot);
         info.append(element("div", "rank-title", row.channel_name));
+        if (slot === "0") info.append(element("div", "activity-sub", cabin));
         info.append(element("div", "rank-sub", n(row.sessions) + " сессий · Последний запрос " + localTime(row.last_seen)));
         const track = element("div", "rank-progress");
         const bar = document.createElement("div");
         bar.style.width = Math.max(2, Math.round(row.seconds / longest * 100)) + "%";
         track.append(bar);
-        info.append(track);
+        info.append(track, eventControl(row, cabin));
         wrapper.append(info);
         wrapper.append(element("div", "rank-duration", duration(row.seconds)));
         ranking.append(wrapper);
@@ -806,10 +894,17 @@
         node.append(heading);
         node.append(element("div", "activity-sub", localTime(row.started_at) + " → " +
           localTime(row.last_seen) + " · Устройство " + row.viewer.slice(0, 6)));
+        if (slot === "0") node.append(element("div", "activity-sub", cabins.get(row.slot)));
+        node.append(eventControl(row, cabins.get(row.slot)));
         recent.append(node);
       });
     } catch (error) {
-      if (app.hidden) return;
+      if (request !== historyRequest || app.hidden) return;
+      if (historySelection) {
+        text("history-event-list", "Не удалось загрузить события.");
+        $("history-event-pages").hidden = true;
+      }
+      for (const id of ["history-total-time", "history-sessions", "history-channels", "history-recording"]) text(id, "—");
       ranking.replaceChildren(element("div", "empty-state", "Не удалось получить историю просмотров."));
       recent.replaceChildren();
     }
@@ -975,7 +1070,34 @@
     const button = event.target.closest("button[data-copy]");
     if (button) copyTvLink(button);
   });
-  $("history-days").addEventListener("change", loadHistory);
+  for (const id of ["history-days", "history-slot"]) {
+    $(id).addEventListener("change", () => {
+      historyPages.rank = historyPages.recent = 0;
+      resetHistorySelection();
+    });
+  }
+  for (const list of ["rank", "recent"]) {
+    for (const [direction, step] of [["prev", -1], ["next", 1]]) {
+      $("history-" + list + "-" + direction).addEventListener("click", () => {
+        historyPages[list] += step;
+        $("history-" + list + "-prev").disabled = $("history-" + list + "-next").disabled = true;
+        resetHistorySelection();
+      });
+    }
+  }
+  $("history-event-close").addEventListener("click", () => {
+    resetHistorySelection();
+    $("history-slot").focus();
+  });
+  for (const [id, step] of [["history-event-prev", -1], ["history-event-next", 1]]) {
+    $(id).addEventListener("click", () => {
+      if (!historySelection) return;
+      historySelection.page += step;
+      $("history-event-prev").disabled = $("history-event-next").disabled = true;
+      text("history-event-list", "Загрузка событий…");
+      loadHistory();
+    });
+  }
   $("incident-days").addEventListener("change", loadIncidents);
   $("incident-filter").addEventListener("change", loadIncidents);
   $("incident-refresh").addEventListener("click", loadIncidents);

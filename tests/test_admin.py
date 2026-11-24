@@ -328,6 +328,43 @@ class AdminTests(unittest.TestCase):
         self.assertEqual(profiles[0]["m3u"], data["m3u"])
         self.assertNotEqual(profiles[0]["m3u"], profiles[1]["m3u"])
 
+    def test_history_filters_before_ranking_and_links_events_to_the_watched_interval(self):
+        with patch("iptv_profiles.download_playlist", return_value=PLAYLIST):
+            self.state.profiles.update(2, "Вадим", "https://provider.example/list")
+        first = admin.channels_from_text(PLAYLIST)[0].id
+        second = "p2:" + first
+        store = Telemetry(self.state.telemetry_db)
+        self.addCleanup(store.close)
+        now = int(time.time()) - 90
+        for cid, viewer, start, end in ((first, "home", 0, 30), (second, "tv", 0, 20),
+                                        (second, "other", 10, 30)):
+            store.observe_segment(cid, viewer, now + start)
+            store.observe_segment(cid, viewer, now + end)
+        for cid, offset, detail in ((second, -1, "BEFORE"), (second, 10, "SHARED"),
+                                    (second, 30, "END"), (second, 31, "AFTER"),
+                                    (first, 12, "DIFFERENT_CABINET")):
+            store.incident(cid, "client_error", detail, timestamp=now + offset)
+        store.flush()
+        self.login().close()
+        path = "/admin/api/history?slot=2&channel=" + second
+        with self.request(path) as response:
+            data = json.load(response)
+        row, = data["channels"]
+        self.assertEqual((row["slot"], row["channel_name"], row["event_count"]), (2, "Россия 24 HD", 2))
+        self.assertEqual(data["total_sessions"], 2)
+        self.assertEqual(data["total_seconds"], 40)
+        self.assertEqual([e["detail"] for e in data["event_page"]["rows"]], ["END", "SHARED"])
+        self.assertNotIn("provider.example", json.dumps(data))
+        session = next(s for s in data["sessions"] if s["viewer"] == "tv")
+        self.assertEqual(session["event_count"], 1)
+        with self.request(path + "&session=" + str(session["id"])) as response:
+            self.assertEqual([e["detail"] for e in json.load(response)["event_page"]["rows"]], ["SHARED"])
+        with self.request("/admin/api/history?slot=1") as response:
+            self.assertEqual(json.load(response)["channels"][0]["event_count"], 1)
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            self.request("/admin/api/history?slot=3&channel=" + second)
+        self.assertEqual(denied.exception.code, 400)
+
     def test_new_private_history_and_incident_endpoints(self):
         # The two pages require the same independent admin session.
         for path in ("/admin/api/history?days=7", "/admin/api/incidents?days=7"):

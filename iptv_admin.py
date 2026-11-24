@@ -30,7 +30,7 @@ from pathlib import Path
 from iptv_multi import channels_from_text
 from iptv_resource_monitor import ResourceSampler
 from iptv_profiles import ProfileStore, ProfileError
-from iptv_telemetry import query_viewing, query_incidents, export_incident_rows, clear_incidents
+from iptv_telemetry import viewing_slot, query_viewing, query_incidents, export_incident_rows, clear_incidents
 
 ASSETS = Path(__file__).resolve().parent / "admin"
 SESSION_SECONDS = 8 * 3600
@@ -382,17 +382,21 @@ class AdminState:
             },
         }
 
-    def _channel_labels(self) -> dict:
+    def _channel_labels(self, *, include_profile=True) -> dict:
         labels = {row["id"]: row["name"] for row in self.channels()}
-        for profile in self.profiles.all()[1:]:
+        for profile in self.profiles.all():
+            if profile["slot"] == 1 and not profile["source_url"]:
+                continue
             if not self.profiles.configured(profile):
                 continue
             try:
                 catalog = channels_from_text(
                     self.profiles.media_path(profile).read_text(encoding="utf-8-sig"))
                 for channel in catalog:
-                    labels[f"p{profile['slot']}:{channel.id}"] = (
-                        f"{profile['name']} · {channel.name}")
+                    slot = profile["slot"]
+                    key = channel.id if slot == 1 else f"p{slot}:{channel.id}"
+                    labels[key] = (f"{profile['name']} · {channel.name}"
+                                   if include_profile and slot != 1 else channel.name)
             except OSError:
                 continue
         return labels
@@ -415,10 +419,13 @@ class AdminState:
         # Never echo submitted private URLs to a browser, even on success.
         return self.profiles_public()
 
-    def viewing_history(self, days: int = 7) -> dict:
-        data = query_viewing(self.telemetry_db, days)
-        names = self._channel_labels()
+    def viewing_history(self, days=7, slot=0, channel="", session=0, page=0,
+                        rank_page=None, recent_page=None) -> dict:
+        data = query_viewing(self.telemetry_db, days, slot, channel, session, page, rank_page, recent_page)
+        names = self._channel_labels(include_profile=False)
+        data["cabins"] = [{"slot": p["slot"], "name": p["name"]} for p in self.profiles.all()]
         for row in data["channels"] + data["sessions"]:
+            row["slot"] = viewing_slot(row["channel_id"])
             row["channel_name"] = names.get(row["channel_id"], "Неизвестный канал")
         state = self.gateway_status()
         data["recording_active"] = bool(state and state.get("telemetry_enabled"))
@@ -625,8 +632,14 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                             200, content, "text/csv; charset=utf-8", head=head,
                             headers={"Content-Disposition":
                                      f'attachment; filename="tv-incidents-{days}d.csv"'})
-                    data = (state.viewing_history(days) if path.endswith("/history")
-                            else state.incident_history(days, kind))
+                    if path.endswith("/history"):
+                        data = state.viewing_history(
+                            days, int(qs.get("slot", ["0"])[0]), qs.get("channel", [""])[0],
+                            int(qs.get("session", ["0"])[0]), int(qs.get("page", ["0"])[0]),
+                            int(qs["rank_page"][0]) if "rank_page" in qs else None,
+                            int(qs["recent_page"][0]) if "recent_page" in qs else None)
+                    else:
+                        data = state.incident_history(days, kind)
                 except (ValueError, TypeError):
                     return self.respond(400, b'{"error":"invalid_filter"}', head=head)
                 except OSError:
