@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS incidents (
     detail TEXT NOT NULL,
     duration_seconds REAL
 );
+CREATE INDEX IF NOT EXISTS incident_channel_time ON incidents(channel_id, occurred_at);
+CREATE INDEX IF NOT EXISTS viewing_channel_time ON viewing_sessions(channel_id, last_seen);
 CREATE INDEX IF NOT EXISTS incident_recent ON incidents(occurred_at DESC);
 """
 KINDS = {"upstream_error", "segment_slow", "stream_stalled",
@@ -79,40 +81,78 @@ def _read_or_create_secret(path: Path) -> bytes:
     return secret
 
 
-def query_viewing(path: Path, days: int = 7) -> dict:
-    if days not in (1, 7, 30):
-        raise ValueError("Unsupported time range")
+def viewing_slot(channel: str) -> int:
+    if channel.startswith("p2:"):
+        return 2
+    return 3 if channel.startswith("p3:") else 1
+
+
+def query_viewing(path: Path, days: int = 7, slot: int = 0, channel: str = "",
+                  session: int = 0, page: int = 0, rank_page: int | None = None,
+                  recent_page: int | None = None) -> dict:
+    if days not in (1, 7, 30) or slot not in (0, 1, 2, 3):
+        raise ValueError("Unsupported history filter")
+    if (not 0 <= session < 2**63 or not 0 <= page <= MAX_EVENTS or len(channel) > 128
+            or ((session or page) and not channel)
+            or (channel and slot and viewing_slot(channel) != slot)):
+        raise ValueError("Invalid event selection")
+    if any(p is not None and not 0 <= p <= MAX_EVENTS for p in (rank_page, recent_page)):
+        raise ValueError("Invalid history page")
     empty = {"tracking_available": False, "days": days, "total_seconds": 0,
              "total_sessions": 0, "unique_channels": 0, "channels": [], "sessions": []}
     if not path.is_file():
         return empty
-    cutoff = int(time.time()) - days * 86400
+    params = {"cutoff": int(time.time()) - days * 86400, "prefix": f"p{slot}:*",
+              "channel": channel, "session": session, "offset": page * 50,
+              "rank_limit": 100 if rank_page is None else 20, "rank_offset": (rank_page or 0) * 20,
+              "recent_limit": 100 if recent_page is None else 12, "recent_offset": (recent_page or 0) * 12}
+    where = "last_seen >= :cutoff"
+    if slot == 1:
+        where += " AND channel_id NOT GLOB 'p[23]:*'"
+    elif slot:
+        where += " AND channel_id GLOB :prefix"
+    # Several devices can watch the same stream during overlapping intervals.
+    # Count each incident once in the ranking, and once per matching session.
+    matches = """FROM viewing_sessions v JOIN incidents i ON i.channel_id = v.channel_id
+                 AND i.occurred_at BETWEEN MAX(v.started_at, :cutoff) AND v.last_seen
+                 WHERE v.last_seen >= :cutoff AND v.channel_id = """
     try:
         with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True, timeout=3) as db:
             db.row_factory = sqlite3.Row
-            by_channel = [dict(row) for row in db.execute("""
-                SELECT channel_id, SUM(estimated_seconds) AS seconds,
-                       COUNT(*) AS sessions, SUM(segment_requests) AS requests,
-                       MAX(last_seen) AS last_seen
-                FROM viewing_sessions
-                WHERE last_seen >= ?
-                GROUP BY channel_id ORDER BY seconds DESC, last_seen DESC LIMIT 100
-            """, (cutoff,))]
-            sessions = [dict(row) for row in db.execute("""
-                SELECT channel_id, viewer, started_at, last_seen,
-                       estimated_seconds AS seconds, segment_requests AS requests
-                FROM viewing_sessions WHERE last_seen >= ?
-                ORDER BY last_seen DESC LIMIT 100
-            """, (cutoff,))]
-            count = db.execute("""
-                SELECT COALESCE(SUM(estimated_seconds), 0), COUNT(*),
-                       COUNT(DISTINCT channel_id)
-                FROM viewing_sessions WHERE last_seen >= ?
-            """, (cutoff,)).fetchone()
-            return {"tracking_available": True, "days": days,
-                    "total_seconds": int(count[0]), "total_sessions": int(count[1]),
-                    "unique_channels": int(count[2]),
+            db.execute("BEGIN")
+            by_channel = [dict(row) for row in db.execute(f"""
+                WITH ranked AS (
+                    SELECT channel_id, SUM(estimated_seconds) AS seconds, COUNT(*) AS sessions,
+                           SUM(segment_requests) AS requests, MAX(last_seen) AS last_seen
+                    FROM viewing_sessions WHERE {where} GROUP BY channel_id
+                    ORDER BY seconds DESC, last_seen DESC, channel_id LIMIT :rank_limit OFFSET :rank_offset
+                )
+                SELECT r.*, (SELECT COUNT(DISTINCT i.id) {matches} r.channel_id) AS event_count
+                FROM ranked r ORDER BY seconds DESC, last_seen DESC, channel_id""", params)]
+            sessions = [dict(row) for row in db.execute(f"""
+                SELECT id, channel_id, viewer, started_at, last_seen, estimated_seconds AS seconds,
+                       segment_requests AS requests, (SELECT COUNT(*) FROM incidents i
+                       WHERE i.channel_id = v.channel_id AND i.occurred_at BETWEEN
+                       MAX(v.started_at, :cutoff) AND v.last_seen) AS event_count
+                FROM viewing_sessions v WHERE {where} ORDER BY last_seen DESC, id DESC LIMIT :recent_limit OFFSET :recent_offset""", params)]
+            count = db.execute(f"""
+                SELECT COALESCE(SUM(estimated_seconds), 0), COUNT(*), COUNT(DISTINCT channel_id)
+                FROM viewing_sessions WHERE {where}""", params).fetchone()
+            data = {"tracking_available": True, "days": days, "total_seconds": count[0],
+                    "total_sessions": count[1], "unique_channels": count[2],
                     "channels": by_channel, "sessions": sessions}
+            if channel:
+                scope = matches + ":channel" + (" AND v.id = :session" if session else "")
+                events = [dict(row) for row in db.execute(f"""
+                    SELECT DISTINCT i.id, i.occurred_at, i.kind, i.detail, i.duration_seconds
+                    {scope} ORDER BY i.occurred_at DESC, i.id DESC LIMIT 51 OFFSET :offset""", params)]
+                data["event_page"] = {"rows": events[:50], "more": len(events) > 50}
+                if session:
+                    interval = db.execute("""SELECT started_at, last_seen FROM viewing_sessions
+                        WHERE channel_id=:channel AND id=:session AND last_seen>=:cutoff""", params).fetchone()
+                    if interval:
+                        data["event_page"]["interval"] = dict(interval)
+            return data
     except sqlite3.Error:
         return empty
 

@@ -576,7 +576,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 if raw is None:
                     self.track_client_failure(cid, "MANIFEST_WARMUP", 503)
                     if request_manager.telemetry is not None and not head:
-                        request_manager.telemetry.incident(manager.telemetry_channel_id(cid), "startup_timeout", "MANIFEST_WARMUP_TIMEOUT")
+                        request_manager.telemetry.incident(request_manager.telemetry_channel_id(cid), "startup_timeout", "MANIFEST_WARMUP_TIMEOUT")
                     stream.gateway.record_client("manifest", 503)
                     return self.respond(503, b"Buffer warming up; reselect channel",
                                         "text/plain", head, {"Retry-After": "2"})

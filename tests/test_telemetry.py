@@ -52,6 +52,18 @@ class TelemetryStorageTests(unittest.TestCase):
         self.assertNotIn(b"10.0.0.1", self.path.read_bytes())
         self.assertNotIn(b"TV A", self.path.read_bytes())
 
+    def test_history_pages_are_per_cabinet_and_include_low_ranked_channels(self):
+        ts = int(time.time()) - 300
+        for i in range(25):
+            for prefix in ("", "p2:"):
+                self.store.observe_segment(f"{prefix}ch{i}", "tv", ts + i)
+        self.store.flush()
+        page = query_viewing(self.path, 1, slot=2, rank_page=1, recent_page=2)
+        self.assertEqual((page["unique_channels"], page["total_sessions"]), (25, 25))
+        self.assertEqual([r["channel_id"] for r in page["channels"]],
+                         [f"p2:ch{i}" for i in (4, 3, 2, 1, 0)])
+        self.assertEqual([r["channel_id"] for r in page["sessions"]], ["p2:ch0"])
+
     def test_incidents_filter_and_no_secret_payloads(self):
         ts = int(time.time()) - 10
         self.store.incident("channel-a", "upstream_error", "MANIFEST_HTTP_404", timestamp=ts)
