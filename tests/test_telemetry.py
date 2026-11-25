@@ -193,7 +193,9 @@ class MultiChannelUsageTests(unittest.TestCase):
                     with self.assertRaises(urllib.error.HTTPError) as denied:
                         urllib.request.urlopen(url.replace(channel.id, other.id).replace("segment/15.ts", "index.m3u8"))
                     self.assertEqual(denied.exception.code, 503)
-                    worker.gateway._notify_event("segment_slow", "SEGMENT_DOWNLOAD_SLOW", 12)
+                    with patch.object(worker.gateway, "status", wraps=worker.gateway.status) as status:
+                        worker.gateway._notify_event("segment_slow", "SEGMENT_DOWNLOAD_SLOW", 12)
+                        status.assert_not_called()
                     store.flush()
                     events = query_incidents(store.path)["events"]
                     failure = next(e for e in events if e["detail"] == "HTTP_503_STREAM_LIMIT")

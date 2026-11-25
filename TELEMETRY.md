@@ -91,7 +91,8 @@ on startup. All timestamps in the export are UTC.
   last download and publication. A source can serve as another TV's backup.
 - For `cdn_decision`, the slot identifies the viewing cabinet. Follow
   `selected_slot` and `from_slot`, and compare the freshness, buffer and guest
-  usage of each candidate. Unavailable slots carry a reason. A manifest startup
+  usage of each candidate. A reserve denied by its stream limit includes its
+  limit and occupying channels at the time of refusal. A manifest startup
   timeout also records the candidates when Multi-CDN is active. Repeated polls
   with the same blocked selection and eligibility produce one decision entry.
 

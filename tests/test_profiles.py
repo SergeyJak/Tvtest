@@ -17,7 +17,7 @@ from iptv_multi import MultiGateway, channels_from_text, make_multi_handler
 from iptv_profiles import ProfileStore, ProfileError
 from iptv_profile_gateway import ProfileRegistry
 from iptv_profile_jobs import generate_for_slot
-from iptv_telemetry import Telemetry, query_incidents
+from iptv_telemetry import Telemetry, query_incidents, export_incident_rows
 
 
 PLAYLIST = """#EXTM3U
@@ -428,6 +428,56 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertEqual(context["sources"]["2"]["state"], "NO_UNIQUE_CHANNEL_MATCH")
         self.assertEqual(context["sources"]["3"]["state"], "NOT_CONFIGURED")
         self.assertNotIn(token, json.dumps(rows))
+
+    def test_busy_backup_exports_occupants_at_the_time_of_refusal(self):
+        telemetry = Telemetry(Path(self.temp.name) / "diagnostics.db")
+        self.addCleanup(telemetry.close)
+        self.base_manager.telemetry = telemetry
+        with patch("iptv_profiles.download_playlist", return_value=PLAYLIST):
+            row, _ = self.store.update(2, "Second", "https://provider.invalid/PRIVATE")
+        backup = self.registry.resolve(row["token"])[0]
+        occupant = backup.start(backup.order[1], pinned=True)
+        occupant.pending_requests = 2
+        token = self.legacy_token.read_text()
+        with self.assertRaises(urllib.error.HTTPError):
+            self.request(token, f"channel/{self.base_manager.order[0]}/index.m3u8")
+        occupant.pending_requests = 0
+        telemetry.flush()
+        [event] = export_incident_rows(telemetry.path, kind="startup_timeout")
+        source = event["diagnostics"]["sources"]["2"]
+        self.assertEqual(source["state"], "STREAM_LIMIT")
+        self.assertEqual(source["max_streams"], 1)
+        [active] = source["active"]
+        self.assertEqual(active["channel_id"], backup.telemetry_channel_id(backup.order[1]))
+        self.assertTrue(active["pinned"])
+        self.assertFalse(active["standby"])
+        self.assertEqual(active["pending_requests"], 2)
+        self.assertGreaterEqual(active["idle_seconds"], 0)
+        self.assertNotIn("PRIVATE", json.dumps(source))
+
+        # Start the home stream, then stall it while the same backup remains busy.
+        cid = self.base_manager.order[0]
+        home = self.base_manager.active[cid].gateway
+        for seq in range(100, 106):
+            home.cache[seq] = (6.0, b"video")
+        home.latest = 105
+        home._fast_start_at = 0
+        home.last_progress = home.last_segment_download = time.time()
+        with self.request(token, f"channel/{cid}/index.m3u8"):
+            pass
+        home.last_segment_download -= 90
+        self.registry.existing_failover(token, cid).last_switch -= 25
+        for _ in range(2):
+            occupant.accessed -= 1
+            with self.request(token, f"channel/{cid}/index.m3u8"):
+                pass
+        telemetry.flush()
+        blocked = [e for e in export_incident_rows(telemetry.path, kind="cdn_decision")
+                   if e["detail"] == "NO_READY_BACKUP"]
+        self.assertEqual(len(blocked), 1)
+        backup_info = blocked[0]["diagnostics"]["sources"]["2"]
+        self.assertEqual(backup_info["active"][0]["pending_requests"], 0)
+        self.assertEqual(backup_info["active"][0]["channel_id"], active["channel_id"])
 
     def test_three_viewers_start_on_own_sources_and_one_may_fail_over(self):
         """Each TV keeps its own token and begins on its own Edem CDN."""

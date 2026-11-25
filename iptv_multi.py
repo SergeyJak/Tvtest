@@ -174,13 +174,8 @@ class MultiGateway:
             return updated.url
 
         def record_event(kind, detail, duration):
-            state = json.loads(gateway.status())
-            diagnostics = {key: state[key] for key in (
-                "buffer_state", "effective_buffer_delay_seconds", "contiguous_tail_seconds",
-                "last_downloaded_sequence", "last_published_sequence", "seconds_since_new_segment",
-                "seconds_since_published_advance", "seconds_since_segment_download")}
             self.telemetry.incident(self.telemetry_channel_id(channel.id), kind, detail,
-                                    duration, diagnostics=diagnostics)
+                                    duration, diagnostics=gateway.source_diagnostics())
 
         gateway = Gateway(channel.url, delay=self.delay, timeout=self.timeout,
                           poll=self.poll, max_bytes=self.cache_mib * 1048576,

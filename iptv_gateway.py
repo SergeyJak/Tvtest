@@ -409,18 +409,6 @@ class Gateway:
             self.check_stall()
             self.stop.wait(max(0.2, self.poll - (time.monotonic() - start)))
 
-    def _contiguous_tail(self) -> list[tuple[int, float]]:
-        """The newest uninterrupted run of locally downloaded segments."""
-        items = [(seq, entry[0]) for seq, entry in self.cache.items()]
-        if not items:
-            return []
-        tail = [items[-1]]
-        for entry in reversed(items[:-1]):
-            if entry[0] + 1 != tail[0][0]:
-                break
-            tail.insert(0, entry)
-        return tail
-
     def _window(self, run: list[tuple[int, float]], end: int, commit: bool) -> list[tuple[int, float]]:
         start = max(0, end - 7)
         if self._published_start is not None:
@@ -584,12 +572,18 @@ class Gateway:
                     self.client_segment_404 += 1
                 self.last_client_segment_access = now
 
-    def status(self) -> bytes:
+    def source_diagnostics(self) -> dict:
+        """Capture only playback metrics, without formatting the admin status."""
         with self.lock:
-            # Read-only observation must not move the TV's playback cursor.
             playable = self.published(commit=False)
-            tail = self._contiguous_tail()
-            tail_seconds = round(sum(duration for _, duration in tail), 1)
+            newest = next(reversed(self.cache), None)
+            tail_seconds = 0.0
+            tail_segments = 0
+            seq = newest
+            while seq in self.cache:
+                tail_seconds += self.cache[seq][0]
+                tail_segments += 1
+                seq -= 1
             behind_seconds = None
             if playable:
                 seq = playable[-1][0] + 1
@@ -600,18 +594,26 @@ class Gateway:
                 behind_seconds = round(seconds, 1)
             state = ('READY' if playable else 'WAITING_FOR_VIDEO' if not self.cache
                      else 'WARMING_OR_REBUILDING_BUFFER')
-            info = dict(ready=bool(playable), delay_seconds=self.delay,
-                        startup_reserve_seconds=self.startup_reserve,
-                        buffer_state=state,
-                        contiguous_tail_segments=len(tail),
-                        contiguous_tail_seconds=tail_seconds,
+            now = time.time()
+            return dict(buffer_state=state, contiguous_tail_segments=tail_segments,
+                        contiguous_tail_seconds=round(tail_seconds, 1),
                         effective_buffer_delay_seconds=behind_seconds,
                         last_published_sequence=self.last_published_seq,
                         seconds_since_published_advance=round(
                             max(0.0, time.monotonic() - self._last_published_at), 1
                         ) if self._last_published_at is not None else None,
+                        last_downloaded_sequence=newest,
+                        seconds_since_segment_download=round(now - self.last_segment_download, 1)
+                        if self.last_segment_download else None,
+                        seconds_since_new_segment=round(now - self.last_progress, 1)
+                        if self.last_progress else None)
+
+    def status(self) -> bytes:
+        with self.lock:
+            playback = self.source_diagnostics()
+            info = dict(**playback, ready=playback["buffer_state"] == "READY", delay_seconds=self.delay,
+                        startup_reserve_seconds=self.startup_reserve,
                         recovery_mode=self._recovery_mode,
-                        last_downloaded_sequence=next(reversed(self.cache), None) if self.cache else None,
                         latest_upstream_sequence=self.latest,
                         client_manifest_503=self.client_manifest_503,
                         client_segment_404=self.client_segment_404,
@@ -625,7 +627,6 @@ class Gateway:
                         seconds_since_client_manifest=round(time.time()-self.last_client_manifest_access, 1) if self.last_client_manifest_access else None,
                         seconds_since_client_segment=round(time.time()-self.last_client_segment_access, 1) if self.last_client_segment_access else None,
                         seconds_since_client_auth_failure=round(time.time()-self.last_client_auth_failure, 1) if self.last_client_auth_failure else None,
-                        seconds_since_segment_download=round(time.time() - self.last_segment_download, 1) if self.last_segment_download else None,
                         cached_segments=len(self.cache), cached_mib=round(self.total_bytes / 1048576, 2),
                         errors=self.errors, slow_segments=self.slow_segments,
                         last_error=self.last_error,
@@ -646,7 +647,6 @@ class Gateway:
                         source_changes=self.source_changes,
                         seconds_since_source_change=round(time.time() - self.last_source_change, 1) if self.last_source_change else None,
                         seconds_since_playlist_update=round(time.time() - self.last_update, 1) if self.last_update else None,
-                        seconds_since_new_segment=round(time.time() - self.last_progress, 1) if self.last_progress else None,
                         upstream_stalled=bool(self.last_progress and time.time() - self.last_progress > max(15, 3 * self.target)))
         return json.dumps(info, ensure_ascii=False).encode('utf-8')
 

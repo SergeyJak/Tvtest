@@ -39,7 +39,7 @@ class Tuning:
         for slot in (1, 2, 3):
             state = mux.source_health.get(slot)
             if state is None:
-                sources[slot] = {"state": self.unavailable.get(slot, "WORKER_STOPPED")}
+                sources[slot] = self.unavailable.get(slot, {"state": "WORKER_STOPPED"})
                 continue
             sources[slot] = {key: state[key] for key in (
                 "ready", "fresh", "age_seconds", "buffer_seconds",
@@ -60,7 +60,12 @@ class Tuning:
         elif mux.backup_blocker:
             reason = mux.backup_blocker
             # Buffer ages change every poll. Only log changes in eligibility.
-            signature = (reason, selected, tuple(sorted(self.unavailable.items())),
+            unavailable = tuple(
+                (slot, info["state"], info.get("max_streams"), tuple(
+                    (item["channel_id"], item["pinned"], item["standby"], bool(item["pending_requests"]))
+                    for item in info.get("active", ())))
+                for slot, info in sorted(self.unavailable.items()))
+            signature = (reason, selected, unavailable,
                          tuple((slot, s["ready"], s["fresh"], usage.get(slot, 0))
                                for slot, s in sorted(mux.source_health.items())))
             if self.blocked_reason == signature:
@@ -282,18 +287,19 @@ class ProfileRegistry:
                     continue
                 route = self.routes.get(profile["token"])
                 if not route:
-                    unavailable[slot] = "NOT_CONFIGURED"
+                    unavailable[slot] = {"state": "NOT_CONFIGURED"}
                     continue
                 manager = route[0]
                 matching_id = self._matching_channel_id(owner[0], manager, wanted)
                 if matching_id is None:
-                    unavailable[slot] = "NO_UNIQUE_CHANNEL_MATCH"
+                    unavailable[slot] = {"state": "NO_UNIQUE_CHANNEL_MATCH"}
                     continue
-                worker = manager.start(matching_id, standby=True)
+                capacity = {} if owner[0].telemetry is not None else None
+                worker = manager.start(matching_id, standby=True, denial=capacity)
                 if worker is not None:
                     sources[slot] = (manager, worker)
                 else:
-                    unavailable[slot] = "STREAM_LIMIT"
+                    unavailable[slot] = {"state": "STREAM_LIMIT", **(capacity or {})}
             dropped = set(tuning.sources.values()) - set(sources.values())
             tuning.sources = sources
             tuning.unavailable = unavailable
