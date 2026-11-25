@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import queue
 import re
@@ -49,7 +50,7 @@ CREATE INDEX IF NOT EXISTS viewing_channel_time ON viewing_sessions(channel_id, 
 CREATE INDEX IF NOT EXISTS incident_recent ON incidents(occurred_at DESC);
 """
 KINDS = {"upstream_error", "segment_slow", "stream_stalled",
-         "stream_recovered", "client_error", "startup_timeout"}
+         "stream_recovered", "client_error", "startup_timeout", "cdn_decision"}
 
 
 def prepare_database(path: Path) -> None:
@@ -59,7 +60,9 @@ def prepare_database(path: Path) -> None:
     with sqlite3.connect(path, timeout=5) as db:
         db.executescript(SCHEMA)
         db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA busy_timeout=3000")
+        db.execute("BEGIN IMMEDIATE")
+        if "diagnostics" not in {row[1] for row in db.execute("PRAGMA table_info(incidents)")}:
+            db.execute("ALTER TABLE incidents ADD COLUMN diagnostics TEXT")
     os.chmod(path, 0o600)
 
 
@@ -85,6 +88,13 @@ def viewing_slot(channel: str) -> int:
     if channel.startswith("p2:"):
         return 2
     return 3 if channel.startswith("p3:") else 1
+
+
+def incident_row(row):
+    event = dict(row)
+    payload = event.get("diagnostics")
+    event["diagnostics"] = json.loads(payload) if payload else None
+    return event
 
 
 def query_viewing(path: Path, days: int = 7, slot: int = 0, channel: str = "",
@@ -143,8 +153,8 @@ def query_viewing(path: Path, days: int = 7, slot: int = 0, channel: str = "",
                     "channels": by_channel, "sessions": sessions}
             if channel:
                 scope = matches + ":channel" + (" AND v.id = :session" if session else "")
-                events = [dict(row) for row in db.execute(f"""
-                    SELECT DISTINCT i.id, i.occurred_at, i.kind, i.detail, i.duration_seconds
+                events = [incident_row(row) for row in db.execute(f"""
+                    SELECT DISTINCT i.*
                     {scope} ORDER BY i.occurred_at DESC, i.id DESC LIMIT 51 OFFSET :offset""", params)]
                 data["event_page"] = {"rows": events[:50], "more": len(events) > 50}
                 if session:
@@ -180,8 +190,8 @@ def query_incidents(path: Path, days: int = 7, kind: str = "all") -> dict:
                 "WHERE occurred_at >= ? GROUP BY kind", (cutoff,))}
             filtered_total = db.execute(
                 f"SELECT COUNT(*) FROM incidents {where}", values).fetchone()[0]
-            events = [dict(row) for row in db.execute(
-                f"""SELECT occurred_at, channel_id, kind, detail, duration_seconds
+            events = [incident_row(row) for row in db.execute(
+                f"""SELECT *
                     FROM incidents {where} ORDER BY occurred_at DESC, id DESC LIMIT 200""", values)]
             return {"tracking_available": True, "days": days, "kind": kind,
                     "total": filtered_total, "summary": summary, "events": events}
@@ -205,10 +215,10 @@ def export_incident_rows(path: Path, days: int = 7, kind: str = "all"):
         with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True, timeout=5) as db:
             db.row_factory = sqlite3.Row
             for row in db.execute(
-                f"""SELECT occurred_at,channel_id,kind,detail,duration_seconds
+                f"""SELECT *
                     FROM incidents {where} ORDER BY occurred_at DESC, id DESC""", params
             ):
-                yield dict(row)
+                yield incident_row(row)
     except sqlite3.Error as exc:
         raise OSError("Incident database unavailable") from None
 
@@ -246,17 +256,17 @@ class Telemetry:
 
     def observe_segment(self, channel_id: str, viewer: str, timestamp: float | None = None) -> None:
         self._enqueue(("watch", int(time.time() if timestamp is None else timestamp),
-                       channel_id, viewer, "", None))
+                       channel_id, viewer, "", None, None))
 
     def incident(self, channel_id: str, kind: str, detail: str = "",
                  duration_seconds: float | None = None,
-                 timestamp: float | None = None) -> None:
+                 timestamp: float | None = None, *, diagnostics: dict | None = None) -> None:
         if kind not in KINDS:
             return
         # Labels must be sanitized categories, never exception strings/URLs.
         sanitized = re.sub(r"[^A-Za-z0-9_ .:-]", "_", detail)[:100]
         self._enqueue(("incident", int(time.time() if timestamp is None else timestamp),
-                       channel_id, kind, sanitized, duration_seconds))
+                       channel_id, kind, sanitized, duration_seconds, diagnostics))
 
     def _enqueue(self, item: tuple) -> None:
         if self._closed:
@@ -277,7 +287,7 @@ class Telemetry:
                 try:
                     if item is None:
                         break
-                    typ, ts, cid, field, detail, duration = item
+                    typ, ts, cid, field, detail, duration, diagnostics = item
                     if typ == "watch":
                         previous = db.execute("""
                             SELECT id,last_seen FROM viewing_sessions
@@ -300,9 +310,10 @@ class Telemetry:
                     else:
                         db.execute("""
                             INSERT INTO incidents
-                            (occurred_at,channel_id,kind,detail,duration_seconds)
-                            VALUES (?,?,?,?,?)
-                        """, (ts, cid, field, detail, duration))
+                            (occurred_at,channel_id,kind,detail,duration_seconds,diagnostics)
+                            VALUES (?,?,?,?,?,?)
+                        """, (ts, cid, field, detail, duration,
+                              json.dumps(diagnostics, separators=(",", ":")) if diagnostics else None))
                     db.commit()
                     if time.monotonic() - last_cleanup > 6 * 3600:
                         cutoff = int(time.time()) - RETENTION_DAYS * 86400

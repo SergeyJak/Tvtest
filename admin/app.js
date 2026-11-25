@@ -821,7 +821,7 @@
       const kind = incidentLabels[event.kind] || [event.kind, "neutral"];
       item.append(element("time", "", new Date(event.occurred_at * 1000).toLocaleString("ru-RU")),
         element("span", "incident-type " + kind[1], kind[0]),
-        element("span", "incident-details", event.detail || "—"),
+        element("span", "incident-details", incidentDetail(event)),
         element("span", "", event.duration_seconds == null ? "" : duration(event.duration_seconds)));
       list.append(item);
     }
@@ -910,10 +910,22 @@
     }
   }
   const incidentLabels = {
+    cdn_decision:["Выбор CDN", "neutral"],
     stream_stalled:["Зависание", "danger"], stream_recovered:["Восстановление", "success"],
     upstream_error:["Ошибка источника", "danger"], client_error:["Ошибка клиента", "warning"],
     startup_timeout:["Таймаут запуска", "warning"], segment_slow:["Медленный сегмент", "warning"]
   };
+  function incidentDetail(row) {
+    const d = row.diagnostics;
+    const parts = [row.detail || "—"];
+    if (!d) return parts[0];
+    if (d.active) parts.push("Занято " + d.active.length + " из " + d.max_streams);
+    if (d.client) parts.push("Клиент " + d.client);
+    if (d.from_slot != null) parts.push("Был кабинет " + d.from_slot);
+    if (d.selected_slot != null) parts.push("Источник " + d.selected_slot);
+    if (d.effective_buffer_delay_seconds != null) parts.push("Запас " + d.effective_buffer_delay_seconds + " с");
+    return parts.join(" · ");
+  }
   async function exportIncidents() {
     const button = $("incident-export");
     const days = $("incident-days").value;
@@ -996,7 +1008,7 @@
         const info = incidentLabels[row.kind] || [row.kind, "neutral"];
         type.append(element("span", "incident-type " + info[1], info[0]));
         tr.append(type);
-        tr.append(element("td", "incident-details", row.detail || "—"));
+        tr.append(element("td", "incident-details", incidentDetail(row)));
         tr.append(element("td", "", row.duration_seconds === null ? "—" : duration(row.duration_seconds)));
         table.append(tr);
       });

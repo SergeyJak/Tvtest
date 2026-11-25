@@ -436,7 +436,7 @@ class AdminState:
         buffer.write("\ufeff")
         writer = csv.writer(buffer)
         writer.writerow(("utc_time", "channel", "channel_id",
-                         "event", "detail", "duration_seconds"))
+                         "event", "detail", "duration_seconds", "cabinet_slot", "diagnostics_json"))
         labels = self._channel_labels()
         def safe_cell(value):
             # Spreadsheet apps may execute formulas in untrusted channel labels.
@@ -448,7 +448,9 @@ class AdminState:
                              safe_cell(labels.get(event["channel_id"], "Неизвестный канал")),
                              safe_cell(event["channel_id"]),
                              safe_cell(event["kind"]), safe_cell(event["detail"]),
-                             event["duration_seconds"] if event["duration_seconds"] is not None else ""))
+                             event["duration_seconds"] if event["duration_seconds"] is not None else "",
+                             viewing_slot(event["channel_id"]),
+                             json.dumps(event["diagnostics"], separators=(",", ":")) if event["diagnostics"] else ""))
         return buffer.getvalue().encode("utf-8")
 
     def clear_incident_history(self) -> int:

@@ -173,17 +173,21 @@ class MultiGateway:
                 raise ValueError("missing_channel_after_refresh")
             return updated.url
 
+        def record_event(kind, detail, duration):
+            self.telemetry.incident(self.telemetry_channel_id(channel.id), kind, detail,
+                                    duration, diagnostics=gateway.source_diagnostics())
+
         gateway = Gateway(channel.url, delay=self.delay, timeout=self.timeout,
                           poll=self.poll, max_bytes=self.cache_mib * 1048576,
                           source_refresher=refresh,
                           startup_reserve=None if pinned else self.startup_reserve,
                           fast_start=not pinned,
                           require_startup_reserve=self.require_startup_reserve,
-                          on_event=(lambda kind, detail, duration: self.telemetry.incident(
-                              self.telemetry_channel_id(channel.id), kind, detail, duration)) if self.telemetry else None)
+                          on_event=record_event if self.telemetry else None)
         return ActiveStream(channel, gateway, self.upstream_slots, pinned, standby)
 
-    def start(self, cid: str, *, pinned: bool = False, standby: bool = False) -> ActiveStream | None:
+    def start(self, cid: str, *, pinned: bool = False, standby: bool = False,
+              denial: dict | None = None) -> ActiveStream | None:
         """Start a requested channel; do not silently evict active viewers."""
         with self.lock:
             if cid not in self.channels:
@@ -227,6 +231,13 @@ class MultiGateway:
                     del self.active[oldest_id]
                     self.recycled_idle_streams += 1
             if len(self.active) >= self.max_streams:
+                if denial is not None:
+                    now = time.monotonic()
+                    denial.update(max_streams=self.max_streams, active=[
+                        {"channel_id": self.telemetry_channel_id(sid), "pinned": item.pinned,
+                         "standby": item.standby, "pending_requests": item.pending_requests,
+                         "idle_seconds": round(now - item.accessed, 1)}
+                        for sid, item in self.active.items()])
                 self.stream_limit_denials += 1
                 return None
             stream = self._new_stream(self.channels[cid], pinned, standby)
@@ -367,10 +378,13 @@ def make_multi_handler(manager: MultiGateway, token: str,
                     pass
             return manager.telemetry.viewer(ip, self.headers.get("User-Agent", ""))
 
-        def track_client_failure(self, cid, reason, status):
+        def track_client_failure(self, cid, reason, status, route, diagnostics=None):
             manager = self._request_manager
             if manager.telemetry is not None and not self._head:
-                manager.telemetry.incident(manager.telemetry_channel_id(cid), "client_error", f"HTTP_{status}_{reason}")
+                manager.telemetry.incident(manager.telemetry_channel_id(cid), "client_error",
+                                           f"HTTP_{status}_{reason}", diagnostics={
+                                               **(diagnostics or {}), "route": route,
+                                               "client": self.viewer_identity()})
 
         def track_view(self, cid):
             manager = self._request_manager
@@ -532,15 +546,16 @@ def make_multi_handler(manager: MultiGateway, token: str,
                     # The catalog entry exists. Its live representation and length
                     # are determined on GET, when the TV actually tunes the channel.
                     return self.respond(200, None, "application/vnd.apple.mpegurl", head)
-                pilot = (profile_registry.failover_for(active_token, cid)
+                denial = {} if request_manager.telemetry else None
+                pilot = (profile_registry.failover_for(active_token, cid, denial=denial)
                          if profile_registry is not None else None)
                 if pilot is None:
-                    stream = request_manager.start(cid)
+                    stream = request_manager.start(cid, denial=denial)
                 else:
                     mux, candidates = pilot
                     stream = dict(candidates).get(mux.home_slot) if mux else None
                 if stream is None:
-                    self.track_client_failure(cid, "STREAM_LIMIT", 503)
+                    self.track_client_failure(cid, "STREAM_LIMIT", 503, "manifest", denial)
                     return self.respond(503, b"Too many active streams",
                                         "text/plain", head, {"Retry-After": "10"})
                 # The old implementation immediately returned 503 when
@@ -574,9 +589,13 @@ def make_multi_handler(manager: MultiGateway, token: str,
                         stream.pending_requests -= 1
                         stream.accessed = time.monotonic()
                 if raw is None:
-                    self.track_client_failure(cid, "MANIFEST_WARMUP", 503)
+                    self.track_client_failure(cid, "MANIFEST_WARMUP", 503, "manifest")
                     if request_manager.telemetry is not None and not head:
-                        request_manager.telemetry.incident(request_manager.telemetry_channel_id(cid), "startup_timeout", "MANIFEST_WARMUP_TIMEOUT")
+                        context = profile_registry.timeout_diagnostics(pilot[0]) if pilot else {}
+                        context["startup_wait_seconds"] = request_manager.startup_wait
+                        request_manager.telemetry.incident(request_manager.telemetry_channel_id(cid),
+                                                           "startup_timeout", "MANIFEST_WARMUP_TIMEOUT",
+                                                           diagnostics=context)
                     stream.gateway.record_client("manifest", 503)
                     return self.respond(503, b"Buffer warming up; reselect channel",
                                         "text/plain", head, {"Retry-After": "2"})
@@ -606,14 +625,14 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 # An expired stream is not restarted on a stale segment URL.
                 stream = request_manager.active_stream(cid)
                 if stream is None:
-                    self.track_client_failure(cid, "STREAM_EXPIRED", 404)
+                    self.track_client_failure(cid, "STREAM_EXPIRED", 404, "segment")
                     return self.respond(404, b"Stream expired", "text/plain", head)
                 if mux is not None:
                     data = mux.segment(seq)
                 else:
                     data = stream.gateway.segment(seq, record_miss=True)
                 if data is None:
-                    self.track_client_failure(cid, "SEGMENT_CACHE_MISS", 404)
+                    self.track_client_failure(cid, "SEGMENT_CACHE_MISS", 404, "segment")
                     return self.respond(404, b"Segment not in cache", "text/plain", head)
                 extra = {"Accept-Ranges": "bytes"}
                 requested_range = self.headers.get("Range")
