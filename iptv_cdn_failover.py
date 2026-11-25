@@ -71,6 +71,7 @@ class FailoverMux:
         self.switches = 0
         self.switch_events: list[dict] = []  # Last 20 choices, sanitized.
         self.last_switch = 0.0
+        self.backup_blocker = None
         self.last_progress = 0.0
         self.last_request = time.monotonic()
         # Keep cursors across switches and idle sessions, without retaining old caches.
@@ -255,6 +256,7 @@ class FailoverMux:
             can_switch = current is None or now - self.last_switch >= SWITCH_COOLDOWN
             home = sources.get(self.home_slot)
             home_recovered = self._home_recovered(home, now)
+            self.backup_blocker = None
             if can_switch and (not fresh or stalled):
                 reason = ("SOURCE_RESTARTED" if current is None and selected is not None else
                           "SOURCE_UNAVAILABLE" if not fresh else
@@ -262,6 +264,10 @@ class FailoverMux:
                 for slot in self._alternates(sources, usage):
                     if self._publish_from(slot, sources[slot], now, reason=reason):
                         break
+                else:
+                    self.backup_blocker = "NO_READY_BACKUP"
+            elif not can_switch and (not fresh or stalled):
+                self.backup_blocker = "SWITCH_COOLDOWN"
             elif can_switch and home_recovered:
                 self._publish_from(self.home_slot, home, now, reason="HOME_RECOVERED")
 

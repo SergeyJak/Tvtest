@@ -30,6 +30,51 @@ class ChannelHistory:
 class Tuning:
     mux: FailoverMux
     sources: dict = field(default_factory=dict)  # slot -> (manager, worker)
+    unavailable: dict = field(default_factory=dict)
+    blocked_reason: tuple | None = None
+
+    def diagnostics(self, usage, now):
+        mux = self.mux
+        sources = {}
+        for slot in (1, 2, 3):
+            state = mux.source_health.get(slot)
+            if state is None:
+                sources[slot] = {"state": self.unavailable.get(slot, "WORKER_STOPPED")}
+                continue
+            sources[slot] = {key: state[key] for key in (
+                "ready", "fresh", "age_seconds", "buffer_seconds",
+                "published_age_seconds", "published_sequence", "downloaded_sequence")}
+            sources[slot]["other_guests"] = usage.get(slot, 0)
+        return {"selected_slot": mux.source_slot, "sources": sources,
+                "publish_age_seconds": round(now - mux.last_progress, 1) if mux.history else None}
+
+    def record_decision(self, telemetry, channel_key, previous, usage, now):
+        mux = self.mux
+        selected = mux.source_slot
+        if selected is None:
+            return  # The manifest timeout records the cold-start snapshot.
+        latest = mux.switch_events[-1]
+        if latest is not previous:
+            reason = latest["reason"]
+            self.blocked_reason = None
+        elif mux.backup_blocker:
+            reason = mux.backup_blocker
+            # Buffer ages change every poll. Only log changes in eligibility.
+            signature = (reason, selected, tuple(sorted(self.unavailable.items())),
+                         tuple((slot, s["ready"], s["fresh"], usage.get(slot, 0))
+                               for slot, s in sorted(mux.source_health.items())))
+            if self.blocked_reason == signature:
+                return
+            self.blocked_reason = signature
+        elif self.blocked_reason is not None:
+            reason = "SOURCE_AVAILABLE"
+            self.blocked_reason = None
+        else:
+            return
+        context = self.diagnostics(usage, now)
+        if latest is not previous:
+            context["from_slot"] = latest["from_cabinet"]
+        telemetry.incident(channel_key, "cdn_decision", reason, diagnostics=context)
 
     def candidates(self):
         return [(slot, worker) for slot, (_, worker) in self.sources.items()
@@ -192,7 +237,7 @@ class ProfileRegistry:
                 self.next_sequences[key] = mux.next_sequence
                 del self.failovers[key]
 
-    def failover_for(self, token: str, cid: str):
+    def failover_for(self, token: str, cid: str, *, denial=None):
         """Use every channel's HOME Edem subscription with optional backups.
 
         Standby streams are started on demand for the *same* channel only;
@@ -210,7 +255,7 @@ class ProfileRegistry:
                 return None
             wanted = owner[0].channels[cid]
             self._prune_failovers(time.monotonic())
-            worker = owner[0].start(cid)
+            worker = owner[0].start(cid, denial=denial)
             if worker is None:
                 return None, []
             key = (home, cid)
@@ -230,22 +275,28 @@ class ProfileRegistry:
                     mux.restart_session(time.monotonic())
                 tuning = self.tunings[home] = Tuning(mux)
             sources = {home: (owner[0], worker)}
+            unavailable = {}
             for profile in self.store.all():
                 slot = profile["slot"]
                 if slot == home:
                     continue
                 route = self.routes.get(profile["token"])
                 if not route:
+                    unavailable[slot] = "NOT_CONFIGURED"
                     continue
                 manager = route[0]
                 matching_id = self._matching_channel_id(owner[0], manager, wanted)
                 if matching_id is None:
+                    unavailable[slot] = "NO_UNIQUE_CHANNEL_MATCH"
                     continue
                 worker = manager.start(matching_id, standby=True)
                 if worker is not None:
                     sources[slot] = (manager, worker)
+                else:
+                    unavailable[slot] = "STREAM_LIMIT"
             dropped = set(tuning.sources.values()) - set(sources.values())
             tuning.sources = sources
+            tuning.unavailable = unavailable
             self._release_unused(dropped)
             return tuning.mux, tuning.candidates()
 
@@ -261,7 +312,22 @@ class ProfileRegistry:
             current = self.tunings.get(mux.home_slot)
             if current is None or current.mux is not mux:
                 return None  # An earlier manifest request finished warming after a retune.
-            return mux.playlist(token, current.candidates(), now=now, usage=self._guest_usage(mux, now))
+            usage = self._guest_usage(mux, now)
+            previous = mux.switch_events[-1] if mux.switch_events else None
+            playlist = mux.playlist(token, current.candidates(), now=now, usage=usage)
+            manager = current.sources[mux.home_slot][0]
+            if manager.telemetry is not None:
+                current.record_decision(manager.telemetry, manager.telemetry_channel_id(mux.channel_id),
+                                        previous, usage, now)
+            return playlist
+
+    def timeout_diagnostics(self, mux):
+        with self.lock:
+            current = self.tunings.get(mux.home_slot)
+            if current is None or current.mux is not mux:
+                return {"tuning_changed": True}
+            now = time.monotonic()
+            return current.diagnostics(self._guest_usage(mux, now), now)
 
     def _guest_usage(self, mux, now):
         usage = {}

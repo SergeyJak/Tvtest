@@ -77,6 +77,24 @@ timestamps, channel names/IDs, event type, sanitized reason and duration;
 private provider URLs and TV access tokens are excluded. Excel/Sheets formula
 injection from untrusted channel names is escaped.
 
+The CSV appends `cabinet_slot` and `diagnostics_json`. Export **Все события** to
+see source faults and CDN decisions together, including after a gateway restart.
+Older rows have an empty diagnostics cell. The gateway upgrades the database
+on startup. All timestamps in the export are UTC.
+
+- For `HTTP_503_STREAM_LIMIT`, compare the anonymous `client` across attempts.
+  The snapshot lists the configured limit and each occupying channel with its
+  idle time, pending manifest requests, pinned and standby flags. Clients behind
+  the same address with the same player signature can share an identifier.
+- For slow or stalled downloads, the slot identifies the source subscription.
+  The snapshot includes the buffer reserve, sequence numbers and ages of the
+  last download and publication. A source can serve as another TV's backup.
+- For `cdn_decision`, the slot identifies the viewing cabinet. Follow
+  `selected_slot` and `from_slot`, and compare the freshness, buffer and guest
+  usage of each candidate. Unavailable slots carry a reason. A manifest startup
+  timeout also records the candidates when Multi-CDN is active. Repeated polls
+  with the same blocked selection and eligibility produce one decision entry.
+
 **Очистить журнал** shows a destructive confirmation dialog, then deletes
 *all stored incidents* (not only the selected period) from the on-VPS SQLite
 database. It does not delete watch history, reset tokens or stop the collector.

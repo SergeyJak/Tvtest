@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import sqlite3
 import tempfile
 import threading
 import time
@@ -82,6 +83,21 @@ class TelemetryStorageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             query_incidents(self.path, 90)
 
+    def test_read_and_upgrade_pre_diagnostic_database(self):
+        old = self.path.with_name("legacy.db")
+        with sqlite3.connect(old) as db:
+            db.execute("""CREATE TABLE incidents (id INTEGER PRIMARY KEY,
+                occurred_at INTEGER, channel_id TEXT, kind TEXT, detail TEXT, duration_seconds REAL)""")
+            db.execute("INSERT INTO incidents VALUES(1, ?, 'p2:test', 'stream_stalled', 'OLD', 20)",
+                       (int(time.time()),))
+        self.assertIsNone(query_incidents(old)["events"][0]["diagnostics"])
+        writer = Telemetry(old)
+        writer.incident("p2:test", "cdn_decision", "START", diagnostics={"selected_slot": 2})
+        writer.close()
+        new, previous = query_incidents(old)["events"]
+        self.assertEqual(new["diagnostics"], {"selected_slot": 2})
+        self.assertIsNone(previous["diagnostics"])
+
     def test_existing_data_survives_restarting_writer(self):
         self.store.observe_segment("channel-a", "anonymized", time.time()-12)
         self.store.close()
@@ -142,9 +158,10 @@ class MultiChannelUsageTests(unittest.TestCase):
     def test_successful_segment_get_is_viewing_but_head_is_not(self):
         with tempfile.TemporaryDirectory() as folder:
             store = Telemetry(Path(folder) / "watch.sqlite3")
-            channel = iptv_multi.channels_from_entries([
-                ("TV", "Demo", "https://provider.invalid/private/channel")])[0]
-            manager = iptv_multi.MultiGateway([channel], Path(folder) / "private.m3u",
+            channel, other = iptv_multi.channels_from_entries([
+                ("TV", "Demo", "https://provider.invalid/private/channel"),
+                ("TV", "Other", "https://provider.invalid/private/other")])
+            manager = iptv_multi.MultiGateway([channel, other], Path(folder) / "private.m3u",
                                               max_streams=1, telemetry=store)
             with patch.object(iptv_multi.Gateway, "run", lambda g: g.stop.wait(3)):
                 worker = manager.start(channel.id)
@@ -173,6 +190,21 @@ class MultiChannelUsageTests(unittest.TestCase):
                     self.assertEqual(history["total_sessions"], 1)
                     self.assertEqual(history["channels"][0]["channel_id"], channel.id)
                     self.assertEqual(incidents["summary"]["client_error"], 1)
+                    with self.assertRaises(urllib.error.HTTPError) as denied:
+                        urllib.request.urlopen(url.replace(channel.id, other.id).replace("segment/15.ts", "index.m3u8"))
+                    self.assertEqual(denied.exception.code, 503)
+                    worker.gateway._notify_event("segment_slow", "SEGMENT_DOWNLOAD_SLOW", 12)
+                    store.flush()
+                    events = query_incidents(store.path)["events"]
+                    failure = next(e for e in events if e["detail"] == "HTTP_503_STREAM_LIMIT")
+                    context = failure["diagnostics"]
+                    self.assertEqual(context["client"], history["sessions"][0]["viewer"])
+                    self.assertEqual(context["max_streams"], 1)
+                    self.assertEqual(context["active"][0]["channel_id"], channel.id)
+                    self.assertEqual(context["route"], "manifest")
+                    slow = next(e for e in events if e["kind"] == "segment_slow")
+                    self.assertEqual(slow["diagnostics"]["last_downloaded_sequence"], 15)
+                    self.assertNotIn("private", json.dumps(events))
                 finally:
                     server.shutdown()
                     server.server_close()

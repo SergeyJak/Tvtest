@@ -17,6 +17,7 @@ from iptv_multi import MultiGateway, channels_from_text, make_multi_handler
 from iptv_profiles import ProfileStore, ProfileError
 from iptv_profile_gateway import ProfileRegistry
 from iptv_profile_jobs import generate_for_slot
+from iptv_telemetry import Telemetry, query_incidents
 
 
 PLAYLIST = """#EXTM3U
@@ -408,9 +409,32 @@ class ThreeCabinetTests(unittest.TestCase):
             self.assertEqual({r["slot"]: r["playing"] for r in rows if "playing" in r},
                              {viewer: viewer == 2})
 
+    def test_warmup_timeout_logs_missing_and_unconfigured_reserves(self):
+        telemetry = Telemetry(Path(self.temp.name) / "diagnostics.db")
+        self.addCleanup(telemetry.close)
+        self.base_manager.telemetry = telemetry
+        with patch("iptv_profiles.download_playlist", return_value=OTHER):
+            self.store.update(2, "Second", "https://provider.invalid/PRIVATE")
+        token = self.legacy_token.read_text()
+        channel_id = self.base_manager.order[0]
+        with self.assertRaises(urllib.error.HTTPError) as failed:
+            self.request(token, f"channel/{channel_id}/index.m3u8")
+        self.assertEqual(failed.exception.code, 503)
+        telemetry.flush()
+        rows = query_incidents(telemetry.path, kind="startup_timeout")["events"]
+        context = rows[0]["diagnostics"]
+        self.assertEqual(context["startup_wait_seconds"], 0)
+        self.assertIsNone(context["selected_slot"])
+        self.assertEqual(context["sources"]["2"]["state"], "NO_UNIQUE_CHANNEL_MATCH")
+        self.assertEqual(context["sources"]["3"]["state"], "NOT_CONFIGURED")
+        self.assertNotIn(token, json.dumps(rows))
+
     def test_three_viewers_start_on_own_sources_and_one_may_fail_over(self):
         """Each TV keeps its own token and begins on its own Edem CDN."""
         from collections import OrderedDict
+        telemetry = Telemetry(Path(self.temp.name) / "events.db")
+        self.addCleanup(telemetry.close)
+        self.registry.options["telemetry"] = telemetry
         tokens = {}
         ids = {}
         for slot in (1, 2, 3):
@@ -469,6 +493,28 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertIn(muxes[1].source_slot, (2, 3))
         self.assertEqual(muxes[2].source_slot, 2)
         self.assertEqual(muxes[3].source_slot, 3)
+        telemetry.flush()
+        switches = [e for e in query_incidents(telemetry.path)["events"]
+                    if e["kind"] == "cdn_decision" and e["detail"] == "SOURCE_UNAVAILABLE"]
+        self.assertEqual(len(switches), 1)
+        switch = switches[0]
+        self.assertEqual(switch["channel_id"], ids[1])
+        self.assertEqual(switch["diagnostics"]["from_slot"], 1)
+        self.assertEqual(switch["diagnostics"]["selected_slot"], muxes[1].source_slot)
+        self.assertFalse(switch["diagnostics"]["sources"]["1"]["fresh"])
+        # No alternative can contribute fresh video. Repeated polls log one decision.
+        for slot in (2, 3):
+            gw = self.registry.resolve(tokens[slot])[0].active[ids[slot]].gateway
+            gw.last_segment_download -= 90
+        muxes[1].last_switch -= 25
+        for _ in range(3):
+            self.registry.publish_failover(muxes[1], tokens[1])
+        telemetry.flush()
+        blocked = [e for e in query_incidents(telemetry.path)["events"]
+                   if e["detail"] == "NO_READY_BACKUP"]
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["diagnostics"]["sources"]["3"]["fresh"], False)
+        self.assertNotIn("PRIVATE_", json.dumps(switches + blocked))
         # A third TV requesting a different token cannot retrieve segments
         # from someone else's virtual stream.
         self.assertIsNot(muxes[1], muxes[2])

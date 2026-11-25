@@ -410,7 +410,8 @@ class AdminTests(unittest.TestCase):
             for index in range(230):
                 store.incident(cid, "segment_slow", "SEGMENT_DOWNLOAD_SLOW",
                                duration_seconds=11.4, timestamp=time.time()-index)
-            store.incident(cid, "stream_stalled", "NO_DOWNLOADED_SEGMENTS")
+            store.incident(cid, "stream_stalled", "NO_DOWNLOADED_SEGMENTS",
+                           diagnostics={"last_downloaded_sequence": 45})
             store.flush()
             self.login().close()
             with self.request("/admin/api/incidents/export?days=7") as response:
@@ -424,6 +425,9 @@ class AdminTests(unittest.TestCase):
             with self.request("/admin/api/incidents/export?days=7&kind=stream_stalled") as response:
                 stalled = list(csv.DictReader(io.StringIO(response.read().decode("utf-8-sig"))))
             self.assertEqual(len(stalled), 1)
+            self.assertEqual(stalled[0]["cabinet_slot"], "1")
+            self.assertEqual(json.loads(stalled[0]["diagnostics_json"]), {"last_downloaded_sequence": 45})
+            self.assertEqual(rows[-1]["diagnostics_json"], "")
             with self.assertRaises(urllib.error.HTTPError) as bad:
                 self.request("/admin/api/incidents/export?days=999")
             self.assertEqual(bad.exception.code, 400)
