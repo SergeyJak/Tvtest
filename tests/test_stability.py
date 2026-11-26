@@ -1,7 +1,9 @@
+import sqlite3
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import iptv_telemetry as telemetry
 
@@ -40,6 +42,78 @@ class StabilityTests(unittest.TestCase):
             self.assertEqual(result["episodes"][0]["recovery_slot"], 2)
             self.assertEqual(next(r for r in result["live"] if r["channel_id"] == "a"
                                   and r["viewer"] == "tv")["state"], "backup")
+
+    def test_cached_retry_updates_source_without_advancing_or_recovering(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "tv.db"
+            store = telemetry.Telemetry(path)
+            self.addCleanup(store.close)
+            t = int(time.time()) - 10
+            store.observe_segment("ch", "tv", t, piece="mux.104", source=2)
+            store.observe_segment("ch", "tv", t+1, piece="mux.103", source=1)
+            store.flush()
+            row, = telemetry.query_stability(path)["live"]
+            self.assertEqual((row["last_video"], row["source"], row["state"]),
+                             (t+1, 1, "playing"))
+            self.assertEqual(row["progress"], t)
+            for offset in (2, 3):
+                store.incident("ch", "client_error", timestamp=t+offset, diagnostics={"client": "tv"})
+            store.observe_segment("ch", "tv", t+4, piece="mux.104", source=2)
+            store.flush()
+            result = telemetry.query_stability(path)
+            row, = result["live"]
+            self.assertEqual((row["source"], row["progress"], row["state"]), (2, t, "interrupted"))
+            self.assertIsNone(result["episodes"][0]["recovered"])
+
+    def test_cleanup_keeps_only_active_old_episode_and_its_correct_recovery(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(telemetry, "time", wraps=time) as clock:
+            now = int(time.time())
+            old = now - 31 * 86400
+            clock.monotonic.return_value = 0
+            path = Path(folder) / "tv.db"
+            store = telemetry.Telemetry(path)
+            self.addCleanup(store.close)
+            for viewer in ("active", "gone"):
+                for ts in (old, old+1):
+                    store.incident("ch", "client_error", timestamp=ts, diagnostics={"client": viewer})
+            store.flush()
+            with sqlite3.connect(path) as db:
+                # Model continuous failed requests spanning the retention boundary.
+                db.execute("UPDATE delivery_clients SET seen=? WHERE viewer='active'", (now-2,))
+                db.execute("UPDATE delivery_clients SET seen=? WHERE viewer='gone'", (now-200,))
+            clock.monotonic.return_value = 6 * 3600 + 1
+            store.observe_manifest("ch", "active", "mux.1", 10, now-1)
+            store.flush()
+            with sqlite3.connect(path) as db:
+                self.assertEqual(db.execute("SELECT viewer FROM delivery_episodes").fetchall(), [("active",)])
+            for ts in (now-1, now):
+                store.incident("ch", "client_error", timestamp=ts, diagnostics={"client": "other"})
+            store.observe_segment("ch", "active", now, piece="mux.2", source=2)
+            store.flush()
+            with sqlite3.connect(path) as db:
+                self.assertEqual(dict(db.execute("SELECT viewer,recovered FROM delivery_episodes")),
+                                 {"active": now, "other": None})
+
+    def test_upgrade_repairs_dangling_and_reused_episode_ids(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "tv.db"
+            telemetry.prepare_database(path)
+            now = int(time.time())
+            with sqlite3.connect(path) as db:
+                db.execute("""INSERT INTO delivery_episodes(id,channel_id,viewer,reason,started,confirmed)
+                           VALUES (1,'a','owner','requests',?,?)""", (now, now))
+                for channel, viewer, episode in (("a", "owner", 1), ("a", "other", 1),
+                                                  ("b", "owner", 1), ("a", "orphan", 42)):
+                    db.execute("""INSERT INTO delivery_clients(channel_id,viewer,seen,first_error,episode)
+                               VALUES (?,?,?,?,?)""", (channel, viewer, now, now, episode))
+            store = telemetry.Telemetry(path)
+            self.addCleanup(store.close)
+            live = telemetry.query_stability(path)["live"]
+            self.assertEqual([(r["channel_id"], r["viewer"]) for r in live if r["episode"]], [("a", "owner")])
+            for channel, viewer in (("a", "other"), ("b", "owner"), ("a", "orphan")):
+                store.observe_segment(channel, viewer, now, piece="mux.2", source=2)
+            store.flush()
+            self.assertIsNone(telemetry.query_stability(path)["episodes"][0]["recovered"])
 
     def test_stale_manifest_needs_recent_requests_and_prior_delivery(self):
         with tempfile.TemporaryDirectory() as folder:

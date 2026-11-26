@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS delivery_clients (
     PRIMARY KEY(channel_id, viewer)
 );
 CREATE INDEX IF NOT EXISTS delivery_recent ON delivery_clients(seen);
+CREATE INDEX IF NOT EXISTS delivery_open ON delivery_clients(episode) WHERE episode IS NOT NULL;
 CREATE TABLE IF NOT EXISTS delivery_episodes (
     id INTEGER PRIMARY KEY, channel_id TEXT NOT NULL, viewer TEXT NOT NULL,
     reason TEXT NOT NULL, started INTEGER NOT NULL, confirmed INTEGER NOT NULL, recovered INTEGER, recovery_slot INTEGER
@@ -77,6 +78,11 @@ def prepare_database(path: Path) -> None:
         db.executescript(SCHEMA)
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("BEGIN IMMEDIATE")
+        # Older writers could prune an episode while its client still referenced it.
+        db.execute("""UPDATE delivery_clients AS c SET episode=NULL, first_error=NULL
+                      WHERE episode IS NOT NULL AND NOT EXISTS (
+                          SELECT 1 FROM delivery_episodes AS e WHERE e.id=c.episode
+                          AND e.viewer=c.viewer AND e.channel_id=c.channel_id AND e.recovered IS NULL)""")
         if "diagnostics" not in {row[1] for row in db.execute("PRAGMA table_info(incidents)")}:
             db.execute("ALTER TABLE incidents ADD COLUMN diagnostics TEXT")
     os.chmod(path, 0o600)
@@ -269,14 +275,15 @@ def record_delivery(db, cid, viewer, ts, kind, observation):
     reason = None
     if kind == "watch":
         piece, source = observation
-        state["last_video"] = ts
+        state.update(last_video=ts, source=source)
         old_generation, _, old_number = (state["piece"] or "").rpartition(".")
         generation, _, number = piece.rpartition(".")
         if not old_number or old_generation != generation or int(number) > int(old_number):
             if state["episode"] is not None:
-                db.execute("UPDATE delivery_episodes SET recovered=?, recovery_slot=? WHERE id=?",
-                           (ts, source, state["episode"]))
-            state.update(progress=ts, piece=piece, source=source, first_error=None, episode=None)
+                db.execute("""UPDATE delivery_episodes SET recovered=?, recovery_slot=?
+                              WHERE id=? AND channel_id=? AND viewer=? AND recovered IS NULL""",
+                           (ts, source, state["episode"], cid, viewer))
+            state.update(progress=ts, piece=piece, first_error=None, episode=None)
     elif kind == "manifest":
         edge, stall_seconds = observation
         if edge != state["edge"]:
@@ -316,8 +323,9 @@ def query_stability(path, days=1, slot=0):
             return empty
         since = db.execute("SELECT installed FROM delivery_monitor WHERE id=1").fetchone()[0]
         live = []
-        for row in db.execute("""SELECT c.channel_id,c.viewer,seen,last_video,progress,source,first_error,episode,e.reason
+        for row in db.execute("""SELECT c.channel_id,c.viewer,seen,last_video,progress,source,first_error,e.id AS episode,e.reason
                 FROM delivery_clients c LEFT JOIN delivery_episodes e ON e.id=c.episode
+                    AND e.viewer=c.viewer AND e.channel_id=c.channel_id AND e.recovered IS NULL
                 WHERE seen>=? ORDER BY c.channel_id,c.viewer""", (now-SESSION_GAP_SECONDS,)):
             item = dict(row)
             if item["episode"] is not None:
@@ -436,9 +444,13 @@ class Telemetry:
                               json.dumps(diagnostics, separators=(",", ":")) if diagnostics else None))
                     db.commit()
                     if time.monotonic() - last_cleanup > 6 * 3600:
-                        cutoff = int(time.time()) - RETENTION_DAYS * 86400
-                        db.execute("DELETE FROM delivery_clients WHERE seen < ?", (cutoff,))
-                        db.execute("DELETE FROM delivery_episodes WHERE confirmed < ?", (cutoff,))
+                        now = int(time.time())
+                        cutoff = now - RETENTION_DAYS * 86400
+                        # Client state only spans a live session. Keep older episodes as long as
+                        # a live client needs them to record recovery, even across the cutoff.
+                        db.execute("DELETE FROM delivery_clients WHERE seen < ?", (now - SESSION_GAP_SECONDS,))
+                        db.execute("""DELETE FROM delivery_episodes WHERE confirmed < ? AND id NOT IN
+                                      (SELECT episode FROM delivery_clients WHERE episode IS NOT NULL)""", (cutoff,))
                         db.execute("DELETE FROM incidents WHERE occurred_at < ?", (cutoff,))
                         db.execute("DELETE FROM viewing_sessions WHERE last_seen < ?", (cutoff,))
                         db.execute("""
