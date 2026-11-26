@@ -43,6 +43,80 @@ class StabilityTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_reset_keeps_active_segment_sequence_private_until_new_progress(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "tv.db"
+            store = telemetry.Telemetry(path)
+            try:
+                now = int(time.time())
+                store.observe_segment("ch", "tv", now-5, piece="mux.104", source=2)
+                store.flush()
+                reset = telemetry.reset_stability(path)
+                # Another viewer's last pre-reset segment was still queued.
+                store.observe_segment("ch", "queued", reset-2, piece="mux.104", source=2)
+                store.flush()
+                self.assertEqual(telemetry.query_stability(path)["live"], [])
+                for viewer in ("tv", "queued"):
+                    for offset in (1, 2):
+                        store.incident("ch", "client_error", timestamp=reset+offset,
+                                       diagnostics={"client": viewer})
+                    store.observe_segment("ch", viewer, reset+3, piece="mux.103", source=1)
+                store.flush()
+                data = telemetry.query_stability(path)
+                self.assertEqual(len(data["episodes"]), 2)
+                for episode in data["episodes"]:
+                    self.assertIsNone(episode["recovered"])
+                    self.assertEqual(episode["reason"], "requests")
+                for client in data["live"]:
+                    self.assertEqual(client["state"], "interrupted")
+                    self.assertEqual(client["source"], 1)
+                    self.assertIsNone(client["progress"])
+                store.observe_segment("ch", "tv", reset+4, piece="mux.105", source=2)
+                store.flush()
+                recovered = {r["viewer"]: r["recovered"] for r in telemetry.query_stability(path)["episodes"]}
+                self.assertEqual(recovered, {"tv": reset+4, "queued": None})
+            finally:
+                store.close()
+
+    def test_reset_recovers_missing_marker_and_preserves_cutoff_on_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "tv.db"
+            telemetry.prepare_database(path)
+            with sqlite3.connect(path) as db:
+                db.execute("DELETE FROM delivery_reset")
+                db.execute("""INSERT INTO incidents(occurred_at,channel_id,kind,detail)
+                              VALUES(?, 'ch','client_error','ERROR')""", (int(time.time())-1,))
+            self.assertEqual(telemetry.query_stability(path)["channels"][0]["errors"], 1)
+            reset = telemetry.reset_stability(path)
+            telemetry.prepare_database(path)
+            result = telemetry.query_stability(path)
+            self.assertEqual(result["since"], reset)
+            self.assertEqual(result["channels"], [])
+            self.assertEqual(telemetry.query_incidents(path)["total"], 1)
+
+    def test_other_connection_cannot_see_partial_schema_upgrade(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "tv.db"
+            telemetry.prepare_database(path)
+            with sqlite3.connect(path) as reader:
+                reader.execute("DROP TABLE delivery_reset")
+                table_count = "SELECT COUNT(*) FROM sqlite_master WHERE name='delivery_reset'"
+                visible_before_seed = []
+                connect = sqlite3.connect
+
+                def migration_connection(*args, **kwargs):
+                    db = connect(*args, **kwargs)
+                    def observe(sql):
+                        if sql.strip().startswith("INSERT OR IGNORE INTO delivery_reset"):
+                            visible_before_seed.append(reader.execute(table_count).fetchone()[0])
+                    db.set_trace_callback(observe)
+                    return db
+
+                with patch.object(telemetry.sqlite3, "connect", migration_connection):
+                    telemetry.prepare_database(path)
+                self.assertEqual(visible_before_seed, [0])
+                self.assertEqual(reader.execute("SELECT reset_at FROM delivery_reset").fetchall(), [(0,)])
+
     def test_concurrent_delivery_errors_reserve_and_recovery(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "tv.db"
