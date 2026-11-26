@@ -41,6 +41,7 @@
     state.overview = null;
     stabilityRequest++;
     resetStability();
+    text("stability-reset-status", "");
     state.cdnHome = null;
     state.cdnChannelByHome = {};
     $("connection-error").hidden = true;
@@ -1063,7 +1064,32 @@
     $("stability-next").disabled = stabilityPage + 1 === count;
     text("stability-page", (stabilityPage + 1) + " / " + count);
   }
+  let stabilityResetting = false;
+  async function clearStability() {
+    if (stabilityResetting || !window.confirm("Сбросить статистику стабильности всех кабинетов? История просмотров и журнал ошибок сохранятся.")) return;
+    stabilityResetting = true;
+    stabilityRequest++;
+    const button = $("stability-reset");
+    button.disabled = true;
+    text("stability-reset-status", "Сбрасываем статистику…");
+    try {
+      await api("stability/reset", {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"},
+        body: JSON.stringify({confirm: "RESET_STABILITY"})
+      });
+      resetStability();
+      text("stability-reset-status", "Статистика сброшена для всех кабинетов.");
+    } catch (_error) {
+      text("stability-reset-status", "Не удалось сбросить статистику.");
+    } finally {
+      stabilityResetting = false;
+      button.disabled = false;
+      if (!app.hidden && state.view === "stability") await loadStability();
+    }
+  }
   async function loadStability() {
+    if (stabilityResetting) return;
     const request = ++stabilityRequest;
     const selector = $("stability-slot"), slot = Number(selector.value), days = $("stability-days").value;
     try {
@@ -1078,7 +1104,7 @@
       selector.replaceChildren(new Option("Все кабинеты", "0"), ...data.cabins.map(c => new Option(c.name, c.slot)));
       selector.value = String(slot);
       text("stability-notice", (data.recording ? "Активность за последние 90 секунд." : "Свежие данные шлюза недоступны.") +
-        " Ошибки — ответы 404 и 503 на запросы видео и плейлиста. Эпизоды учитываются с " + localTime(data.since) + ".");
+        " Ошибки — ответы 404 и 503 на запросы видео и плейлиста. Сбор эпизодов с " + localTime(data.since) + ".");
       const live = $("stability-live");
       live.replaceChildren();
       for (const cabin of data.cabins.filter(c => !slot || slot === c.slot)) {
@@ -1218,6 +1244,7 @@
     text("stability-notice", "Загрузка данных…");
     loadStability();
   });
+  $("stability-reset").addEventListener("click", clearStability);
   $("stability-prev").addEventListener("click", () => { stabilityPage--; renderStabilityChannels(); });
   $("stability-next").addEventListener("click", () => { stabilityPage++; renderStabilityChannels(); });
   $("incident-days").addEventListener("change", loadIncidents);

@@ -470,6 +470,43 @@ class AdminTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_reset_stability_requires_auth_and_confirmation(self):
+        store = Telemetry(self.state.telemetry_db)
+        try:
+            cid = admin.channels_from_text(PLAYLIST)[0].id
+            store.observe_segment(cid, "tv", time.time()-10, piece="1", source=1)
+            store.incident(cid, "client_error", timestamp=time.time()-5, diagnostics={"client": "tv"})
+            store.flush()
+            url = self.url + "/admin/api/stability/reset"
+            headers = {"Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest"}
+            body = b'{"confirm":"RESET_STABILITY"}'
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.opener.open(urllib.request.Request(url, data=body, headers=headers), timeout=4)
+            self.assertEqual(error.exception.code, 401)
+            self.login().close()
+            for invalid_headers, invalid_body, code in (
+                ({"Content-Type": "application/json"}, body, 403),
+                (headers, b'{}', 400),
+            ):
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    self.opener.open(urllib.request.Request(url, data=invalid_body, headers=invalid_headers), timeout=4)
+                self.assertEqual(error.exception.code, code)
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                self.request("/admin/api/stability/reset")
+            self.assertEqual(error.exception.code, 405)
+            with self.request("/admin/api/stability?days=30") as response:
+                self.assertEqual(len(json.load(response)["channels"]), 1)
+            with self.opener.open(urllib.request.Request(url, data=body, headers=headers), timeout=4) as response:
+                self.assertGreater(json.load(response)["since"], 0)
+            with self.request("/admin/api/stability?days=30") as response:
+                self.assertEqual(json.load(response)["channels"], [])
+            with self.request("/admin/api/incidents?days=7") as response:
+                self.assertEqual(json.load(response)["total"], 1)
+            with self.request("/admin/api/history?days=7") as response:
+                self.assertEqual(json.load(response)["total_sessions"], 1)
+        finally:
+            store.close()
+
     def test_profiles_api_renames_and_hides_provider_playlist_source(self):
         self.login().close()
         with self.request("/admin/api/profiles") as response:

@@ -31,7 +31,7 @@ from pathlib import Path
 from iptv_multi import channels_from_text
 from iptv_resource_monitor import ResourceSampler
 from iptv_profiles import ProfileStore, ProfileError
-from iptv_telemetry import query_stability, viewing_slot, query_viewing, query_incidents, export_incident_rows, clear_incidents
+from iptv_telemetry import query_stability, viewing_slot, query_viewing, query_incidents, export_incident_rows, clear_incidents, reset_stability
 
 ASSETS = Path(__file__).resolve().parent / "admin"
 SESSION_SECONDS = 8 * 3600
@@ -560,7 +560,7 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                             "/admin/api/session", "/admin/api/login",
                             "/admin/api/logout", "/admin/api/overview",
                             "/admin/api/channels", "/admin/api/tv-links", "/admin/api/history",
-                            "/admin/api/stability", "/admin/api/incidents", "/admin/api/incidents/export",
+                            "/admin/api/stability", "/admin/api/stability/reset", "/admin/api/incidents", "/admin/api/incidents/export",
                             "/admin/api/incidents/clear", "/admin/api/profiles") and not re.fullmatch(
                                 r"/admin/api/profiles/[123]", path):
                 return self.respond(404, b"Not found", "text/plain", head=head)
@@ -611,6 +611,23 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                     message = str(exc) if isinstance(exc, ProfileError) else "Некорректные данные"
                     return self.respond(400, json.dumps({"error": message}, ensure_ascii=False).encode("utf-8"), head=head)
                 return self.respond(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), head=head)
+            if path == "/admin/api/stability/reset":
+                if self.command != "POST":
+                    return self.respond(405, b"", head=head)
+                if self.headers.get("X-Requested-With") != "XMLHttpRequest":
+                    return self.respond(403, b'{"error":"forbidden"}', head=head)
+                try:
+                    size = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < size <= 256:
+                        raise ValueError()
+                    if json.loads(self.rfile.read(size)) != {"confirm": "RESET_STABILITY"}:
+                        raise ValueError()
+                    since = reset_stability(state.telemetry_db)
+                except (ValueError, json.JSONDecodeError):
+                    return self.respond(400, b'{"error":"confirmation_required"}', head=head)
+                except OSError:
+                    return self.respond(503, b'{"error":"database_unavailable"}', head=head)
+                return self.respond(200, json.dumps({"since": since}).encode("utf-8"), head=head)
             if path == "/admin/api/incidents/clear" and self.command == "POST":
                 # SameSite cookie plus a non-simple custom header defends
                 # against cross-site form submissions. Never clear on GET.

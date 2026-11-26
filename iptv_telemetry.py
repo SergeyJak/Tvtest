@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS delivery_monitor (
     id INTEGER PRIMARY KEY CHECK(id=1), installed INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO delivery_monitor VALUES (1, CAST(strftime('%s','now') AS INTEGER));
+CREATE TABLE IF NOT EXISTS delivery_reset (
+    id INTEGER PRIMARY KEY CHECK(id=1), reset_at INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO delivery_reset VALUES (1, 0);
 CREATE TABLE IF NOT EXISTS delivery_clients (
     channel_id TEXT NOT NULL, viewer TEXT NOT NULL, seen INTEGER NOT NULL,
     last_video INTEGER, progress INTEGER, piece TEXT, source INTEGER,
@@ -75,9 +79,9 @@ def prepare_database(path: Path) -> None:
     if path.parent.stat().st_mode & 0o077:
         raise ValueError("Telemetry directory must not be accessible by other users")
     with sqlite3.connect(path, timeout=5) as db:
-        db.executescript(SCHEMA)
         db.execute("PRAGMA journal_mode=WAL")
-        db.execute("BEGIN IMMEDIATE")
+        # executescript commits a preceding transaction; start the migration inside the script.
+        db.executescript("BEGIN IMMEDIATE;\n" + SCHEMA)
         # Older writers could prune an episode while its client still referenced it.
         db.execute("""UPDATE delivery_clients AS c SET episode=NULL, first_error=NULL
                       WHERE episode IS NOT NULL AND NOT EXISTS (
@@ -261,7 +265,35 @@ def clear_incidents(path: Path) -> int:
         raise OSError("Incident database unavailable") from None
 
 
+def reset_stability(path: Path) -> int:
+    """Reset delivery monitoring without removing the incident or viewing history."""
+    if not path.is_file():
+        raise OSError("Stability database unavailable")
+    try:
+        with sqlite3.connect(path, timeout=5) as db:
+            db.execute("BEGIN IMMEDIATE")
+            reset_at = int(time.time())
+            db.execute("""INSERT INTO delivery_reset (id, reset_at) VALUES (1, ?)
+                          ON CONFLICT(id) DO UPDATE SET reset_at=excluded.reset_at""", (reset_at,))
+            # Keep only the last sequence of each active session, hidden until its next request.
+            db.execute("DELETE FROM delivery_clients WHERE piece IS NULL OR seen < ?",
+                       (reset_at - SESSION_GAP_SECONDS,))
+            db.execute("""UPDATE delivery_clients SET last_video=NULL, progress=NULL, source=NULL,
+                          edge=NULL, edge_since=NULL, first_error=NULL, episode=NULL""")
+            db.execute("DELETE FROM delivery_episodes")
+            return reset_at
+    except sqlite3.Error:
+        raise OSError("Stability database unavailable") from None
+
+
 def record_delivery(db, cid, viewer, ts, kind, observation):
+    # Serialize the reset and observation, including queued pre-reset requests.
+    if not db.in_transaction:
+        db.execute("BEGIN IMMEDIATE")
+    reset_at = db.execute("SELECT reset_at FROM delivery_reset WHERE id=1").fetchone()[0]
+    before_reset = ts <= reset_at
+    if before_reset and (kind != "watch" or ts < reset_at - SESSION_GAP_SECONDS):
+        return
     row = db.execute("SELECT * FROM delivery_clients WHERE channel_id=? AND viewer=?",
                      (cid, viewer)).fetchone()
     if row and ts < row["seen"]:
@@ -275,28 +307,31 @@ def record_delivery(db, cid, viewer, ts, kind, observation):
     reason = None
     if kind == "watch":
         piece, source = observation
-        state.update(last_video=ts, source=source)
+        if not before_reset:
+            state.update(last_video=ts, source=source)
         old_generation, _, old_number = (state["piece"] or "").rpartition(".")
         generation, _, number = piece.rpartition(".")
         if not old_number or old_generation != generation or int(number) > int(old_number):
-            if state["episode"] is not None:
-                db.execute("""UPDATE delivery_episodes SET recovered=?, recovery_slot=?
-                              WHERE id=? AND channel_id=? AND viewer=? AND recovered IS NULL""",
-                           (ts, source, state["episode"], cid, viewer))
-            state.update(progress=ts, piece=piece, first_error=None, episode=None)
+            state["piece"] = piece
+            if not before_reset:
+                if state["episode"] is not None:
+                    db.execute("""UPDATE delivery_episodes SET recovered=?, recovery_slot=?
+                                  WHERE id=? AND channel_id=? AND viewer=? AND recovered IS NULL""",
+                               (ts, source, state["episode"], cid, viewer))
+                state.update(progress=ts, first_error=None, episode=None)
     elif kind == "manifest":
         edge, stall_seconds = observation
         if edge != state["edge"]:
             state.update(edge=edge, edge_since=ts)
-        elif state["progress"] is not None:
-            started = max(state["edge_since"], state["progress"])
+        elif state["piece"] is not None:
+            started = max(state["edge_since"], state["progress"] or 0)
             if ts - started >= stall_seconds:
                 reason = "playlist"
     else:
         if state["first_error"] is None:
             state["first_error"] = ts
         else:
-            reason = "requests" if state["last_video"] is not None else "startup"
+            reason = "requests" if state["piece"] is not None else "startup"
             started = state["first_error"]
     if reason and state["episode"] is None:
         state["episode"] = db.execute("""INSERT INTO delivery_episodes
@@ -322,11 +357,16 @@ def query_stability(path, days=1, slot=0):
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_monitor'").fetchone():
             return empty
         since = db.execute("SELECT installed FROM delivery_monitor WHERE id=1").fetchone()[0]
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_reset'").fetchone():
+            reset_at = db.execute("SELECT MAX(reset_at) FROM delivery_reset").fetchone()[0]
+            if reset_at:
+                since = reset_at
+                cutoff = max(cutoff, reset_at + 1)
         live = []
         for row in db.execute("""SELECT c.channel_id,c.viewer,seen,last_video,progress,source,first_error,e.id AS episode,e.reason
                 FROM delivery_clients c LEFT JOIN delivery_episodes e ON e.id=c.episode
                     AND e.viewer=c.viewer AND e.channel_id=c.channel_id AND e.recovered IS NULL
-                WHERE seen>=? ORDER BY c.channel_id,c.viewer""", (now-SESSION_GAP_SECONDS,)):
+                WHERE seen>=? ORDER BY c.channel_id,c.viewer""", (max(now-SESSION_GAP_SECONDS, cutoff),)):
             item = dict(row)
             if item["episode"] is not None:
                 state = "stale_playlist" if item["reason"] == "playlist" else "interrupted"
