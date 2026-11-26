@@ -33,6 +33,7 @@
       <div class="side-label">РАБОЧЕЕ ПРОСТРАНСТВО</div>
       <nav class="side-nav" aria-label="Навигация">
         <button type="button" class="nav-button active" data-target="overview"><span class="nav-icon">◈</span> Обзор</button>
+        <button type="button" class="nav-button" data-target="stability"><span class="nav-icon">∿</span> Стабильность</button>
         <button type="button" class="nav-button" data-target="cdn"><span class="nav-icon">◎</span> CDN-монитор</button>
         <button type="button" class="nav-button" data-target="channels"><span class="nav-icon">▤</span> Каналы</button>
         <button type="button" class="nav-button" data-target="epg"><span class="nav-icon">▦</span> Телепрограмма</button>
@@ -188,6 +189,28 @@
             <p>EPG берётся из заголовка загруженного M3U или из отдельного XMLTV URL, указанного в карточке.
             Для каждого кабинета создаётся свой XMLTV с правильными идентификаторами каналов.
             Если приложение не подтянуло EPG автоматически, вставь его ссылку в настройках плеера.</p>
+          </article>
+        </section>
+
+        <section class="view" id="view-stability" hidden>
+          <div class="view-heading">
+            <div><h1>Стабильность выдачи<span class="accent">.</span></h1><p>Что шлюз отдаёт плеерам и где выдача прерывается.</p></div>
+            <div class="period-controls">
+              <label>Кабинет <select id="stability-slot"><option value="0">Все кабинеты</option></select></label>
+              <select id="stability-days" aria-label="Период стабильности"><option value="1">За 24 часа</option><option value="7">За 7 дней</option><option value="30">За 30 дней</option></select>
+            </div>
+          </div>
+          <p id="stability-notice" class="notice" role="status">Загрузка данных…</p>
+          <div id="stability-live" class="stability-live"></div>
+          <article class="panel stability-panel">
+            <div class="panel-heading"><h2>Ошибки выдачи по каналам</h2><span id="stability-total" class="resource-note"></span></div>
+            <div class="stability-scroll"><table><thead><tr><th>Кабинет</th><th>Канал</th><th>Ошибки запросов</th><th>Эпизоды</th></tr></thead><tbody id="stability-channels"></tbody></table></div>
+            <div class="history-event-pages" id="stability-pages" hidden><button id="stability-prev" type="button">Назад</button><span id="stability-page"></span><button id="stability-next" type="button">Далее</button></div>
+          </article>
+          <article class="panel stability-panel">
+            <div class="panel-heading"><h2>Последние эпизоды</h2></div>
+            <p class="resource-note">Эпизод начинается при повторном отказе или когда плеер продолжает получать один и тот же плейлист без новых фрагментов. Восстановление фиксируется по выдаче следующего фрагмента.</p>
+            <div id="stability-episodes"></div>
           </article>
         </section>
 

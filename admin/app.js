@@ -5,7 +5,7 @@
   const app = $("app");
   const loginScreen = $("login-screen");
   const state = {overview: null, channels: [], epgStatus: "", page: 0, size: 50, lastCatalog: 0, view: "overview", busy: false, cdnHome: null, cdnChannelByHome: {}};
-  const views = {overview:"ОБЗОР", cdn:"CDN-МОНИТОР", channels:"КАНАЛЫ", epg:"ТЕЛЕПРОГРАММА", tv:"КАБИНЕТЫ ТВ", history:"ПРОСМОТРЫ", incidents:"ОШИБКИ И ЗАВИСАНИЯ", system:"ДИАГНОСТИКА"};
+  const views = {stability:"СТАБИЛЬНОСТЬ", overview:"ОБЗОР", cdn:"CDN-МОНИТОР", channels:"КАНАЛЫ", epg:"ТЕЛЕПРОГРАММА", tv:"КАБИНЕТЫ ТВ", history:"ПРОСМОТРЫ", incidents:"ОШИБКИ И ЗАВИСАНИЯ", system:"ДИАГНОСТИКА"};
 
   function text(id, value) {
     const node = $(id);
@@ -33,11 +33,14 @@
     if (name === "channels") renderChannels();
     if (name === "epg") renderGroups();
     if (name === "tv") loadTvProfiles();
+    if (name === "stability") loadStability();
     if (name === "history") loadHistory();
     if (name === "incidents") loadIncidents();
   }
   function showLogin() {
     state.overview = null;
+    stabilityRequest++;
+    resetStability();
     state.cdnHome = null;
     state.cdnChannelByHome = {};
     $("connection-error").hidden = true;
@@ -1023,12 +1026,112 @@
     }
   }
 
+  let stabilityRequest = 0;
+  let stabilityPage = 0;
+  let stabilityData = null;
+  const deliveryStates = {
+    playing:["Видео отдаётся", "success"], backup:["Видео через резерв", "success"],
+    interrupted:["Проблема с выдачей", "danger"], error:["Отказ запроса", "warning"],
+    stale_playlist:["Плейлист без обновлений", "warning"], waiting:["Ожидание видео", "neutral"]
+  };
+  function resetStability() {
+    stabilityData = null;
+    stabilityPage = 0;
+    for (const id of ["live", "channels", "episodes", "total"]) $("stability-" + id).replaceChildren();
+    $("stability-pages").hidden = true;
+  }
+  function renderStabilityChannels() {
+    if (!stabilityData) return;
+    const rows = stabilityData.channels;
+    const count = Math.max(1, Math.ceil(rows.length / 20));
+    stabilityPage = Math.min(stabilityPage, count - 1);
+    const table = $("stability-channels");
+    table.replaceChildren();
+    for (const row of rows.slice(stabilityPage * 20, stabilityPage * 20 + 20)) {
+      const tr = element("tr");
+      for (const value of [row.cabinet, row.channel_name, n(row.errors), n(row.episodes)]) tr.append(element("td", "", value));
+      table.append(tr);
+    }
+    if (!rows.length) {
+      const tr = element("tr"), td = element("td", "", "За этот период записей нет.");
+      td.colSpan = 4;
+      tr.append(td);
+      table.append(tr);
+    }
+    $("stability-pages").hidden = count === 1;
+    $("stability-prev").disabled = stabilityPage === 0;
+    $("stability-next").disabled = stabilityPage + 1 === count;
+    text("stability-page", (stabilityPage + 1) + " / " + count);
+  }
+  async function loadStability() {
+    const request = ++stabilityRequest;
+    const selector = $("stability-slot"), slot = Number(selector.value), days = $("stability-days").value;
+    try {
+      const data = await api("stability?days=" + days + "&slot=" + slot);
+      if (request !== stabilityRequest || state.view !== "stability" || app.hidden) return;
+      if (!data.available) {
+        resetStability();
+        text("stability-notice", "Нет данных мониторинга. Проверь обновление шлюза и запись телеметрии.");
+        return;
+      }
+      const names = new Map(data.cabins.map(c => [c.slot, c.name]));
+      selector.replaceChildren(new Option("Все кабинеты", "0"), ...data.cabins.map(c => new Option(c.name, c.slot)));
+      selector.value = String(slot);
+      text("stability-notice", (data.recording ? "Активность за последние 90 секунд." : "Свежие данные шлюза недоступны.") +
+        " Ошибки — ответы 404 и 503 на запросы видео и плейлиста. Эпизоды учитываются с " + localTime(data.since) + ".");
+      const live = $("stability-live");
+      live.replaceChildren();
+      for (const cabin of data.cabins.filter(c => !slot || slot === c.slot)) {
+        const card = element("article", "panel");
+        card.append(element("h2", "", cabin.name));
+        const clients = data.live.filter(row => row.slot === cabin.slot);
+        if (!cabin.recording || !clients.length) card.append(element("p", "resource-note", cabin.recording ? "Нет активного просмотра" : "Нет связи с телеметрией"));
+        else for (const row of clients) {
+          const group = element("div", "activity-row");
+          const [label, tone] = deliveryStates[row.state];
+          group.append(element("div", "activity-title", row.channel_name),
+            element("span", "incident-type " + tone, label),
+            element("div", "activity-sub", "Клиент " + row.viewer.slice(0, 8) +
+              (row.source ? " · Источник: " + names.get(row.source) : "") +
+              (row.last_video ? " · Последняя выдача " + new Date(row.last_video * 1000).toLocaleTimeString("ru-RU") : "")));
+          card.append(group);
+        }
+        live.append(card);
+      }
+      for (const row of data.channels) row.cabinet = names.get(row.slot);
+      stabilityData = data;
+      renderStabilityChannels();
+      text("stability-total", "Ошибок: " + n(data.channels.reduce((a,r) => a + r.errors, 0)) +
+        " · Эпизодов: " + n(data.channels.reduce((a,r) => a + r.episodes, 0)));
+      const episodes = $("stability-episodes");
+      episodes.replaceChildren();
+      if (!data.episodes.length) episodes.append(element("p", "resource-note", "За этот период эпизодов не зафиксировано."));
+      for (const row of data.episodes) {
+        const group = element("div", "activity-row");
+        const open = data.cabins.some(c => c.slot === row.slot && c.recording) && data.live.some(r => r.episode === row.id);
+        group.append(element("div", "activity-title", names.get(row.slot) + " · " + row.channel_name),
+          element("div", "activity-sub", localTime(row.started) + " · Клиент " + row.viewer.slice(0, 8) + " · " +
+            (row.reason === "playlist" ? "Плейлист перестал обновляться" :
+              row.reason === "startup" ? "Повторные отказы при открытии" : "Повторные отказы запросов") + " · " +
+            (row.recovered != null ? "Выдача возобновилась через " + duration(row.recovered - row.started) +
+              (row.recovery_slot !== row.slot ? " · Резерв: " + names.get(row.recovery_slot) : "") :
+              open ? "Продолжается" : "Возобновление не зафиксировано")));
+        episodes.append(group);
+      }
+    } catch (error) {
+      if (request !== stabilityRequest || state.view !== "stability" || app.hidden) return;
+      resetStability();
+      text("stability-notice", "Не удалось загрузить данные стабильности.");
+    }
+  }
+
   async function refresh(force) {
     if (state.busy || app.hidden) return;
     state.busy = true;
     $("refresh-button").disabled = true;
     let received = false;
     try {
+      if (state.view === "stability") await loadStability();
       const data = await api("overview");
       updateOverview(data);
       received = true;
@@ -1110,6 +1213,13 @@
       loadHistory();
     });
   }
+  for (const id of ["stability-slot", "stability-days"]) $(id).addEventListener("change", () => {
+    resetStability();
+    text("stability-notice", "Загрузка данных…");
+    loadStability();
+  });
+  $("stability-prev").addEventListener("click", () => { stabilityPage--; renderStabilityChannels(); });
+  $("stability-next").addEventListener("click", () => { stabilityPage++; renderStabilityChannels(); });
   $("incident-days").addEventListener("change", loadIncidents);
   $("incident-filter").addEventListener("change", loadIncidents);
   $("incident-refresh").addEventListener("click", loadIncidents);

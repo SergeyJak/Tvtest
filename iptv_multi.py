@@ -87,6 +87,7 @@ class ActiveStream:
     def __init__(self, channel: Channel, gateway: Gateway, slots: threading.BoundedSemaphore,
                  pinned: bool = False, standby: bool = False):
         self.channel = channel
+        self.delivery_generation = str(time.monotonic_ns())
         self.gateway = gateway
         self.pinned = pinned
         self.standby = standby
@@ -386,11 +387,6 @@ def make_multi_handler(manager: MultiGateway, token: str,
                                                **(diagnostics or {}), "route": route,
                                                "client": self.viewer_identity()})
 
-        def track_view(self, cid):
-            manager = self._request_manager
-            if manager.telemetry is not None and not self._head:
-                manager.telemetry.observe_segment(manager.telemetry_channel_id(cid), self.viewer_identity())
-
         def log_message(self, *_args):
             pass  # No token, viewer IP, or upstream URLs in logs.
 
@@ -414,7 +410,8 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 try:
                     self.wfile.write(body)
                 except (BrokenPipeError, ConnectionResetError):
-                    pass
+                    return False
+            return True
 
         def serve_epg(self, head: bool, epg_file: Path):
             """Conditional and streaming EPG delivery without reading the 43 MB
@@ -606,8 +603,18 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 if profile_registry is not None and pilot is None:
                     after += b"native."
                 stream.gateway.record_client("manifest", 200)
-                return self.respond(200, raw.replace(before, after),
-                                    "application/vnd.apple.mpegurl", head)
+                sent = self.respond(200, raw.replace(before, after), "application/vnd.apple.mpegurl", head)
+                if sent and request_manager.telemetry is not None:
+                    # Extract only the public sequence and target duration from the exact response.
+                    edge = re.search(rb"[/.]([0-9]+)\.ts\s*$", raw)
+                    target = re.search(rb"#EXT-X-TARGETDURATION:(\d+)", raw)
+                    if edge and target:
+                        generation = pilot[0].generation if pilot else stream.delivery_generation
+                        request_manager.telemetry.observe_manifest(
+                            request_manager.telemetry_channel_id(cid), self.viewer_identity(),
+                            generation + "." + edge[1].decode("ascii"), int(target[1]),
+                            window_seconds=sum(float(value) for value in re.findall(rb"#EXTINF:([0-9.]+),", raw)))
+                return
             if len(route) == 4 and resource == "segment" and route[3].endswith(".ts"):
                 match = re.fullmatch(r"(?:(native|[a-f0-9]{24})\.)?([0-9]{1,20})\.ts", route[3])
                 if match is None:
@@ -616,21 +623,30 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 # Older virtual and native manifests both used bare numbers.
                 # Only the original prewarm alias is unambiguously native.
                 if generation is None and profile_registry is not None and path.startswith(prefix + "/channel/"):
+                    self.track_client_failure(cid, "STREAM_EXPIRED", 404, "segment")
                     return self.respond(404, b"Segment expired", "text/plain", head)
                 mux = None
                 if generation not in (None, "native"):
                     mux = profile_registry.existing_failover(active_token, cid) if profile_registry else None
                     if mux is None or mux.generation != generation:
+                        self.track_client_failure(cid, "STREAM_EXPIRED", 404, "segment")
                         return self.respond(404, b"Segment expired", "text/plain", head)
                 # An expired stream is not restarted on a stale segment URL.
                 stream = request_manager.active_stream(cid)
                 if stream is None:
                     self.track_client_failure(cid, "STREAM_EXPIRED", 404, "segment")
                     return self.respond(404, b"Stream expired", "text/plain", head)
+                source = request_manager.profile_slot
                 if mux is not None:
-                    data = mux.segment(seq)
+                    record = mux.segment_record(seq)
+                    data = record.content if record else None
+                    if record:
+                        source = record.source_slot
+                    piece = f"{generation}.{seq}"
                 else:
-                    data = stream.gateway.segment(seq, record_miss=True)
+                    with stream.gateway.lock:
+                        data = stream.gateway.segment(seq, record_miss=True)
+                        piece = f"{stream.delivery_generation}.{stream.gateway.cache_epoch}.{seq}"
                 if data is None:
                     self.track_client_failure(cid, "SEGMENT_CACHE_MISS", 404, "segment")
                     return self.respond(404, b"Segment not in cache", "text/plain", head)
@@ -652,13 +668,13 @@ def make_multi_handler(manager: MultiGateway, token: str,
                                             {"Content-Range": f"bytes */{len(data)}"})
                     last = min(last, len(data) - 1)
                     extra["Content-Range"] = f"bytes {first}-{last}/{len(data)}"
-                    stream.gateway.record_client("segment", 206)
-                    self.track_view(cid)
-                    return self.respond(206, data[first:last + 1], "video/mp2t",
-                                        head, extra)
-                stream.gateway.record_client("segment", 200)
-                self.track_view(cid)
-                return self.respond(200, data, "video/mp2t", head, extra)
+                    data = data[first:last + 1]
+                status = 206 if requested_range else 200
+                stream.gateway.record_client("segment", status)
+                if self.respond(status, data, "video/mp2t", head, extra) and not head and request_manager.telemetry:
+                    request_manager.telemetry.observe_segment(request_manager.telemetry_channel_id(cid),
+                                                             self.viewer_identity(), piece=piece, source=source)
+                return
             return self.respond(404, b"Not found", "text/plain", head)
 
     return Handler

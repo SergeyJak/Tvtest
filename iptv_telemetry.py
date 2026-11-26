@@ -26,6 +26,23 @@ MAX_EVENTS = 100_000
 QUEUE_SIZE = 8192
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS delivery_monitor (
+    id INTEGER PRIMARY KEY CHECK(id=1), installed INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO delivery_monitor VALUES (1, CAST(strftime('%s','now') AS INTEGER));
+CREATE TABLE IF NOT EXISTS delivery_clients (
+    channel_id TEXT NOT NULL, viewer TEXT NOT NULL, seen INTEGER NOT NULL,
+    last_video INTEGER, progress INTEGER, piece TEXT, source INTEGER,
+    edge TEXT, edge_since INTEGER, first_error INTEGER, episode INTEGER,
+    PRIMARY KEY(channel_id, viewer)
+);
+CREATE INDEX IF NOT EXISTS delivery_recent ON delivery_clients(seen);
+CREATE INDEX IF NOT EXISTS delivery_open ON delivery_clients(episode) WHERE episode IS NOT NULL;
+CREATE TABLE IF NOT EXISTS delivery_episodes (
+    id INTEGER PRIMARY KEY, channel_id TEXT NOT NULL, viewer TEXT NOT NULL,
+    reason TEXT NOT NULL, started INTEGER NOT NULL, confirmed INTEGER NOT NULL, recovered INTEGER, recovery_slot INTEGER
+);
+CREATE INDEX IF NOT EXISTS delivery_confirmed ON delivery_episodes(confirmed);
 CREATE TABLE IF NOT EXISTS viewing_sessions (
     id INTEGER PRIMARY KEY,
     viewer TEXT NOT NULL,
@@ -61,6 +78,11 @@ def prepare_database(path: Path) -> None:
         db.executescript(SCHEMA)
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("BEGIN IMMEDIATE")
+        # Older writers could prune an episode while its client still referenced it.
+        db.execute("""UPDATE delivery_clients AS c SET episode=NULL, first_error=NULL
+                      WHERE episode IS NOT NULL AND NOT EXISTS (
+                          SELECT 1 FROM delivery_episodes AS e WHERE e.id=c.episode
+                          AND e.viewer=c.viewer AND e.channel_id=c.channel_id AND e.recovered IS NULL)""")
         if "diagnostics" not in {row[1] for row in db.execute("PRAGMA table_info(incidents)")}:
             db.execute("ALTER TABLE incidents ADD COLUMN diagnostics TEXT")
     os.chmod(path, 0o600)
@@ -239,6 +261,102 @@ def clear_incidents(path: Path) -> int:
         raise OSError("Incident database unavailable") from None
 
 
+def record_delivery(db, cid, viewer, ts, kind, observation):
+    row = db.execute("SELECT * FROM delivery_clients WHERE channel_id=? AND viewer=?",
+                     (cid, viewer)).fetchone()
+    if row and ts < row["seen"]:
+        return
+    if row and ts - row["seen"] <= SESSION_GAP_SECONDS:
+        state = dict(row)
+    else:
+        state = dict(channel_id=cid, viewer=viewer, last_video=None, progress=None, piece=None,
+                     source=None, edge=None, edge_since=None, first_error=None, episode=None)
+    state["seen"] = ts
+    reason = None
+    if kind == "watch":
+        piece, source = observation
+        state.update(last_video=ts, source=source)
+        old_generation, _, old_number = (state["piece"] or "").rpartition(".")
+        generation, _, number = piece.rpartition(".")
+        if not old_number or old_generation != generation or int(number) > int(old_number):
+            if state["episode"] is not None:
+                db.execute("""UPDATE delivery_episodes SET recovered=?, recovery_slot=?
+                              WHERE id=? AND channel_id=? AND viewer=? AND recovered IS NULL""",
+                           (ts, source, state["episode"], cid, viewer))
+            state.update(progress=ts, piece=piece, first_error=None, episode=None)
+    elif kind == "manifest":
+        edge, stall_seconds = observation
+        if edge != state["edge"]:
+            state.update(edge=edge, edge_since=ts)
+        elif state["progress"] is not None:
+            started = max(state["edge_since"], state["progress"])
+            if ts - started >= stall_seconds:
+                reason = "playlist"
+    else:
+        if state["first_error"] is None:
+            state["first_error"] = ts
+        else:
+            reason = "requests" if state["last_video"] is not None else "startup"
+            started = state["first_error"]
+    if reason and state["episode"] is None:
+        state["episode"] = db.execute("""INSERT INTO delivery_episodes
+            (channel_id,viewer,reason,started,confirmed) VALUES (?,?,?,?,?)""",
+            (cid, viewer, reason, started, ts)).lastrowid
+    db.execute("""INSERT OR REPLACE INTO delivery_clients
+        (channel_id,viewer,seen,last_video,progress,piece,source,edge,edge_since,first_error,episode)
+        VALUES (:channel_id,:viewer,:seen,:last_video,:progress,:piece,:source,:edge,:edge_since,
+                :first_error,:episode)""", state)
+
+
+def query_stability(path, days=1, slot=0):
+    if days not in (1, 7, 30) or slot not in (0, 1, 2, 3):
+        raise ValueError("Unsupported stability period")
+    empty = {"available": False, "live": [], "channels": [], "episodes": []}
+    if not path.is_file():
+        return empty
+    now = int(time.time())
+    cutoff = now - days * 86400
+    with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True, timeout=3) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("BEGIN")
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_monitor'").fetchone():
+            return empty
+        since = db.execute("SELECT installed FROM delivery_monitor WHERE id=1").fetchone()[0]
+        live = []
+        for row in db.execute("""SELECT c.channel_id,c.viewer,seen,last_video,progress,source,first_error,e.id AS episode,e.reason
+                FROM delivery_clients c LEFT JOIN delivery_episodes e ON e.id=c.episode
+                    AND e.viewer=c.viewer AND e.channel_id=c.channel_id AND e.recovered IS NULL
+                WHERE seen>=? ORDER BY c.channel_id,c.viewer""", (now-SESSION_GAP_SECONDS,)):
+            item = dict(row)
+            if item["episode"] is not None:
+                state = "stale_playlist" if item["reason"] == "playlist" else "interrupted"
+            elif item["first_error"] is not None:
+                state = "error"
+            elif item["progress"] is None or item["progress"] < now - SESSION_GAP_SECONDS:
+                state = "waiting"
+            else:
+                state = "playing" if item["source"] == viewing_slot(item["channel_id"]) else "backup"
+            live.append(dict(item, state=state))
+        channels = [dict(r) for r in db.execute("""SELECT channel_id, SUM(errors) AS errors,
+                SUM(episodes) AS episodes FROM (
+                SELECT channel_id, COUNT(*) AS errors, 0 AS episodes FROM incidents
+                WHERE occurred_at>=? AND kind='client_error' GROUP BY channel_id
+                UNION ALL SELECT channel_id, 0, COUNT(*) FROM delivery_episodes
+                WHERE confirmed>=? GROUP BY channel_id
+                UNION ALL SELECT channel_id, 0, 0 FROM viewing_sessions
+                WHERE last_seen>=? GROUP BY channel_id)
+                GROUP BY channel_id ORDER BY episodes DESC,errors DESC,channel_id""", (cutoff,cutoff,cutoff))]
+        scope = ""
+        if slot:
+            scope = (" AND channel_id NOT GLOB 'p[23]:*'" if slot == 1 else
+                     f" AND channel_id GLOB 'p{slot}:*'")
+            live = [r for r in live if viewing_slot(r["channel_id"]) == slot]
+            channels = [r for r in channels if viewing_slot(r["channel_id"]) == slot]
+        episodes = [dict(r) for r in db.execute(f"""SELECT id,channel_id,viewer,started,confirmed,recovered,recovery_slot,reason
+                FROM delivery_episodes WHERE confirmed>=? {scope} ORDER BY confirmed DESC,id DESC LIMIT 50""", (cutoff,))]
+    return {"available": True, "since": since, "live": live, "channels": channels, "episodes": episodes}
+
+
 class Telemetry:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -254,9 +372,14 @@ class Telemetry:
         identity = (address[:80] + "|" + user_agent[:160]).encode("utf-8", "replace")
         return hmac.new(self.salt, identity, hashlib.sha256).hexdigest()[:16]
 
-    def observe_segment(self, channel_id: str, viewer: str, timestamp: float | None = None) -> None:
+    def observe_segment(self, channel_id: str, viewer: str, timestamp: float | None = None, *,
+                        piece: str | None = None, source: int | None = None) -> None:
         self._enqueue(("watch", int(time.time() if timestamp is None else timestamp),
-                       channel_id, viewer, "", None, None))
+                       channel_id, viewer, "", None, (piece, source) if piece is not None else None))
+
+    def observe_manifest(self, channel_id, viewer, edge, target, timestamp=None, *, window_seconds=0):
+        self._enqueue(("manifest", int(time.time() if timestamp is None else timestamp),
+                       channel_id, viewer, "", None, (edge, max(30, 3 * target, window_seconds))))
 
     def incident(self, channel_id: str, kind: str, detail: str = "",
                  duration_seconds: float | None = None,
@@ -278,6 +401,7 @@ class Telemetry:
 
     def _run(self):
         db = sqlite3.connect(self.path, timeout=5)
+        db.row_factory = sqlite3.Row
         try:
             db.execute("PRAGMA busy_timeout=3000")
             db.execute("PRAGMA synchronous=NORMAL")
@@ -288,6 +412,8 @@ class Telemetry:
                     if item is None:
                         break
                     typ, ts, cid, field, detail, duration, diagnostics = item
+                    if typ in ("watch", "manifest") and diagnostics is not None:
+                        record_delivery(db, cid, field, ts, typ, diagnostics)
                     if typ == "watch":
                         previous = db.execute("""
                             SELECT id,last_seen FROM viewing_sessions
@@ -307,7 +433,9 @@ class Telemetry:
                                 (viewer,channel_id,started_at,last_seen)
                                 VALUES (?,?,?,?)
                             """, (field, cid, ts, ts))
-                    else:
+                    elif typ == "incident":
+                        if field == "client_error" and diagnostics and diagnostics.get("client"):
+                            record_delivery(db, cid, diagnostics["client"], ts, "error", None)
                         db.execute("""
                             INSERT INTO incidents
                             (occurred_at,channel_id,kind,detail,duration_seconds,diagnostics)
@@ -316,7 +444,13 @@ class Telemetry:
                               json.dumps(diagnostics, separators=(",", ":")) if diagnostics else None))
                     db.commit()
                     if time.monotonic() - last_cleanup > 6 * 3600:
-                        cutoff = int(time.time()) - RETENTION_DAYS * 86400
+                        now = int(time.time())
+                        cutoff = now - RETENTION_DAYS * 86400
+                        # Client state only spans a live session. Keep older episodes as long as
+                        # a live client needs them to record recovery, even across the cutoff.
+                        db.execute("DELETE FROM delivery_clients WHERE seen < ?", (now - SESSION_GAP_SECONDS,))
+                        db.execute("""DELETE FROM delivery_episodes WHERE confirmed < ? AND id NOT IN
+                                      (SELECT episode FROM delivery_clients WHERE episode IS NOT NULL)""", (cutoff,))
                         db.execute("DELETE FROM incidents WHERE occurred_at < ?", (cutoff,))
                         db.execute("DELETE FROM viewing_sessions WHERE last_seen < ?", (cutoff,))
                         db.execute("""

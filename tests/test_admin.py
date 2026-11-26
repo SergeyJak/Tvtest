@@ -90,7 +90,7 @@ class AdminTests(unittest.TestCase):
             self.assertIn("refresh", response.read().decode())
 
     def test_data_requires_separate_login(self):
-        for path in ("/admin/api/session", "/admin/api/overview", "/admin/api/channels"):
+        for path in ("/admin/api/session", "/admin/api/overview", "/admin/api/channels", "/admin/api/stability"):
             with self.assertRaises(urllib.error.HTTPError) as result:
                 self.request(path)
             self.assertEqual(result.exception.code, 401)

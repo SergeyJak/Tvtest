@@ -32,6 +32,7 @@ class VirtualSegment:
     duration: float
     content: bytes
     discontinuity: bool
+    source_slot: int
 
 
 @dataclass
@@ -147,8 +148,8 @@ class FailoverMux:
         progress.last_advance = now
         return now - progress.since >= SWITCH_COOLDOWN
 
-    def _append(self, duration: float, payload: bytes, *, discontinuity: bool):
-        self.history.append(VirtualSegment(self.next_sequence, duration, payload, discontinuity))
+    def _append(self, duration: float, payload: bytes, source_slot: int, *, discontinuity: bool):
+        self.history.append(VirtualSegment(self.next_sequence, duration, payload, discontinuity, source_slot))
         self.target_duration = max(self.target_duration, math.ceil(duration))
         self.next_sequence += 1
         while (len(self.history) > WINDOW_SEGMENTS
@@ -198,7 +199,7 @@ class FailoverMux:
         boundary = switching or reset
         for seq, duration, payload in records:
             gap = last is not None and seq != last + 1
-            self._append(duration, payload,
+            self._append(duration, payload, slot,
                          discontinuity=self.next_sequence > 1 and (boundary or gap))
             last = seq
             boundary = False
@@ -291,12 +292,16 @@ class FailoverMux:
                 output.append(f"/{token}/segment/{self.generation}.{entry.number}.ts")
             return ("\n".join(output) + "\n").encode("utf-8")
 
-    def segment(self, sequence: int) -> bytes | None:
+    def segment_record(self, sequence: int) -> VirtualSegment | None:
         with self.lock:
             for entry in self.history:
                 if entry.number == sequence:
-                    return entry.content
+                    return entry
         return None
+
+    def segment(self, sequence: int) -> bytes | None:
+        entry = self.segment_record(sequence)
+        return entry.content if entry else None
 
     def status(self) -> dict:
         with self.lock:
