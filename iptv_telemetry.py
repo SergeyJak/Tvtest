@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS delivery_monitor (
     id INTEGER PRIMARY KEY CHECK(id=1), installed INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO delivery_monitor VALUES (1, CAST(strftime('%s','now') AS INTEGER));
+CREATE TABLE IF NOT EXISTS delivery_reset (
+    id INTEGER PRIMARY KEY CHECK(id=1), reset_at INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO delivery_reset VALUES (1, 0);
 CREATE TABLE IF NOT EXISTS delivery_clients (
     channel_id TEXT NOT NULL, viewer TEXT NOT NULL, seen INTEGER NOT NULL,
     last_video INTEGER, progress INTEGER, piece TEXT, source INTEGER,
@@ -261,7 +265,29 @@ def clear_incidents(path: Path) -> int:
         raise OSError("Incident database unavailable") from None
 
 
+def reset_stability(path: Path) -> int:
+    """Reset delivery monitoring without removing the incident or viewing history."""
+    if not path.is_file():
+        raise OSError("Stability database unavailable")
+    try:
+        with sqlite3.connect(path, timeout=5) as db:
+            db.execute("BEGIN IMMEDIATE")
+            reset_at = int(time.time())
+            db.execute("UPDATE delivery_reset SET reset_at=? WHERE id=1", (reset_at,))
+            db.execute("DELETE FROM delivery_clients")
+            db.execute("DELETE FROM delivery_episodes")
+            return reset_at
+    except sqlite3.Error:
+        raise OSError("Stability database unavailable") from None
+
+
 def record_delivery(db, cid, viewer, ts, kind, observation):
+    # Serialize the reset and observation, including queued pre-reset requests.
+    if not db.in_transaction:
+        db.execute("BEGIN IMMEDIATE")
+    reset_at = db.execute("SELECT reset_at FROM delivery_reset WHERE id=1").fetchone()[0]
+    if ts <= reset_at:
+        return
     row = db.execute("SELECT * FROM delivery_clients WHERE channel_id=? AND viewer=?",
                      (cid, viewer)).fetchone()
     if row and ts < row["seen"]:
@@ -322,6 +348,11 @@ def query_stability(path, days=1, slot=0):
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_monitor'").fetchone():
             return empty
         since = db.execute("SELECT installed FROM delivery_monitor WHERE id=1").fetchone()[0]
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_reset'").fetchone():
+            reset_at = db.execute("SELECT reset_at FROM delivery_reset WHERE id=1").fetchone()[0]
+            if reset_at:
+                since = reset_at
+                cutoff = max(cutoff, reset_at + 1)
         live = []
         for row in db.execute("""SELECT c.channel_id,c.viewer,seen,last_video,progress,source,first_error,e.id AS episode,e.reason
                 FROM delivery_clients c LEFT JOIN delivery_episodes e ON e.id=c.episode
