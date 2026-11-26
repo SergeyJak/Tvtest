@@ -9,8 +9,10 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from iptv_multi import MultiGateway, channels_from_text, make_multi_handler
@@ -614,6 +616,194 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertTrue(first.gateway.stop.is_set())
         self.assertNotIn(manager.order[0], manager.active)
         self.assertIs(manager.active[manager.order[1]], second)
+
+    def fetch_manifest(self, token, cid, player="Living room TV"):
+        request = urllib.request.Request(f"{self.base}/{token}/channel/{cid}/index.m3u8",
+                                         headers={"User-Agent": player})
+        try:
+            with urllib.request.urlopen(request, timeout=4) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, error.read().decode()
+
+    def wait_for_pending_manifest(self, manager, cid, response):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if response.done():
+                self.fail(f"Manifest finished before warming: {response.result()}")
+            with manager.lock:
+                worker = manager.active.get(cid)
+                if worker is not None and worker.pending_requests:
+                    return worker
+            time.sleep(0.01)
+        self.fail("Manifest did not begin warming")
+
+    def test_rapid_retune_supersedes_same_player_startup_with_one_slot(self):
+        token = self.configure_backup(2, PLAYLIST + OTHER.split("\n", 1)[1])
+        manager = self.registry.resolve(token)[0]
+        manager.startup_wait = 3
+        first, second, third = manager.order
+
+        with ThreadPoolExecutor(max_workers=3) as requests:
+            a = requests.submit(self.fetch_manifest, token, first)
+            old = self.wait_for_pending_manifest(manager, first, a)
+            b = requests.submit(self.fetch_manifest, token, second)
+            interim = self.wait_for_pending_manifest(manager, second, b)
+            c = requests.submit(self.fetch_manifest, token, third)
+            newest = self.wait_for_pending_manifest(manager, third, c)
+            self.fill_cache(newest, "latest")
+
+            self.assertEqual(a.result(timeout=2)[0], 409)
+            self.assertEqual(b.result(timeout=2)[0], 409)
+            status, manifest = c.result(timeout=2)
+            self.assertEqual(status, 200)
+            self.assertIn(f"/channel/{third}/segment/", manifest)
+
+        self.assertTrue(old.gateway.stop.is_set())
+        self.assertTrue(interim.gateway.stop.is_set())
+        self.assertEqual(list(manager.active), [third])
+        self.assertEqual(manager.stream_limit_denials, 0)
+        self.assertEqual(manager.warmup_timeouts, 0)
+
+    def test_pending_manifest_of_another_player_keeps_its_slot(self):
+        token = self.configure_backup(2)
+        manager = self.registry.resolve(token)[0]
+        manager.startup_wait = 3
+        first, second = manager.order
+
+        with ThreadPoolExecutor(max_workers=1) as requests:
+            a = requests.submit(self.fetch_manifest, token, first)
+            owner = self.wait_for_pending_manifest(manager, first, a)
+            self.assertEqual(self.fetch_manifest(token, second, "Kitchen TV")[0], 503)
+            self.assertFalse(owner.gateway.stop.is_set())
+            self.fill_cache(owner, "owner")
+            self.assertEqual(a.result(timeout=2)[0], 200)
+
+    def test_a_former_second_player_does_not_block_the_continuing_player(self):
+        token = self.configure_backup(2)
+        backup_token = self.configure_backup(3)
+        manager = self.registry.resolve(token)[0]
+        backup = self.registry.resolve(backup_token)[0]
+        first, second = manager.order
+        self.fill_cache(manager.start(first), "first")
+        base = time.monotonic()
+        elapsed = 0
+
+        with patch("iptv_profile_gateway.time", SimpleNamespace(monotonic=lambda: base + elapsed)):
+            self.assertEqual(self.fetch_manifest(token, first)[0], 200)
+            self.assertEqual(self.fetch_manifest(token, first, "Kitchen TV")[0], 200)
+            self.assertEqual(self.fetch_manifest(token, second)[0], 503)
+            elapsed = 35
+            self.assertEqual(self.fetch_manifest(token, first)[0], 200)
+            elapsed = 46
+            self.fill_cache(backup.start(second), "reserve")
+            self.assertEqual(self.fetch_manifest(token, second)[0], 200)
+
+    def test_ready_backup_serves_manifest_and_segments_if_home_slot_is_busy(self):
+        token = self.configure_backup(2)
+        backup_token = self.configure_backup(3)
+        manager = self.registry.resolve(token)[0]
+        backup = self.registry.resolve(backup_token)[0]
+        first, second = manager.order
+        occupant = manager.start(first, pinned=True)
+        self.fill_cache(backup.start(second), "reserve")
+
+        status, manifest = self.fetch_manifest(token, second)
+        self.assertEqual(status, 200)
+        segment = next(line for line in manifest.splitlines() if line.startswith("/"))
+        with urllib.request.urlopen(self.base + segment, timeout=3) as response:
+            self.assertEqual(response.read(), b"reserve-3")
+        self.assertIs(manager.active[first], occupant)
+        self.assertFalse(occupant.gateway.stop.is_set())
+        self.assertNotIn(second, manager.active)
+
+    def test_retune_preserves_a_home_worker_serving_another_cabinet(self):
+        token = self.configure_backup(2)
+        backup_token = self.configure_backup(3)
+        primary = self.store.get(1)["token"]
+        manager = self.registry.resolve(token)[0]
+        backup = self.registry.resolve(backup_token)[0]
+        first, second = manager.order
+        old = manager.start(first)
+        self.fill_cache(old, "shared")
+
+        self.assertEqual(self.fetch_manifest(token, first)[0], 200)
+        self.assertEqual(self.fetch_manifest(primary, first)[0], 200)
+        self.assertEqual(self.registry.existing_failover(primary, first).source_slot, 2)
+        self.fill_cache(backup.start(second), "reserve")
+
+        self.assertEqual(self.fetch_manifest(token, second)[0], 200)
+        self.assertEqual(self.registry.existing_failover(token, second).source_slot, 3)
+        self.assertIs(manager.active[first], old)
+        self.assertFalse(old.gateway.stop.is_set())
+
+        # A viewer on another cabinet still renews the borrowed worker even
+        # after the home TV has switched away from it.
+        with manager.lock:
+            old.accessed -= manager.idle_seconds + 1
+        self.assertEqual(self.fetch_manifest(primary, first)[0], 200)
+        manager.sweep()
+        self.assertIs(manager.active.get(first), old)
+        self.assertEqual(self.registry.existing_failover(primary, first).source_slot, 2)
+
+    def test_unadvanced_reserve_does_not_replace_a_playing_channel(self):
+        token = self.configure_backup(2, PLAYLIST + OTHER.split("\n", 1)[1])
+        manager = self.registry.resolve(token)[0]
+        first, second, pinned = manager.order
+        manager.start(pinned, pinned=True)
+        self.fill_cache(self.base_manager.start(first), "first")
+        self.fill_cache(self.base_manager.start(second), "second")
+
+        self.assertEqual(self.fetch_manifest(token, first)[0], 200)
+        self.assertEqual(self.fetch_manifest(token, second)[0], 200)
+        self.assertEqual(self.fetch_manifest(token, first)[0], 503)
+        self.assertEqual(self.registry.tunings[2].mux.channel_id, second)
+        self.assertEqual(self.fetch_manifest(token, second)[0], 200)
+
+    def test_reserve_cache_reset_during_retune_keeps_the_playing_channel(self):
+        token = self.configure_backup(2, PLAYLIST + OTHER.split("\n", 1)[1])
+        manager = self.registry.resolve(token)[0]
+        first, second, pinned = manager.order
+        manager.start(pinned, pinned=True)
+        self.fill_cache(self.base_manager.start(first), "playing")
+        reserve = self.base_manager.start(second)
+        self.fill_cache(reserve, "reserve")
+        self.assertEqual(self.fetch_manifest(token, first)[0], 200)
+
+        candidates = self.registry._reserves
+
+        def reset_cache_after_discovery(*args, **kwargs):
+            result = candidates(*args, **kwargs)
+            with reserve.gateway.lock:
+                reserve.gateway.cache.clear()
+                reserve.gateway.cache_epoch += 1
+            return result
+
+        with patch.object(self.registry, "_reserves", side_effect=reset_cache_after_discovery):
+            self.assertEqual(self.fetch_manifest(token, second)[0], 503)
+        self.assertEqual(self.registry.tunings[2].mux.channel_id, first)
+        self.assertEqual(self.fetch_manifest(token, first)[0], 200)
+
+    def test_guest_keeps_playing_a_worker_after_the_home_tuning_expired(self):
+        token = self.configure_backup(2)
+        primary = self.store.get(1)["token"]
+        manager = self.registry.resolve(token)[0]
+        first = manager.order[0]
+        old = manager.start(first)
+        self.fill_cache(old, "shared")
+        self.assertEqual(self.fetch_manifest(token, first)[0], 200)
+        with self.registry.lock:
+            self.registry.tunings[2].mux.last_request -= 46
+
+        self.assertEqual(self.fetch_manifest(primary, first)[0], 200)
+        self.assertNotIn(2, self.registry.tunings)
+        self.assertEqual(self.registry.existing_failover(primary, first).source_slot, 2)
+        with manager.lock:
+            old.accessed -= manager.idle_seconds + 1
+        self.assertEqual(self.fetch_manifest(primary, first)[0], 200)
+        manager.sweep()
+        self.assertIs(manager.active.get(first), old)
 
     def test_every_channel_is_eligible_and_uses_matching_backup_only(self):
         """A movie, news and UHD channel are equal citizens of failover."""

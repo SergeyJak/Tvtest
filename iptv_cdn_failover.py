@@ -172,6 +172,20 @@ class FailoverMux:
             self.last_request = now
             # Keep next_sequence and each worker's last published cursor.
 
+    def start_from_ready(self, slot, stream, now: float) -> bool:
+        """Capture an initial HLS window before the router switches the viewer."""
+        gateway = stream.gateway
+        with self.lock, gateway.lock:
+            if gateway.stop.is_set() or not self._health(stream)["fresh"]:
+                return False
+            epoch = gateway.cache_epoch
+            previous_epoch, last = self.published_cursors.get(stream, (epoch, None))
+            window = gateway.published(commit=False)
+            if not window or (epoch == previous_epoch and last is not None and window[-1][0] <= last):
+                return False
+            self.restart_session(now)
+            return self._publish_from(slot, stream, now)
+
     def _publish_from(self, slot, stream, now: float, *, reason: str = "START") -> bool:
         """Select a worker only when it contributes playable, unseen video."""
         gateway = stream.gateway

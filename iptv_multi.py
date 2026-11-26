@@ -188,7 +188,7 @@ class MultiGateway:
         return ActiveStream(channel, gateway, self.upstream_slots, pinned, standby)
 
     def start(self, cid: str, *, pinned: bool = False, standby: bool = False,
-              denial: dict | None = None) -> ActiveStream | None:
+              denial: dict | None = None, superseded=None, protected=()) -> ActiveStream | None:
         """Start a requested channel; do not silently evict active viewers."""
         with self.lock:
             if cid not in self.channels:
@@ -210,7 +210,7 @@ class MultiGateway:
                 # Background CDN mirrors must never block real viewers
                 # from tuning their own TV cabinet to a different channel.
                 disposable = [(sid, item) for sid, item in self.active.items()
-                              if item.standby and item.pending_requests == 0]
+                              if item.standby and item.pending_requests == 0 and item not in protected]
                 if disposable:
                     sid, old = min(disposable, key=lambda row: row[1].accessed)
                     old.close()
@@ -220,30 +220,34 @@ class MultiGateway:
                 # must never displace another cabin's selected channel.
                 # A channel-switching TV may keep two stopped channels in
                 # cache; reclaim only genuinely idle, unpinned sessions.
-                # Never steal from active viewers or pending warmups.
+                # Only the same player's superseded warmup may be interrupted.
                 now = time.monotonic()
                 stale = [(sid, item) for sid, item in self.active.items()
-                         if not item.pinned and item.pending_requests == 0
-                         and (self.prefer_owner_tuning or
-                              now - item.accessed >= self.switch_grace)]
+                         if not item.pinned and item not in protected
+                         and (item is superseded or (item.pending_requests == 0 and
+                              (self.prefer_owner_tuning or now - item.accessed >= self.switch_grace)))]
                 if stale:
                     oldest_id, oldest = min(stale, key=lambda row: row[1].accessed)
                     oldest.close()
                     del self.active[oldest_id]
                     self.recycled_idle_streams += 1
             if len(self.active) >= self.max_streams:
-                if denial is not None:
-                    now = time.monotonic()
-                    denial.update(max_streams=self.max_streams, active=[
-                        {"channel_id": self.telemetry_channel_id(sid), "pinned": item.pinned,
-                         "standby": item.standby, "pending_requests": item.pending_requests,
-                         "idle_seconds": round(now - item.accessed, 1)}
-                        for sid, item in self.active.items()])
-                self.stream_limit_denials += 1
+                self.record_capacity_denial(denial)
                 return None
             stream = self._new_stream(self.channels[cid], pinned, standby)
             self.active[cid] = stream
             return stream
+
+    def record_capacity_denial(self, denial):
+        with self.lock:
+            if denial is not None:
+                now = time.monotonic()
+                denial.update(max_streams=self.max_streams, active=[
+                    {"channel_id": self.telemetry_channel_id(sid), "pinned": item.pinned,
+                     "standby": item.standby, "pending_requests": item.pending_requests,
+                     "idle_seconds": round(now - item.accessed, 1)}
+                    for sid, item in self.active.items()])
+            self.stream_limit_denials += 1
 
     def active_stream(self, cid: str) -> ActiveStream | None:
         with self.lock:
@@ -363,10 +367,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
     configured_epg_file = epg_file
 
     class Handler(BaseHTTPRequestHandler):
-        def viewer_identity(self):
-            manager = self._request_manager
-            if manager.telemetry is None:
-                return ""
+        def player_identity(self):
             ip = self.client_address[0]
             # Only trust proxy headers when the actual TCP peer is localhost.
             # Never keep original IP or user-agent in SQLite.
@@ -377,7 +378,11 @@ def make_multi_handler(manager: MultiGateway, token: str,
                         ip = str(ipaddress.ip_address(forwarded))
                 except ValueError:
                     pass
-            return manager.telemetry.viewer(ip, self.headers.get("User-Agent", ""))
+            return ip, self.headers.get("User-Agent", "")
+
+        def viewer_identity(self):
+            manager = self._request_manager
+            return manager.telemetry.viewer(*self.player_identity()) if manager.telemetry else ""
 
         def track_client_failure(self, cid, reason, status, route, diagnostics=None):
             manager = self._request_manager
@@ -544,26 +549,33 @@ def make_multi_handler(manager: MultiGateway, token: str,
                     # are determined on GET, when the TV actually tunes the channel.
                     return self.respond(200, None, "application/vnd.apple.mpegurl", head)
                 denial = {} if request_manager.telemetry else None
-                pilot = (profile_registry.failover_for(active_token, cid, denial=denial)
-                         if profile_registry is not None else None)
-                if pilot is None:
+                player = self.player_identity() if profile_registry is not None else None
+                selection = (profile_registry.begin_manifest(active_token, cid, player, denial=denial)
+                             if profile_registry is not None else None)
+                if selection is None:
+                    tuning = None
+                    raw = None
                     stream = request_manager.start(cid, denial=denial)
+                    if stream is not None:
+                        with request_manager.lock:
+                            stream.pending_requests += 1
                 else:
-                    mux, candidates = pilot
-                    stream = dict(candidates).get(mux.home_slot) if mux else None
-                if stream is None:
+                    tuning, stream, raw = selection
+                if tuning is None and stream is None:
                     self.track_client_failure(cid, "STREAM_LIMIT", 503, "manifest", denial)
                     return self.respond(503, b"Too many active streams",
                                         "text/plain", head, {"Retry-After": "10"})
-                # The old implementation immediately returned 503 when
-                # selecting a cold channel. Many TV players never retry it.
-                # Keep this *one* manifest request open briefly while the
-                # worker fills its first delayed HLS window.
-                with request_manager.lock:
-                    stream.pending_requests += 1
+
+                def playlist():
+                    if tuning is not None:
+                        return profile_registry.publish_failover(tuning.mux, active_token, request=tuning, player=player)
+                    return stream.gateway.playlist(active_token)
+
+                # Hold a cold manifest while one of its sources warms up.
+                cancelled = tuning.ended if tuning is not None else stream.gateway.stop
                 try:
-                    raw = (profile_registry.publish_failover(pilot[0], active_token)
-                           if pilot else stream.gateway.playlist(active_token))
+                    if tuning is None:
+                        raw = playlist()
                     waited = False
                     deadline = time.monotonic() + request_manager.startup_wait
                     while raw is None and not request_manager.stop.is_set():
@@ -571,45 +583,50 @@ def make_multi_handler(manager: MultiGateway, token: str,
                         if remaining <= 0:
                             break
                         waited = True
-                        if stream.gateway.stop.wait(min(0.25, remaining)):
+                        if cancelled.wait(min(0.25, remaining)):
                             break
-                        raw = (profile_registry.publish_failover(pilot[0], active_token)
-                               if pilot else stream.gateway.playlist(active_token))
+                        raw = playlist()
+                    replaced, context = (profile_registry.finish_manifest(tuning, timed_out=raw is None)
+                                         if tuning is not None else (False, {}))
                     with request_manager.lock:
-                        if waited:
+                        if waited and not replaced:
                             if raw is not None:
                                 request_manager.warmup_successes += 1
                             else:
                                 request_manager.warmup_timeouts += 1
                 finally:
-                    with request_manager.lock:
-                        stream.pending_requests -= 1
-                        stream.accessed = time.monotonic()
+                    if stream is not None:
+                        with request_manager.lock:
+                            stream.pending_requests -= 1
+                            stream.accessed = time.monotonic()
+                if replaced:
+                    return self.respond(409, b"Channel selection changed", "text/plain", head)
                 if raw is None:
                     self.track_client_failure(cid, "MANIFEST_WARMUP", 503, "manifest")
                     if request_manager.telemetry is not None and not head:
-                        context = profile_registry.timeout_diagnostics(pilot[0]) if pilot else {}
                         context["startup_wait_seconds"] = request_manager.startup_wait
                         request_manager.telemetry.incident(request_manager.telemetry_channel_id(cid),
                                                            "startup_timeout", "MANIFEST_WARMUP_TIMEOUT",
                                                            diagnostics=context)
-                    stream.gateway.record_client("manifest", 503)
+                    if stream is not None:
+                        stream.gateway.record_client("manifest", 503)
                     return self.respond(503, b"Buffer warming up; reselect channel",
                                         "text/plain", head, {"Retry-After": "2"})
                 # The legacy single-channel gateway outputs /TOKEN/segment/...
                 # Inject this channel's stable ID without touching source URLs.
                 before = f"/{active_token}/segment/".encode()
                 after = f"/{active_token}/channel/{cid}/segment/".encode()
-                if profile_registry is not None and pilot is None:
+                if profile_registry is not None and tuning is None:
                     after += b"native."
-                stream.gateway.record_client("manifest", 200)
+                if stream is not None:
+                    stream.gateway.record_client("manifest", 200)
                 sent = self.respond(200, raw.replace(before, after), "application/vnd.apple.mpegurl", head)
                 if sent and request_manager.telemetry is not None:
                     # Extract only the public sequence and target duration from the exact response.
                     edge = re.search(rb"[/.]([0-9]+)\.ts\s*$", raw)
                     target = re.search(rb"#EXT-X-TARGETDURATION:(\d+)", raw)
                     if edge and target:
-                        generation = pilot[0].generation if pilot else stream.delivery_generation
+                        generation = tuning.mux.generation if tuning is not None else stream.delivery_generation
                         request_manager.telemetry.observe_manifest(
                             request_manager.telemetry_channel_id(cid), self.viewer_identity(),
                             generation + "." + edge[1].decode("ascii"), int(target[1]),
@@ -633,7 +650,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                         return self.respond(404, b"Segment expired", "text/plain", head)
                 # An expired stream is not restarted on a stale segment URL.
                 stream = request_manager.active_stream(cid)
-                if stream is None:
+                if mux is None and stream is None:
                     self.track_client_failure(cid, "STREAM_EXPIRED", 404, "segment")
                     return self.respond(404, b"Stream expired", "text/plain", head)
                 source = request_manager.profile_slot
@@ -670,7 +687,8 @@ def make_multi_handler(manager: MultiGateway, token: str,
                     extra["Content-Range"] = f"bytes {first}-{last}/{len(data)}"
                     data = data[first:last + 1]
                 status = 206 if requested_range else 200
-                stream.gateway.record_client("segment", status)
+                if stream is not None:
+                    stream.gateway.record_client("segment", status)
                 if self.respond(status, data, "video/mp2t", head, extra) and not head and request_manager.telemetry:
                     request_manager.telemetry.observe_segment(request_manager.telemetry_channel_id(cid),
                                                              self.viewer_identity(), piece=piece, source=source)
