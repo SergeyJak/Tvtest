@@ -9,6 +9,40 @@ import iptv_telemetry as telemetry
 
 
 class StabilityTests(unittest.TestCase):
+    def test_reset_preserves_history_and_ignores_queued_old_observations(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "tv.db"
+            store = telemetry.Telemetry(path)
+            try:
+                now = int(time.time())
+                for cid in ("a", "p2:b"):
+                    store.observe_segment(cid, "tv", now-10, piece="1", source=1)
+                    for ts in (now-9, now-8):
+                        store.incident(cid, "client_error", timestamp=ts, diagnostics={"client": "tv"})
+                store.flush()
+                self.assertEqual(len(telemetry.query_stability(path)["episodes"]), 2)
+                reset = telemetry.reset_stability(path)
+                store.observe_segment("old", "tv", reset-1, piece="1", source=1)
+                store.incident("old", "client_error", timestamp=reset, diagnostics={"client": "tv"})
+                store.flush()
+                for days in (1, 7, 30):
+                    result = telemetry.query_stability(path, days)
+                    self.assertEqual(result["since"], reset)
+                    for key in ("live", "channels", "episodes"):
+                        self.assertEqual(result[key], [])
+                self.assertEqual(telemetry.query_incidents(path)["total"], 5)
+                self.assertEqual(telemetry.query_viewing(path)["total_sessions"], 3)
+                store.observe_segment("new", "tv", reset+1, piece="1", source=1)
+                for ts in (reset+2, reset+3):
+                    store.incident("new", "client_error", timestamp=ts, diagnostics={"client": "tv"})
+                store.flush()
+                result = telemetry.query_stability(path)
+                self.assertEqual([row["channel_id"] for row in result["channels"]], ["new"])
+                self.assertEqual(result["channels"][0]["errors"], 2)
+                self.assertEqual(len(result["episodes"]), 1)
+            finally:
+                store.close()
+
     def test_concurrent_delivery_errors_reserve_and_recovery(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "tv.db"
