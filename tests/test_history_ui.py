@@ -16,6 +16,46 @@ except ImportError:
 
 @unittest.skipUnless(sync_playwright, "Rendered history test requires Playwright and Chromium")
 class HistoryUiTests(unittest.TestCase):
+    def test_stability_shows_delivery_per_cabinet_and_handles_lost_connection(self):
+        fixture = test_admin.AdminTests()
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        fixture._status["cabins"] = [{"slot": i, "telemetry_enabled": True} for i in (1, 2)]
+        cid = channels_from_text(test_admin.PLAYLIST)[0].id
+        with patch("iptv_profiles.download_playlist", return_value=test_admin.PLAYLIST):
+            fixture.state.profiles.update(2, "Вадим", "https://provider.example/list")
+        store = Telemetry(fixture.state.telemetry_db)
+        self.addCleanup(store.close)
+        ts = int(time.time()) - 10
+        for key in (cid, "p2:" + cid):
+            store.observe_segment(key, "anonymous", ts, piece="v.2", source=2)
+        for offset in (1, 2):
+            store.incident("p2:" + cid, "client_error", "HTTP_404_SEGMENT_CACHE_MISS",
+                           timestamp=ts+offset, diagnostics={"client":"anonymous"})
+        store.incident(cid, "upstream_error", "MANIFEST_HTTP_404", timestamp=ts+2)
+        store.flush()
+        with sync_playwright() as playwright:
+            chrome = shutil.which("chromium") or shutil.which("google-chrome")
+            browser = playwright.chromium.launch(executable_path=chrome)
+            page = browser.new_page(viewport={"width": 390, "height": 844})
+            page.goto(fixture.url + "/admin/")
+            page.locator("#password").fill(fixture.pwd)
+            page.locator("#login-button").click()
+            page.locator('[data-target="stability"]').click()
+            live = page.locator("#stability-live")
+            expect(live).to_contain_text("Видео через резерв")
+            expect(live).to_contain_text("Проблема с выдачей")
+            expect(page.locator("#stability-total")).to_contain_text("Ошибок: 2 · Эпизодов: 1")
+            page.locator("#stability-slot").select_option("1")
+            expect(page.locator("#stability-total")).to_contain_text("Ошибок: 0 · Эпизодов: 0")
+            expect(live).not_to_contain_text("Проблема с выдачей")
+            self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), 390)
+            page.route("**/admin/api/stability?**", lambda route: route.fulfill(status=503, body="{}"))
+            page.locator("#stability-days").select_option("7")
+            expect(page.locator("#stability-notice")).to_contain_text("Не удалось")
+            expect(live).to_be_empty()
+            browser.close()
+
     def test_history_selection_and_event_pagination(self):
         fixture = test_admin.AdminTests()
         fixture.setUp()

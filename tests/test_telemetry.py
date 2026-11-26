@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import iptv_gateway
 import iptv_multi
-from iptv_telemetry import Telemetry, query_incidents, query_viewing
+from iptv_telemetry import Telemetry, query_incidents, query_viewing, query_stability
 
 
 class TelemetryStorageTests(unittest.TestCase):
@@ -179,6 +179,7 @@ class MultiChannelUsageTests(unittest.TestCase):
                         self.assertEqual(response.status, 200)
                     store.flush()
                     self.assertEqual(query_viewing(store.path, 1)["total_sessions"], 0)
+                    self.assertEqual(query_stability(store.path)["live"], [])
                     with urllib.request.urlopen(url, timeout=3) as response:
                         self.assertEqual(response.read(), b"ABCDEFGHIJK")
                     with self.assertRaises(urllib.error.HTTPError) as response:
@@ -186,6 +187,9 @@ class MultiChannelUsageTests(unittest.TestCase):
                     self.assertEqual(response.exception.code, 404)
                     store.flush()
                     history = query_viewing(store.path, 1)
+                    [live] = query_stability(store.path)["live"]
+                    self.assertIsNotNone(live["last_video"])
+                    self.assertEqual(live["source"], 1)
                     incidents = query_incidents(store.path, 1)
                     self.assertEqual(history["total_sessions"], 1)
                     self.assertEqual(history["channels"][0]["channel_id"], channel.id)

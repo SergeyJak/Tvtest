@@ -17,6 +17,7 @@ import json
 import os
 import re
 import secrets
+import sqlite3
 import threading
 import time
 import urllib.error
@@ -30,7 +31,7 @@ from pathlib import Path
 from iptv_multi import channels_from_text
 from iptv_resource_monitor import ResourceSampler
 from iptv_profiles import ProfileStore, ProfileError
-from iptv_telemetry import viewing_slot, query_viewing, query_incidents, export_incident_rows, clear_incidents
+from iptv_telemetry import query_stability, viewing_slot, query_viewing, query_incidents, export_incident_rows, clear_incidents
 
 ASSETS = Path(__file__).resolve().parent / "admin"
 SESSION_SECONDS = 8 * 3600
@@ -254,6 +255,7 @@ class AdminState:
                     multi_cdn_diagnostics = report
             cabins.append({
                 "slot": profile["slot"], "name": profile["name"],
+                "telemetry_enabled": bool(data.get("telemetry_enabled")),
                 "active_streams": len(data.get("streams") or []),
                 "max_streams": data.get("max_streams", 0),
             })
@@ -431,6 +433,23 @@ class AdminState:
         data["recording_active"] = bool(state and state.get("telemetry_enabled"))
         return data
 
+    def delivery_stability(self, days, slot):
+        try:
+            result = query_stability(self.telemetry_db, days, slot)
+        except sqlite3.Error:
+            raise OSError("Stability database unavailable") from None
+        names = self._channel_labels(include_profile=False)
+        for group in ("live", "channels", "episodes"):
+            for row in result[group]:
+                row["slot"] = viewing_slot(row["channel_id"])
+                row["channel_name"] = names.get(row["channel_id"], "Неизвестный канал")
+        status = self.gateway_status() or {}
+        recording = {c["slot"] for c in status.get("cabins", []) if c["telemetry_enabled"]}
+        result["cabins"] = [{"slot": p["slot"], "name": p["name"], "recording": p["slot"] in recording}
+                            for p in self.profiles.all()]
+        result["recording"] = bool(recording)
+        return result
+
     def incident_csv(self, days: int = 7, kind: str = "all") -> bytes:
         buffer = io.StringIO(newline="")
         buffer.write("\ufeff")
@@ -541,7 +560,7 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                             "/admin/api/session", "/admin/api/login",
                             "/admin/api/logout", "/admin/api/overview",
                             "/admin/api/channels", "/admin/api/tv-links", "/admin/api/history",
-                            "/admin/api/incidents", "/admin/api/incidents/export",
+                            "/admin/api/stability", "/admin/api/incidents", "/admin/api/incidents/export",
                             "/admin/api/incidents/clear", "/admin/api/profiles") and not re.fullmatch(
                                 r"/admin/api/profiles/[123]", path):
                 return self.respond(404, b"Not found", "text/plain", head=head)
@@ -619,7 +638,7 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                 return self.respond(405, b"", head=head)
             if path == "/admin/api/session":
                 return self.respond(200, b'{"ok":true}', head=head)
-            if path in ("/admin/api/history", "/admin/api/incidents",
+            if path in ("/admin/api/history", "/admin/api/stability", "/admin/api/incidents",
                         "/admin/api/incidents/export"):
                 from urllib.parse import parse_qs
                 qs = parse_qs(urlsplit(self.path).query)
@@ -634,7 +653,9 @@ def make_admin_handler(state: AdminState, *, secure_cookies: bool = True):
                             200, content, "text/csv; charset=utf-8", head=head,
                             headers={"Content-Disposition":
                                      f'attachment; filename="tv-incidents-{days}d.csv"'})
-                    if path.endswith("/history"):
+                    if path.endswith("/stability"):
+                        data = state.delivery_stability(days, int(qs.get("slot", ["0"])[0]))
+                    elif path.endswith("/history"):
                         data = state.viewing_history(
                             days, int(qs.get("slot", ["0"])[0]), qs.get("channel", [""])[0],
                             int(qs.get("session", ["0"])[0]), int(qs.get("page", ["0"])[0]),

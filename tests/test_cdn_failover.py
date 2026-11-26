@@ -204,6 +204,8 @@ class MultiCdnTests(unittest.TestCase):
         self.assertIn(f"/safe-token/segment/{mux.generation}.4.ts", swapped)
         self.assertEqual(mux.segment(1), b"CDN-1-100")
         self.assertEqual(mux.segment(4), b"CDN-2-100")
+        self.assertEqual(mux.segment_record(1).source_slot, 1)
+        self.assertEqual(mux.segment_record(4).source_slot, 2)
         self.assertEqual(mux.segment(6), b"CDN-2-102")
 
         # A fresh primary should not trigger instant source ping-pong.

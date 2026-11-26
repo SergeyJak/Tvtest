@@ -251,3 +251,12 @@ td{padding:13px 23px;border-top:1px solid #233044;color:#95a7bd;font-size:12px}t
 .history-event-pages{display:flex;align-items:center;gap:16px;margin-top:14px;font-size:12px}
 .history-event-pages button:disabled{color:var(--muted);cursor:default}
 @media(max-width:740px){#view-history .view-heading{flex-wrap:wrap}#view-history .period-controls{flex-direction:row;align-items:center}.history-event-row{grid-template-columns:1fr 1fr}.history-event-row .incident-details{grid-column:1/-1}}
+
+.stability-live{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,235px),1fr));gap:14px;margin:16px 0}
+.stability-live .panel,.stability-panel{padding:20px;min-width:0}
+.stability-panel{margin:16px 0}
+.stability-panel .panel-heading{padding:0;flex-wrap:wrap;gap:8px}
+.stability-live h2,.stability-panel h2{margin:0;font-size:16px}
+.stability-live .incident-type{margin:6px 0}
+.stability-scroll{overflow-x:auto}
+#view-stability .view-heading{flex-wrap:wrap;gap:12px}
