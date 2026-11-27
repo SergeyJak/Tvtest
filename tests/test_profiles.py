@@ -757,20 +757,65 @@ class ThreeCabinetTests(unittest.TestCase):
             next_channel = requests.submit(self.fetch_manifest, token, second)
             newest = self.wait_for_pending_manifest(manager, second, next_channel)
             self.assertEqual(self.fetch_tv_url(old_session)[0], 409)
-            self.assertEqual(self.fetch_tv_url(first_url)[0], 409)
             self.fill_cache(newest, "second")
             self.assertEqual(next_channel.result(timeout=2)[0], 200)
         self.assertEqual(list(manager.active), [second])
         self.assertEqual(manager.stream_limit_denials, 0)
-        later = time.monotonic() + 11
-        with patch("iptv_profile_gateway.time", SimpleNamespace(monotonic=lambda: later)):
-            with ThreadPoolExecutor(max_workers=1) as requests:
-                reopen = requests.submit(self.fetch_tv_url, first_url)
-                newest = self.wait_for_pending_manifest(manager, first, reopen)
-                self.fill_cache(newest, "reopened")
-                self.assertEqual(reopen.result(timeout=2)[0], 200)
+        with ThreadPoolExecutor(max_workers=1) as requests:
+            reopen = requests.submit(self.fetch_tv_url, first_url)
+            newest = self.wait_for_pending_manifest(manager, first, reopen)
             self.assertEqual(self.fetch_tv_url(old_session)[0], 409)
-            self.assertEqual(list(manager.active), [first])
+            self.fill_cache(newest, "reopened")
+            self.assertEqual(reopen.result(timeout=2)[0], 200)
+        self.assertEqual(list(manager.active), [first])
+
+    def test_redirected_manifest_resumes_after_idle_and_gateway_restart(self):
+        token = self.configure_backup(2)
+        manager = self.registry.resolve(token)[0]
+        first, second = manager.order
+        self.fill_cache(manager.start(first), "original")
+        with self.request(token, f"channel/{first}/index.m3u8?device=tv") as response:
+            obsolete = response.geturl()
+        self.assertEqual(self.fetch_manifest(token, second, "tv")[0], 503)
+        self.fill_cache(manager.active[second], "second")
+        with self.request(token, f"channel/{second}/index.m3u8?device=tv") as response:
+            current = response.geturl()
+            old_manifest = response.read().decode()
+
+        # Expire both the tuning and its cached video. The player only has its final URL.
+        self.registry.failovers[2, second].last_request -= 90
+        self.fill_cache(manager.active[second], "after-idle")
+        self.assertEqual(self.fetch_tv_url(obsolete)[0], 409)
+        status, resumed = self.fetch_tv_url(current)
+        self.assertEqual(status, 200)
+
+        # A new registry and HTTP handler share only the on-disk profile directory.
+        self.registry.close()
+        self.registry = ProfileRegistry(self.store, self.base_manager, self.legacy_token.read_text(),
+                                        self.legacy_epg, dict(max_streams=2, startup_wait=3))
+        self.server.RequestHandlerClass = make_multi_handler(
+            self.base_manager, self.legacy_token.read_text(), profile_registry=self.registry)
+        manager = self.registry.resolve(token)[0]
+        self.assertEqual(self.fetch_tv_url(obsolete)[0], 409)
+        self.assertEqual(self.fetch_tv_url(current.replace("device=tv", "device=other"))[0], 409)
+        self.assertFalse(manager.active)
+        with ThreadPoolExecutor(max_workers=1) as requests:
+            pending = requests.submit(self.fetch_tv_url, current)
+            worker = self.wait_for_pending_manifest(manager, second, pending)
+            self.fill_cache(worker, "after-restart")
+            status, recovered = pending.result(timeout=2)
+        self.assertEqual(status, 200)
+
+        def window(manifest):
+            start = int(next(line.split(":")[1] for line in manifest.splitlines()
+                             if line.startswith("#EXT-X-MEDIA-SEQUENCE:")))
+            return range(start, start + manifest.count("#EXTINF:"))
+
+        self.assertGreater(window(resumed).start, window(old_manifest)[-1])
+        self.assertGreater(window(recovered).start, window(resumed)[-1])
+        segment = next(line for line in recovered.splitlines() if line.endswith(".ts"))
+        with urllib.request.urlopen(self.base + segment, timeout=3) as response:
+            self.assertTrue(response.read())
 
     def test_disabling_multicdn_allows_the_native_launch_of_an_old_channel(self):
         token = self.configure_backup(2)
@@ -825,9 +870,7 @@ class ThreeCabinetTests(unittest.TestCase):
 
         self.assertEqual(self.fetch_manifest(token, first)[0], 200)
         self.assertEqual(self.fetch_manifest(token, second)[0], 200)
-        later = time.monotonic() + 11
-        with patch("iptv_profile_gateway.time", SimpleNamespace(monotonic=lambda: later)):
-            self.assertEqual(self.fetch_manifest(token, first)[0], 503)
+        self.assertEqual(self.fetch_manifest(token, first)[0], 503)
         self.assertEqual(self.registry.tunings[2].mux.channel_id, second)
         self.assertEqual(self.fetch_manifest(token, second)[0], 200)
 

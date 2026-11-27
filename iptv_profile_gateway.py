@@ -15,14 +15,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from iptv_profiles import ProfileStore
+from iptv_profiles import ProfileStore, atomic_private_write
 from iptv_cdn_failover import FailoverMux, SESSION_IDLE_SECONDS, MAX_GUESTS_PER_SOURCE
 
 if TYPE_CHECKING:
     from iptv_multi import ActiveStream, MultiGateway
 
 ARCHIVED_CHANNELS_PER_CABIN = 32
-RETUNE_RETRY_SECONDS = 10.0
 
 
 @dataclass
@@ -34,19 +33,42 @@ class ChannelHistory:
 
 
 @dataclass
+class ManifestCheckpoint:
+    channel_id: str
+    key: bytes = field(repr=False)
+    sequence_limit: int = 0
+
+    @classmethod
+    def load(cls, path: Path) -> ManifestCheckpoint | None:
+        try:
+            channel, key, limit = json.loads(path.read_text(encoding="ascii"))
+        except FileNotFoundError:
+            return None
+        return cls(channel, bytes.fromhex(key), limit)
+
+    def reserve(self, path: Path, next_sequence: int) -> None:
+        # Write ahead in blocks so a crash cannot reuse a published sequence.
+        if next_sequence < self.sequence_limit:
+            return
+        limit = next_sequence + 1024
+        atomic_private_write(path, json.dumps([self.channel_id, self.key.hex(), limit]))
+        self.sequence_limit = limit
+
+    def manifest_id(self, device: str) -> str:
+        return hmac.digest(self.key, device.encode("ascii"), "sha256")[:12].hex()
+
+
+@dataclass
 class Tuning:
     mux: FailoverMux
     manager: MultiGateway
-    manifest_key: bytes = field(default_factory=lambda: secrets.token_bytes(32), repr=False)
+    checkpoint: ManifestCheckpoint
     players: dict[str | tuple[str, str], float] = field(default_factory=dict, repr=False)
     ended: threading.Event = field(default_factory=threading.Event)
     sources: dict = field(default_factory=dict)  # slot -> (manager, worker)
     unavailable: dict = field(default_factory=dict)
     blocked_reason: tuple | None = None
     reported_switch: dict | None = None
-
-    def manifest_id(self, device: str) -> str:
-        return hmac.digest(self.manifest_key, device.encode("ascii"), "sha256")[:12].hex()
 
     def note_player(self, player, now):
         if player is not None:
@@ -135,9 +157,14 @@ class ProfileRegistry:
         self.tunings: dict[int, Tuning] = {}
         self.history = {slot: {} for slot in (1, 2, 3)}
         self.next_sequences = {}  # Resume numbering after the video cache expires.
+        self.checkpoints = {slot: ManifestCheckpoint.load(self._checkpoint_path(slot))
+                            for slot in (1, 2, 3)}
         self.closed = False
         self.legacy_detached = False
         self._reload()
+
+    def _checkpoint_path(self, home):
+        return self.store.directory / f"manifest-session-{home}.json"
 
     def _reload(self):
         # Check the small config file, not the 2MB channel snapshots or EPG.
@@ -293,24 +320,12 @@ class ProfileRegistry:
     def begin_manifest(self, token: str, cid: str, player: str | tuple[str, str], *, session=None, denial=None):
         """Select and first publish atomically with respect to other tunings."""
         with self.lock:
-            now = time.monotonic()
-            self._prune_failovers(now)
-            home = self._slot_for_token(token)
-            current = self.tunings.get(home)
-            same_channel = current is not None and current.mux.channel_id == cid
-            if self._failover_enabled():
-                if session is not None:
-                    if (not same_channel or not isinstance(player, str)
-                            or not hmac.compare_digest(current.manifest_id(player), session)):
-                        return ManifestSelection(superseded=True)
-                elif not same_channel:
-                    old = self.failovers.get((home, cid))
-                    owner = self.routes.get(token)
-                    # Players that retry the launch URL carry no session ID.
-                    if (owner is not None and owner[0].prefer_owner_tuning and owner[0].max_streams == 1
-                            and old is not None and old.superseded_at is not None
-                            and now - old.superseded_at < RETUNE_RETRY_SECONDS):
-                        return ManifestSelection(superseded=True)
+            if session is not None:
+                home = self._slot_for_token(token)
+                saved = self.checkpoints.get(home)
+                if (saved is None or saved.channel_id != cid or not isinstance(player, str)
+                        or not hmac.compare_digest(saved.manifest_id(player), session)):
+                    return ManifestSelection(superseded=True)
             selection = self.failover_for(token, cid, player=player, denial=denial)
             if selection is None:
                 return None  # Native HLS mode.
@@ -374,9 +389,16 @@ class ProfileRegistry:
             key = (home, cid)
             mux = self.failovers.get(key)
             new_mux = mux is None
+            checkpoint = self.checkpoints[home]
+            resuming = checkpoint is not None and checkpoint.channel_id == cid
             if new_mux:
+                first_sequence = self.next_sequences.get(key, 1)
+                if resuming:
+                    first_sequence = max(first_sequence, checkpoint.sequence_limit)
                 mux = FailoverMux(home_slot=home, channel_id=cid, channel_name=wanted.name,
-                                  first_sequence=self.next_sequences.get(key, 1))
+                                  first_sequence=first_sequence)
+                if resuming:
+                    mux.discontinuity_sequence = checkpoint.sequence_limit
                 history = self.history[home].get(cid)
                 if history:
                     mux.switches = history.switches
@@ -387,8 +409,10 @@ class ProfileRegistry:
                     manager.record_capacity_denial(None)
                     return None, []
             if tuning is None or retuning:
-                if retuning and dedicated:
-                    tuning.mux.superseded_at = now
+                if not resuming:
+                    checkpoint = ManifestCheckpoint(cid, secrets.token_bytes(32))
+                checkpoint.reserve(self._checkpoint_path(home), mux.next_sequence)
+                self.checkpoints[home] = checkpoint
                 self._end_tuning(home, reserves.values() if require_ready else ())
                 if new_mux:
                     self.next_sequences.pop(key, None)
@@ -396,7 +420,7 @@ class ProfileRegistry:
                     self.failovers[key] = mux
                 elif not require_ready:
                     mux.restart_session(time.monotonic())
-                tuning = self.tunings[home] = Tuning(mux, manager)
+                tuning = self.tunings[home] = Tuning(mux, manager, checkpoint)
             tuning.note_player(player, now)
             if not require_ready:
                 reserves, unavailable = self._reserves(home, manager, wanted)
@@ -456,6 +480,8 @@ class ProfileRegistry:
             current.note_player(player, now)
             usage = self._guest_usage(mux.home_slot, now)
             playlist = mux.playlist(token, current.candidates(), now=now, usage=usage)
+            if playlist:
+                current.checkpoint.reserve(self._checkpoint_path(mux.home_slot), mux.next_sequence)
             if playlist and mux.source_slot != mux.home_slot:
                 selected = current.sources.get(mux.source_slot)
                 if selected is not None:
@@ -614,7 +640,7 @@ class ProfileRegistry:
                 match = wanted.id if slot == home else self._matching_channel_id(owner[0], manager, wanted)
             cabin = {
                 "slot": slot,
-                "name": profile["name"] if slot == home else f"Кабинет {slot}",
+                "name": profile["name"] if slot == home else f"ÐšÐ°Ð±Ð¸Ð½ÐµÑ‚ {slot}",
                 "configured": manager is not None,
                 "channel_found": match is not None if wanted else bool(manager and manager.channels),
                 "channel_name": wanted.name if slot == home and wanted else None,

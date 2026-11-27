@@ -600,6 +600,10 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 # Hold a cold manifest while one of its sources warms up.
                 cancelled = tuning.ended if tuning is not None else stream.gateway.stop
                 try:
+                    if tuning is not None and device and session is None:
+                        query = urllib.parse.urlencode({"device": device, "session": tuning.checkpoint.manifest_id(device)})
+                        location = f"{prefix}/channel/{cid}/index.m3u8?{query}"
+                        return self.respond(307, b"", "text/plain", head, {"Location": location})
                     if tuning is None:
                         raw = playlist()
                     waited = False
@@ -638,10 +642,6 @@ def make_multi_handler(manager: MultiGateway, token: str,
                         stream.gateway.record_client("manifest", 503)
                     return self.respond(503, b"Buffer warming up; reselect channel",
                                         "text/plain", head, {"Retry-After": "2"})
-                if tuning is not None and device and session is None:
-                    query = urllib.parse.urlencode({"device": device, "session": tuning.manifest_id(device)})
-                    location = f"{prefix}/channel/{cid}/index.m3u8?{query}"
-                    return self.respond(307, b"", "text/plain", head, {"Location": location})
                 # The legacy single-channel gateway outputs /TOKEN/segment/...
                 # Inject this channel's stable ID without touching source URLs.
                 before = f"/{active_token}/segment/".encode()

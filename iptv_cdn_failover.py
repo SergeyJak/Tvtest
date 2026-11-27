@@ -75,7 +75,6 @@ class FailoverMux:
         self.backup_blocker = None
         self.last_progress = 0.0
         self.last_request = time.monotonic()
-        self.superseded_at: float | None = None
         # Keep cursors across switches and idle sessions, without retaining old caches.
         self.published_cursors = WeakKeyDictionary()  # worker -> (cache epoch, sequence)
         self.slots_seen: list[int] = []
