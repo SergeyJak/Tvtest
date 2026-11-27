@@ -11,7 +11,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass
-from weakref import ReferenceType, WeakKeyDictionary, ref
+from weakref import WeakKeyDictionary
 
 PILOT_NAME = "vf теория большого взрыва"
 WINDOW_SEGMENTS = 12
@@ -35,15 +35,6 @@ class VirtualSegment:
     source_slot: int
 
 
-@dataclass
-class HomeProgress:
-    worker: ReferenceType
-    epoch: int
-    sequence: int
-    since: float
-    last_advance: float
-
-
 class FailoverMux:
     """Emit monotonic virtual HLS sequences across complete source switches.
 
@@ -63,7 +54,6 @@ class FailoverMux:
         self.lock = threading.RLock()
         self.source_slot = None
         self.source_stream = None
-        self.home_progress = None
         self.generation = secrets.token_hex(12)
         self.next_sequence = first_sequence
         self.history: list[VirtualSegment] = []
@@ -122,32 +112,6 @@ class FailoverMux:
             -slot
         ), reverse=True)
 
-    def _home_recovered(self, home, now: float) -> bool:
-        """Observe the playable edge without moving the home gateway's cursor."""
-        if (home is None or self.source_slot in (None, self.home_slot)
-                or not self.source_health[self.home_slot]["fresh"]):
-            self.home_progress = None
-            return False
-        with home.gateway.lock:
-            epoch = home.gateway.cache_epoch
-            window = home.gateway.published(commit=False)
-        if not window:
-            self.home_progress = None
-            return False
-
-        sequence = window[-1][0]
-        progress = self.home_progress
-        if (progress is None or home is not progress.worker() or epoch != progress.epoch
-                or sequence < progress.sequence
-                or now - progress.last_advance >= PUBLISH_STALL_SECONDS):
-            self.home_progress = HomeProgress(ref(home), epoch, sequence, now, now)
-            return False
-        if sequence == progress.sequence:
-            return False
-        progress.sequence = sequence
-        progress.last_advance = now
-        return now - progress.since >= SWITCH_COOLDOWN
-
     def _append(self, duration: float, payload: bytes, source_slot: int, *, discontinuity: bool):
         self.history.append(VirtualSegment(self.next_sequence, duration, payload, discontinuity, source_slot))
         self.target_duration = max(self.target_duration, math.ceil(duration))
@@ -166,7 +130,6 @@ class FailoverMux:
             self.history.clear()
             self.source_slot = None
             self.source_stream = None
-            self.home_progress = None
             self.last_progress = 0.0
             self.last_switch = 0.0
             self.last_request = now
@@ -269,8 +232,6 @@ class FailoverMux:
 
             stalled = now - self.last_progress >= PUBLISH_STALL_SECONDS
             can_switch = current is None or now - self.last_switch >= SWITCH_COOLDOWN
-            home = sources.get(self.home_slot)
-            home_recovered = self._home_recovered(home, now)
             self.backup_blocker = None
             if can_switch and (not fresh or stalled):
                 reason = ("SOURCE_RESTARTED" if current is None and selected is not None else
@@ -283,8 +244,6 @@ class FailoverMux:
                     self.backup_blocker = "NO_READY_BACKUP"
             elif not can_switch and (not fresh or stalled):
                 self.backup_blocker = "SWITCH_COOLDOWN"
-            elif can_switch and home_recovered:
-                self._publish_from(self.home_slot, home, now, reason="HOME_RECOVERED")
 
             # A stale provider can still have minutes of playable local video.
             if not fresh and current is not None and current is self.source_stream:
