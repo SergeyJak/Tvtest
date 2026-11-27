@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 from iptv_multi import MultiGateway, channels_from_text, make_multi_handler
 from iptv_profiles import ProfileStore, ProfileError
-from iptv_profile_gateway import ProfileRegistry
+from iptv_profile_gateway import ManifestCheckpoint, ProfileRegistry
 from iptv_profile_jobs import generate_for_slot
 from iptv_telemetry import Telemetry, query_incidents, export_incident_rows
 
@@ -322,6 +322,8 @@ class ThreeCabinetTests(unittest.TestCase):
         with self.request(owner_token, "status") as response:
             status = json.load(response)
         self.assertIn("multi_cdn_diagnostics", status)
+        cabins = status["multi_cdn_diagnostics"]["cabins"]
+        self.assertEqual([cabin["name"] for cabin in cabins], ["Основной", "Кабинет 2", "Кабинет 3"])
         self.assertNotIn("PRIVATE_KEY", json.dumps(status))
         self.assertNotIn("provider.example", json.dumps(status))
         self.assertTrue(status["multi_cdn_diagnostics"]["primary_channel_found"])
@@ -769,6 +771,53 @@ class ThreeCabinetTests(unittest.TestCase):
             self.assertEqual(reopen.result(timeout=2)[0], 200)
         self.assertEqual(list(manager.active), [first])
 
+    def reopen_gateway(self):
+        self.registry.close()
+        self.registry = ProfileRegistry(self.store, self.base_manager, self.legacy_token.read_text(),
+                                        self.legacy_epg, dict(max_streams=2, startup_wait=3))
+        self.server.RequestHandlerClass = make_multi_handler(
+            self.base_manager, self.legacy_token.read_text(), profile_registry=self.registry)
+
+    def test_corrupt_checkpoint_does_not_block_other_cabinets_or_a_new_selection(self):
+        token = self.configure_backup(2)
+        owner = self.registry.resolve(token)[0]
+        channel = owner.order[0]
+        self.fill_cache(owner.start(channel), "backup")
+        with self.request(token, f"channel/{channel}/index.m3u8?device=tv") as response:
+            saved_url = response.geturl()
+        primary = self.store.get(1)["token"]
+        primary_channel = self.base_manager.order[0]
+        self.fill_cache(self.base_manager.start(primary_channel), "primary")
+        launch = f"channel/{primary_channel}/index.m3u8?device=primary"
+        with self.request(primary, launch) as response:
+            lost_url = response.geturl()
+        damaged = self.store.directory / "manifest-session-1.json"
+        damaged.write_bytes(b'["truncated"')
+
+        self.reopen_gateway()
+        self.assertEqual(self.fetch_tv_url(lost_url)[0], 409)
+        self.fill_cache(self.registry.resolve(token)[0].start(channel), "resumed")
+        self.assertEqual(self.fetch_tv_url(saved_url)[0], 200)
+        with self.request(primary, launch) as response:
+            self.assertEqual(response.status, 200)
+            self.assertNotEqual(response.geturl(), lost_url)
+        self.assertEqual(ManifestCheckpoint.load(damaged).channel_id, primary_channel)
+
+    def test_invalid_or_unreadable_manifest_checkpoint_is_ignored(self):
+        path = Path(self.temp.name) / "checkpoint.json"
+        channel = self.base_manager.order[0]
+        key = "ab" * 32
+        for data in (None, {}, [channel], [channel, None, 1025], [channel, "zz" * 32, 1025],
+                     [channel, "ab", 1025], [None, key, 1025], [channel, key, "1025"],
+                     [channel, key, True], [channel, key, -1]):
+            with self.subTest(data=data):
+                path.write_text(json.dumps(data), encoding="ascii")
+                self.assertIsNone(ManifestCheckpoint.load(path))
+        for payload in (b"\xff", b"[" * 5000):
+            path.write_bytes(payload)
+            self.assertIsNone(ManifestCheckpoint.load(path))
+        self.assertIsNone(ManifestCheckpoint.load(path.parent))  # directory read raises OSError
+
     def test_redirected_manifest_resumes_after_idle_and_gateway_restart(self):
         token = self.configure_backup(2)
         manager = self.registry.resolve(token)[0]
@@ -790,11 +839,7 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertEqual(status, 200)
 
         # A new registry and HTTP handler share only the on-disk profile directory.
-        self.registry.close()
-        self.registry = ProfileRegistry(self.store, self.base_manager, self.legacy_token.read_text(),
-                                        self.legacy_epg, dict(max_streams=2, startup_wait=3))
-        self.server.RequestHandlerClass = make_multi_handler(
-            self.base_manager, self.legacy_token.read_text(), profile_registry=self.registry)
+        self.reopen_gateway()
         manager = self.registry.resolve(token)[0]
         self.assertEqual(self.fetch_tv_url(obsolete)[0], 409)
         self.assertEqual(self.fetch_tv_url(current.replace("device=tv", "device=other"))[0], 409)

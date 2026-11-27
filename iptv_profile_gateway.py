@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
+import re
 import secrets
 import threading
 import time
@@ -41,10 +43,25 @@ class ManifestCheckpoint:
     @classmethod
     def load(cls, path: Path) -> ManifestCheckpoint | None:
         try:
-            channel, key, limit = json.loads(path.read_text(encoding="ascii"))
+            # The writer stores three short fields. Bound even a damaged file before parsing.
+            with path.open("rb") as stream:
+                raw = stream.read(513)
+            if len(raw) > 512:
+                raise ValueError("oversized checkpoint")
+            data = json.loads(raw.decode("ascii"))
+            if not isinstance(data, list) or len(data) != 3:
+                raise ValueError("invalid checkpoint layout")
+            channel, key, limit = data
+            if (not isinstance(channel, str) or not re.fullmatch(r"[0-9a-f]{20}", channel)
+                    or not isinstance(key, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", key)
+                    or type(limit) is not int or not 0 < limit < 2**64):
+                raise ValueError("invalid checkpoint fields")
+            return cls(channel, bytes.fromhex(key), limit)
         except FileNotFoundError:
             return None
-        return cls(channel, bytes.fromhex(key), limit)
+        except (OSError, ValueError):
+            logging.getLogger(__name__).warning("Ignoring unreadable or invalid manifest checkpoint %s", path.name)
+            return None
 
     def reserve(self, path: Path, next_sequence: int) -> None:
         # Write ahead in blocks so a crash cannot reuse a published sequence.
@@ -640,7 +657,7 @@ class ProfileRegistry:
                 match = wanted.id if slot == home else self._matching_channel_id(owner[0], manager, wanted)
             cabin = {
                 "slot": slot,
-                "name": profile["name"] if slot == home else f"ÐšÐ°Ð±Ð¸Ð½ÐµÑ‚ {slot}",
+                "name": profile["name"] if slot == home else f"Кабинет {slot}",
                 "configured": manager is not None,
                 "channel_found": match is not None if wanted else bool(manager and manager.channels),
                 "channel_name": wanted.name if slot == home and wanted else None,
