@@ -1,4 +1,5 @@
 """Offline tests for the on-demand family TV catalog prototype."""
+import gc
 import http.client
 import json
 import threading
@@ -6,10 +7,11 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import weakref
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import iptv_multi as multi
 
@@ -390,6 +392,35 @@ class MultiChannelTests(unittest.TestCase):
         self.manager.sweep()
         self.assertEqual(len(self.manager.active), 1)
         self.assertIsNotNone(self.manager.start(another.id))
+
+    def test_idle_stream_with_telemetry_is_released_without_cyclic_gc(self):
+        telemetry = self.manager.telemetry = Mock()
+        channel = self.channels[0]
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            stream = self.manager.start(channel.id)
+            gateway = weakref.ref(stream.gateway)
+            with stream.gateway.lock:
+                segment = b"video" * 1000
+                stream.gateway.cache[1] = (6.0, segment)
+                stream.gateway.total_bytes = len(segment)
+            diagnostics = stream.gateway.source_diagnostics()
+            stream.gateway._notify_event("segment_slow", "SEGMENT_DOWNLOAD_SLOW", 8.0)
+            telemetry.incident.assert_called_once_with(
+                channel.id, "segment_slow", "SEGMENT_DOWNLOAD_SLOW", 8.0,
+                diagnostics=diagnostics)
+
+            stream.accessed -= 30
+            self.manager.sweep()
+            self.assertNotIn(channel.id, self.manager.active)
+            stream.worker.join(timeout=2)
+            self.assertFalse(stream.worker.is_alive())
+            del stream
+            self.assertIsNone(gateway())
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
     def test_real_viewer_preempts_standby_without_allowing_standby_to_evict_viewer(self):
         first, second = self.channels

@@ -21,6 +21,7 @@ import re
 import threading
 import time
 import urllib.parse
+import weakref
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -175,8 +176,10 @@ class MultiGateway:
             return updated.url
 
         def record_event(kind, detail, duration):
-            self.telemetry.incident(self.telemetry_channel_id(channel.id), kind, detail,
-                                    duration, diagnostics=gateway.source_diagnostics())
+            source = gateway_ref()
+            if source is not None:
+                self.telemetry.incident(self.telemetry_channel_id(channel.id), kind, detail,
+                                        duration, diagnostics=source.source_diagnostics())
 
         gateway = Gateway(channel.url, delay=self.delay, timeout=self.timeout,
                           poll=self.poll, max_bytes=self.cache_mib * 1048576,
@@ -185,6 +188,8 @@ class MultiGateway:
                           fast_start=not pinned,
                           require_startup_reserve=self.require_startup_reserve,
                           on_event=record_event if self.telemetry else None)
+        # The callback belongs to the gateway; a strong reference would retain its cache.
+        gateway_ref = weakref.ref(gateway)
         return ActiveStream(channel, gateway, self.upstream_slots, pinned, standby)
 
     def start(self, cid: str, *, pinned: bool = False, standby: bool = False,
