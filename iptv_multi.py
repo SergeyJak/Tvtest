@@ -188,7 +188,8 @@ class MultiGateway:
         return ActiveStream(channel, gateway, self.upstream_slots, pinned, standby)
 
     def start(self, cid: str, *, pinned: bool = False, standby: bool = False,
-              denial: dict | None = None, superseded=None, protected=()) -> ActiveStream | None:
+              denial: dict | None = None, superseded=None, protected=(),
+              count_denial: bool = True) -> ActiveStream | None:
         """Start a requested channel; do not silently evict active viewers."""
         with self.lock:
             if cid not in self.channels:
@@ -232,13 +233,13 @@ class MultiGateway:
                     del self.active[oldest_id]
                     self.recycled_idle_streams += 1
             if len(self.active) >= self.max_streams:
-                self.record_capacity_denial(denial)
+                self.record_capacity_denial(denial, count=count_denial)
                 return None
             stream = self._new_stream(self.channels[cid], pinned, standby)
             self.active[cid] = stream
             return stream
 
-    def record_capacity_denial(self, denial):
+    def record_capacity_denial(self, denial, *, count=True):
         with self.lock:
             if denial is not None:
                 now = time.monotonic()
@@ -247,7 +248,8 @@ class MultiGateway:
                      "standby": item.standby, "pending_requests": item.pending_requests,
                      "idle_seconds": round(now - item.accessed, 1)}
                     for sid, item in self.active.items()])
-            self.stream_limit_denials += 1
+            if count:
+                self.stream_limit_denials += 1
 
     def active_stream(self, cid: str) -> ActiveStream | None:
         with self.lock:
@@ -341,13 +343,15 @@ class MultiGateway:
             }, ensure_ascii=False).encode("utf-8")
 
     def playlist(self, token: str, host: str, *, filter_names: list[str] | None = None,
-                 public_base_url: str | None = None, epg_enabled: bool = False) -> bytes:
+                 public_base_url: str | None = None, epg_enabled: bool = False,
+                 device: str | None = None) -> bytes:
         base_url = public_base_url or f"http://{host}"
         lines = [(
             f'#EXTM3U x-tvg-url="{base_url}/{token}/epg.xml.gz" '
             f'url-tvg="{base_url}/{token}/epg.xml.gz"'
         ) if epg_enabled else "#EXTM3U"]
         allowed = set(filter_names) if filter_names is not None else None
+        suffix = "?" + urllib.parse.urlencode({"device": device}) if device else ""
         for cid in self.order:
             c = self.channels[cid]
             if allowed is not None and cid not in allowed:
@@ -356,7 +360,7 @@ class MultiGateway:
             group = c.group.replace("\r", " ").replace("\n", " ").replace('"', "")
             meta = f' tvg-id="{cid}"' + (f' group-title="{group}"' if group else "")
             lines.append(f'#EXTINF:-1{meta},{name}')
-            lines.append(f'{base_url}/{token}/channel/{cid}/index.m3u8')
+            lines.append(f'{base_url}/{token}/channel/{cid}/index.m3u8{suffix}')
         return ("\n".join(lines) + "\n").encode("utf-8")
 
 
@@ -367,7 +371,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
     configured_epg_file = epg_file
 
     class Handler(BaseHTTPRequestHandler):
-        def player_identity(self):
+        def viewer_signature(self):
             ip = self.client_address[0]
             # Only trust proxy headers when the actual TCP peer is localhost.
             # Never keep original IP or user-agent in SQLite.
@@ -381,8 +385,18 @@ def make_multi_handler(manager: MultiGateway, token: str,
             return ip, self.headers.get("User-Agent", "")
 
         def viewer_identity(self):
-            manager = self._request_manager
-            return manager.telemetry.viewer(*self.player_identity()) if manager.telemetry else ""
+            telemetry = self._request_manager.telemetry
+            return telemetry.viewer(*self.viewer_signature()) if telemetry else ""
+
+        def playback_parameters(self, query):
+            values = urllib.parse.parse_qs(query, keep_blank_values=True, max_num_fields=16)
+            device, = values.get("device", [None])
+            session, = values.get("session", [None])
+            if device is not None and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", device) is None:
+                raise ValueError("Invalid device")
+            if session is not None and (not device or re.fullmatch(r"[a-f0-9]{24}", session) is None):
+                raise ValueError("Invalid session")
+            return device, session
 
         def track_client_failure(self, cid, reason, status, route, diagnostics=None):
             manager = self._request_manager
@@ -480,7 +494,8 @@ def make_multi_handler(manager: MultiGateway, token: str,
 
         def serve(self, head: bool):
             self._head = head
-            path = urllib.parse.urlsplit(self.path).path
+            url = urllib.parse.urlsplit(self.path)
+            path = url.path
             requested_token = path.split("/", 2)[1] if path.startswith("/") else ""
             if profile_registry is None:
                 resolved = (manager, token, configured_epg_file) if requested_token == token else None
@@ -500,7 +515,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 credential = self.headers.get("Authorization", "")
                 include_standby = (profile_registry is not None and credential.isascii()
                                    and hmac.compare_digest(credential, "Bearer " + profile_registry.store.monitor_token))
-                if include_standby and urllib.parse.urlsplit(self.path).query == "scope=cabinets":
+                if include_standby and url.query == "scope=cabinets":
                     snapshot = {"cabinet_statuses": profile_registry.monitor_snapshot()}
                     return self.respond(200, json.dumps(snapshot, ensure_ascii=False).encode("utf-8"),
                                         "application/json", head)
@@ -515,6 +530,10 @@ def make_multi_handler(manager: MultiGateway, token: str,
                 return self.respond(200, json.dumps(data, ensure_ascii=False).encode("utf-8"),
                                     "application/json", head)
             if route == ["channels.m3u"]:
+                try:
+                    device, _ = self.playback_parameters(url.query)
+                except ValueError:
+                    return self.respond(400, b"Invalid playback parameters", "text/plain", head)
                 host = self.headers.get("Host", "")
                 if not re.fullmatch(r"[A-Za-z0-9.:\-\[\]]{1,255}", host):
                     return self.respond(400, b"Invalid host", "text/plain", head)
@@ -522,7 +541,8 @@ def make_multi_handler(manager: MultiGateway, token: str,
                     request_manager.catalog_requests += 1
                 return self.respond(200, request_manager.playlist(active_token, host,
                                                           public_base_url=public_base_url,
-                                                          epg_enabled=active_epg_file is not None),
+                                                          epg_enabled=active_epg_file is not None,
+                                                          device=device),
                                     "audio/x-mpegurl", head)
             # Saved TV favorites may retain the old single-channel URLs
             # even after the catalog URL has been reloaded. Alias only to
@@ -549,9 +569,15 @@ def make_multi_handler(manager: MultiGateway, token: str,
                     # are determined on GET, when the TV actually tunes the channel.
                     return self.respond(200, None, "application/vnd.apple.mpegurl", head)
                 denial = {} if request_manager.telemetry else None
-                player = self.player_identity() if profile_registry is not None else None
-                selection = (profile_registry.begin_manifest(active_token, cid, player, denial=denial)
+                try:
+                    device, session = self.playback_parameters(url.query)
+                except ValueError:
+                    return self.respond(400, b"Invalid playback parameters", "text/plain", head)
+                player = device or self.viewer_signature()
+                selection = (profile_registry.begin_manifest(active_token, cid, player, session=session, denial=denial)
                              if profile_registry is not None else None)
+                if (selection is not None and selection.superseded) or (session and selection is None):
+                    return self.respond(409, b"Channel selection changed", "text/plain", head)
                 if selection is None:
                     tuning = None
                     raw = None
@@ -560,7 +586,7 @@ def make_multi_handler(manager: MultiGateway, token: str,
                         with request_manager.lock:
                             stream.pending_requests += 1
                 else:
-                    tuning, stream, raw = selection
+                    tuning, stream, raw = selection.tuning, selection.worker, selection.playlist
                 if tuning is None and stream is None:
                     self.track_client_failure(cid, "STREAM_LIMIT", 503, "manifest", denial)
                     return self.respond(503, b"Too many active streams",
@@ -612,6 +638,10 @@ def make_multi_handler(manager: MultiGateway, token: str,
                         stream.gateway.record_client("manifest", 503)
                     return self.respond(503, b"Buffer warming up; reselect channel",
                                         "text/plain", head, {"Retry-After": "2"})
+                if tuning is not None and device and session is None:
+                    query = urllib.parse.urlencode({"device": device, "session": tuning.manifest_id(device)})
+                    location = f"{prefix}/channel/{cid}/index.m3u8?{query}"
+                    return self.respond(307, b"", "text/plain", head, {"Location": location})
                 # The legacy single-channel gateway outputs /TOKEN/segment/...
                 # Inject this channel's stable ID without touching source URLs.
                 before = f"/{active_token}/segment/".encode()

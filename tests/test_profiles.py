@@ -617,9 +617,11 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertNotIn(manager.order[0], manager.active)
         self.assertIs(manager.active[manager.order[1]], second)
 
-    def fetch_manifest(self, token, cid, player="Living room TV"):
-        request = urllib.request.Request(f"{self.base}/{token}/channel/{cid}/index.m3u8",
-                                         headers={"User-Agent": player})
+    def fetch_manifest(self, token, cid, player="living-room"):
+        return self.fetch_tv_url(f"{self.base}/{token}/channel/{cid}/index.m3u8?device={player}")
+
+    def fetch_tv_url(self, url):
+        request = urllib.request.Request(url, headers={"User-Agent": "Identical TV"})
         try:
             with urllib.request.urlopen(request, timeout=4) as response:
                 return response.status, response.read().decode()
@@ -675,10 +677,26 @@ class ThreeCabinetTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=1) as requests:
             a = requests.submit(self.fetch_manifest, token, first)
             owner = self.wait_for_pending_manifest(manager, first, a)
-            self.assertEqual(self.fetch_manifest(token, second, "Kitchen TV")[0], 503)
+            self.assertEqual(self.fetch_manifest(token, second, "kitchen")[0], 503)
             self.assertFalse(owner.gateway.stop.is_set())
             self.fill_cache(owner, "owner")
             self.assertEqual(a.result(timeout=2)[0], 200)
+        self.assertEqual(manager.stream_limit_denials, 1)
+
+    def test_identical_legacy_signatures_cannot_cancel_an_inflight_warmup(self):
+        token = self.configure_backup(2)
+        manager = self.registry.resolve(token)[0]
+        manager.startup_wait = 3
+        first, second = manager.order
+        first_url = f"{self.base}/{token}/channel/{first}/index.m3u8"
+        second_url = f"{self.base}/{token}/channel/{second}/index.m3u8"
+        with ThreadPoolExecutor(max_workers=1) as requests:
+            pending = requests.submit(self.fetch_tv_url, first_url)
+            owner = self.wait_for_pending_manifest(manager, first, pending)
+            self.assertEqual(self.fetch_tv_url(second_url)[0], 503)
+            self.assertFalse(owner.gateway.stop.is_set())
+            self.fill_cache(owner, "owner")
+            self.assertEqual(pending.result(timeout=2)[0], 200)
 
     def test_a_former_second_player_does_not_block_the_continuing_player(self):
         token = self.configure_backup(2)
@@ -692,7 +710,7 @@ class ThreeCabinetTests(unittest.TestCase):
 
         with patch("iptv_profile_gateway.time", SimpleNamespace(monotonic=lambda: base + elapsed)):
             self.assertEqual(self.fetch_manifest(token, first)[0], 200)
-            self.assertEqual(self.fetch_manifest(token, first, "Kitchen TV")[0], 200)
+            self.assertEqual(self.fetch_manifest(token, first, "kitchen")[0], 200)
             self.assertEqual(self.fetch_manifest(token, second)[0], 503)
             elapsed = 35
             self.assertEqual(self.fetch_manifest(token, first)[0], 200)
@@ -717,6 +735,56 @@ class ThreeCabinetTests(unittest.TestCase):
         self.assertIs(manager.active[first], occupant)
         self.assertFalse(occupant.gateway.stop.is_set())
         self.assertNotIn(second, manager.active)
+        self.assertEqual(manager.stream_limit_denials, 0)
+
+    def test_device_catalog_carries_identity_and_old_requests_cannot_retune(self):
+        token = self.configure_backup(2)
+        manager = self.registry.resolve(token)[0]
+        manager.startup_wait = 3
+        first, second = manager.order
+        with self.request(token, "channels.m3u?device=living-room") as response:
+            paths = [line for line in response.read().decode().splitlines() if line.startswith("https://")]
+        self.assertEqual(len(paths), 2)
+        self.assertTrue(all(path.endswith("?device=living-room") for path in paths))
+        self.fill_cache(manager.start(first), "first")
+        first_url = f"{self.base}/{token}/channel/{first}/index.m3u8?device=living-room"
+        with urllib.request.urlopen(first_url, timeout=3) as response:
+            old_session = response.geturl()
+        self.assertIn("&session=", old_session)
+        self.assertEqual(self.fetch_tv_url(old_session.replace("device=living-room", "device=kitchen"))[0], 409)
+
+        with ThreadPoolExecutor(max_workers=1) as requests:
+            next_channel = requests.submit(self.fetch_manifest, token, second)
+            newest = self.wait_for_pending_manifest(manager, second, next_channel)
+            self.assertEqual(self.fetch_tv_url(old_session)[0], 409)
+            self.assertEqual(self.fetch_tv_url(first_url)[0], 409)
+            self.fill_cache(newest, "second")
+            self.assertEqual(next_channel.result(timeout=2)[0], 200)
+        self.assertEqual(list(manager.active), [second])
+        self.assertEqual(manager.stream_limit_denials, 0)
+        later = time.monotonic() + 11
+        with patch("iptv_profile_gateway.time", SimpleNamespace(monotonic=lambda: later)):
+            with ThreadPoolExecutor(max_workers=1) as requests:
+                reopen = requests.submit(self.fetch_tv_url, first_url)
+                newest = self.wait_for_pending_manifest(manager, first, reopen)
+                self.fill_cache(newest, "reopened")
+                self.assertEqual(reopen.result(timeout=2)[0], 200)
+            self.assertEqual(self.fetch_tv_url(old_session)[0], 409)
+            self.assertEqual(list(manager.active), [first])
+
+    def test_disabling_multicdn_allows_the_native_launch_of_an_old_channel(self):
+        token = self.configure_backup(2)
+        manager = self.registry.resolve(token)[0]
+        first, second = manager.order
+        self.fill_cache(manager.start(first), "first")
+        self.assertEqual(self.fetch_manifest(token, first)[0], 200)
+        self.assertEqual(self.fetch_manifest(token, second)[0], 503)
+
+        (self.store.directory / "multicdn.disabled").touch()
+        status, message = self.fetch_manifest(token, first)
+        self.assertEqual(status, 503)
+        self.assertIn("Buffer warming up", message)
+        self.assertEqual(list(manager.active), [first])
 
     def test_retune_preserves_a_home_worker_serving_another_cabinet(self):
         token = self.configure_backup(2)
@@ -757,7 +825,9 @@ class ThreeCabinetTests(unittest.TestCase):
 
         self.assertEqual(self.fetch_manifest(token, first)[0], 200)
         self.assertEqual(self.fetch_manifest(token, second)[0], 200)
-        self.assertEqual(self.fetch_manifest(token, first)[0], 503)
+        later = time.monotonic() + 11
+        with patch("iptv_profile_gateway.time", SimpleNamespace(monotonic=lambda: later)):
+            self.assertEqual(self.fetch_manifest(token, first)[0], 503)
         self.assertEqual(self.registry.tunings[2].mux.channel_id, second)
         self.assertEqual(self.fetch_manifest(token, second)[0], 200)
 

@@ -6,7 +6,9 @@ random path tokens. Saving a profile swaps only that profile's manager.
 """
 from __future__ import annotations
 
+import hmac
 import json
+import secrets
 import threading
 import time
 from dataclasses import dataclass, field
@@ -17,9 +19,10 @@ from iptv_profiles import ProfileStore
 from iptv_cdn_failover import FailoverMux, SESSION_IDLE_SECONDS, MAX_GUESTS_PER_SOURCE
 
 if TYPE_CHECKING:
-    from iptv_multi import MultiGateway
+    from iptv_multi import ActiveStream, MultiGateway
 
 ARCHIVED_CHANNELS_PER_CABIN = 32
+RETUNE_RETRY_SECONDS = 10.0
 
 
 @dataclass
@@ -34,12 +37,16 @@ class ChannelHistory:
 class Tuning:
     mux: FailoverMux
     manager: MultiGateway
-    players: dict[tuple[str, str], float] = field(default_factory=dict, repr=False)
+    manifest_key: bytes = field(default_factory=lambda: secrets.token_bytes(32), repr=False)
+    players: dict[str | tuple[str, str], float] = field(default_factory=dict, repr=False)
     ended: threading.Event = field(default_factory=threading.Event)
     sources: dict = field(default_factory=dict)  # slot -> (manager, worker)
     unavailable: dict = field(default_factory=dict)
     blocked_reason: tuple | None = None
     reported_switch: dict | None = None
+
+    def manifest_id(self, device: str) -> str:
+        return hmac.digest(self.manifest_key, device.encode("ascii"), "sha256")[:12].hex()
 
     def note_player(self, player, now):
         if player is not None:
@@ -102,6 +109,14 @@ class Tuning:
     def candidates(self):
         return [(slot, worker) for slot, (_, worker) in self.sources.items()
                 if not worker.gateway.stop.is_set()]
+
+
+@dataclass(frozen=True)
+class ManifestSelection:
+    tuning: Tuning | None = None
+    worker: ActiveStream | None = None
+    playlist: bytes | None = None
+    superseded: bool = False
 
 
 class ProfileRegistry:
@@ -275,22 +290,43 @@ class ProfileRegistry:
                 self.next_sequences[key] = mux.next_sequence
                 del self.failovers[key]
 
-    def begin_manifest(self, token: str, cid: str, player, *, denial=None):
+    def begin_manifest(self, token: str, cid: str, player: str | tuple[str, str], *, session=None, denial=None):
         """Select and first publish atomically with respect to other tunings."""
         with self.lock:
+            now = time.monotonic()
+            self._prune_failovers(now)
+            home = self._slot_for_token(token)
+            current = self.tunings.get(home)
+            same_channel = current is not None and current.mux.channel_id == cid
+            if self._failover_enabled():
+                if session is not None:
+                    if (not same_channel or not isinstance(player, str)
+                            or not hmac.compare_digest(current.manifest_id(player), session)):
+                        return ManifestSelection(superseded=True)
+                elif not same_channel:
+                    old = self.failovers.get((home, cid))
+                    owner = self.routes.get(token)
+                    # Players that retry the launch URL carry no session ID.
+                    if (owner is not None and owner[0].prefer_owner_tuning and owner[0].max_streams == 1
+                            and old is not None and old.superseded_at is not None
+                            and now - old.superseded_at < RETUNE_RETRY_SECONDS):
+                        return ManifestSelection(superseded=True)
             selection = self.failover_for(token, cid, player=player, denial=denial)
             if selection is None:
                 return None  # Native HLS mode.
             mux, candidates = selection
             if mux is None:
-                return None, None, None  # All usable slots are busy.
+                return ManifestSelection()  # All usable slots are busy.
             tuning = self.tunings[mux.home_slot]
             worker = dict(candidates).get(mux.home_slot)
             playlist = self.publish_failover(mux, token, request=tuning, player=player)
             if worker is not None:
                 with tuning.manager.lock:
                     worker.pending_requests += 1
-            return tuning, worker, playlist
+            return ManifestSelection(tuning, worker, playlist)
+
+    def _failover_enabled(self):
+        return not self.closed and not (self.store.directory / "multicdn.disabled").exists()
 
     def failover_for(self, token: str, cid: str, *, player=None, denial=None):
         """Use every channel's HOME Edem subscription with optional backups.
@@ -300,7 +336,7 @@ class ProfileRegistry:
         missing in a backup stays playable from its owner's own source.
         """
         with self.lock:
-            if self.closed or (self.store.directory / "multicdn.disabled").exists():
+            if not self._failover_enabled():
                 for slot in list(self.tunings):
                     self._end_tuning(slot)
                 return None
@@ -322,11 +358,15 @@ class ProfileRegistry:
                                     for other, seen in tuning.players.items()):
                     manager.record_capacity_denial(denial)
                     return None, []
-                if retuning and player in tuning.players and home in tuning.sources:
+                # IP and User-Agent can distinguish some legacy viewers, but
+                # matching signatures do not prove the same device.
+                if retuning and isinstance(player, str) and player in tuning.players and home in tuning.sources:
                     superseded = tuning.sources[home][1]
                 protected = self._selected_guest_workers(home)
-            worker = manager.start(cid, denial=denial, superseded=superseded, protected=protected)
+            worker = manager.start(cid, denial=denial, superseded=superseded,
+                                   protected=protected, count_denial=False)
             if worker is None and not dedicated:
+                manager.record_capacity_denial(None)
                 return None, []
             # A new selection can bypass a busy home source with an already
             # playable reserve. Keep the existing tuning if there is none.
@@ -344,8 +384,11 @@ class ProfileRegistry:
             if require_ready:
                 reserves, unavailable = self._reserves(home, manager, wanted, ready_only=True)
                 if not self._start_on_reserve(mux, reserves, now):
+                    manager.record_capacity_denial(None)
                     return None, []
             if tuning is None or retuning:
+                if retuning and dedicated:
+                    tuning.mux.superseded_at = now
                 self._end_tuning(home, reserves.values() if require_ready else ())
                 if new_mux:
                     self.next_sequences.pop(key, None)
@@ -391,7 +434,7 @@ class ProfileRegistry:
                         sources[slot] = (manager, worker)
             else:
                 capacity = {} if owner.telemetry is not None else None
-                worker = manager.start(matching_id, standby=True, denial=capacity)
+                worker = manager.start(matching_id, standby=True, denial=capacity, count_denial=False)
                 if worker is not None:
                     sources[slot] = (manager, worker)
                 else:
