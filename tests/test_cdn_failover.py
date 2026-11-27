@@ -44,13 +44,14 @@ class MultiCdnTests(unittest.TestCase):
 
         Real provider traffic and TV decoders are out of scope. Validate that
         each viewer keeps a monotonic HLS timeline, no CDN gets two guests,
-        the home source remains preferred, and healthy homes are reclaimed.
+        and healthy backup streams stay selected after home recovery.
         """
         sources = {slot: FakeStream(f"CDN-{slot}") for slot in (1, 2, 3)}
         viewers = {home: FailoverMux(home_slot=home, channel_name=f"TV-{home}")
                    for home in (1, 2, 3)}
         last_sequence = {home: 0 for home in viewers}
         out_count = {home: 0 for home in viewers}
+        settled = None
         for step in range(121):
             now = 100 + step * 6
             down = ({1} if 20 <= step < 35 else set()) | (
@@ -89,17 +90,13 @@ class MultiCdnTests(unittest.TestCase):
                 self.assertLessEqual(sum(
                     viewer.source_slot == slot and home != slot
                     for home, viewer in viewers.items()), 1)
-            if step < 20 or step >= 45:
-                # No intermittent failure: after 18s verified recovery,
-                # all viewers should be back on their own subscription.
-                if step >= 45:
-                    self.assertEqual(selected, [1, 2, 3])
-            for home, mux in viewers.items():
-                if step < 20:
-                    self.assertEqual(mux.source_slot, home)
-        self.assertEqual([mux.source_slot for mux in viewers.values()], [1, 2, 3])
-        self.assertTrue(all(mux.switches >= 2 for home, mux in viewers.items()
-                            if home in (1, 2)))
+            if step < 20:
+                self.assertEqual(selected, [1, 2, 3])
+            if step == 45:
+                settled = selected
+                self.assertNotEqual(settled, [1, 2, 3])
+            if step > 45:
+                self.assertEqual(selected, settled)
         self.assertTrue(all(count >= 90 for count in out_count.values()))
 
     def test_pilot_is_exact_and_case_insensitive(self):
@@ -141,7 +138,7 @@ class MultiCdnTests(unittest.TestCase):
                                          now=100, usage={2: 1, 3: 1}))
         self.assertIsNone(mux2.source_slot)
 
-    def test_warming_home_reclaims_viewer_after_sustained_playable_progress(self):
+    def test_healthy_backup_stays_selected_until_it_stalls(self):
         mux = FailoverMux(home_slot=2)
         backup, home = FakeStream("backup"), FakeStream("home")
         sources = [(1, backup), (2, home)]
@@ -153,16 +150,21 @@ class MultiCdnTests(unittest.TestCase):
             seq = 102 + step
             backup.gateway.segments.append((seq, 6.0))
             backup.gateway.payload[seq] = b"backup"
-            # Fresh download status alone cannot establish home recovery.
             if step > 5:
                 home.gateway.segments.append((seq, 6.0))
                 home.gateway.payload[seq] = b"home"
             mux.playlist("tv", sources, now=100 + 6 * step)
-            if step <= 5:
-                self.assertEqual(mux.source_slot, 1)
+            self.assertEqual(mux.source_slot, 1)
+        self.assertEqual(mux.switches, 0)
+        self.assertEqual(mux.history[-1].content, b"backup")
+
+        # A fresh backup download can mask a stalled TV-facing playlist.
+        home.gateway.segments.append((112, 6.0))
+        home.gateway.payload[112] = b"home"
+        mux.playlist("tv", sources, now=172)
         self.assertEqual(mux.source_slot, 2)
         self.assertEqual(mux.switches, 1)
-        self.assertEqual(mux.switch_events[-1]["reason"], "HOME_RECOVERED")
+        self.assertEqual(mux.switch_events[-1]["reason"], "PUBLISH_STALL")
         self.assertEqual(mux.history[-1].content, b"home")
 
     def test_good_owner_is_sticky_not_switched_for_faster_backup(self):
