@@ -38,6 +38,8 @@ class Channel:
     name: str
     group: str
     url: str
+    tvg_id: str = ""
+    tvg_name: str = ""
 
 
 def channels_from_entries(entries: list[tuple[str, str, str]]) -> list[Channel]:
@@ -48,7 +50,7 @@ def channels_from_entries(entries: list[tuple[str, str, str]]) -> list[Channel]:
 def _catalogue(rows) -> list[Channel]:
     seen: dict[tuple[str, str], int] = {}
     channels = []
-    for name, id_group, group, url in rows:
+    for name, id_group, group, url, *metadata in rows:
         if not name or urllib.parse.urlsplit(url).scheme not in ("http", "https"):
             continue
         # Existing TV and EPG IDs include only the separate EXTGRP tag.
@@ -57,7 +59,7 @@ def _catalogue(rows) -> list[Channel]:
         seen[identity] = ordinal + 1
         marker = f"{identity[0]}\x00{identity[1]}\x00{ordinal}".encode("utf-8")
         cid = hashlib.sha256(marker).hexdigest()[:20]
-        channels.append(Channel(cid, name, group, url))
+        channels.append(Channel(cid, name, group, url, *metadata))
     return channels
 
 
@@ -71,15 +73,21 @@ def channels_from_text(text: str) -> list[Channel]:
             meta, _, title = line.rpartition(",")
             name = title.strip()
             inline_group = ""
+            tvg_id = tvg_name = ""
             for attr in re.finditer(r'''\s+([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s,]+))''', meta):
-                if attr[1].casefold() == "group-title":
-                    inline_group = (attr[2] or attr[3] or attr[4] or "").strip()
-                    break
+                key = attr[1].casefold()
+                value = (attr[2] or attr[3] or attr[4] or "").strip()
+                if key == "group-title":
+                    inline_group = value
+                elif key == "tvg-id":
+                    tvg_id = value
+                elif key == "tvg-name":
+                    tvg_name = value
             group = ""
         elif line.startswith("#EXTGRP:"):
             group = line[len("#EXTGRP:"):].strip()
         elif line and not line.startswith("#") and name is not None:
-            result.append((name, group, group or inline_group, line))
+            result.append((name, group, group or inline_group, line, tvg_id, tvg_name))
             name = None
     return _catalogue(result)
 
