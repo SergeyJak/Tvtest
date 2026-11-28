@@ -85,6 +85,34 @@ class StreamingEpgTests(unittest.TestCase):
             self.assertEqual(root.find("programme").get("channel"),
                              channels_from_text(PLAYLIST)[2].id)
 
+    def test_provider_metadata_matches_without_changing_public_ids(self):
+        playlist = """#EXTM3U
+#EXTINF:-1 tvg-id="provider-42" group-title="Sport",Local sports label
+https://example.invalid/stream1
+#EXTINF:-1 group-title="News" tvg-name="Original News",Local news label
+https://example.invalid/stream2
+"""
+        original = playlist.replace(' tvg-id="provider-42"', '').replace(' tvg-name="Original News"', '')
+        channels = channels_from_text(playlist)
+        self.assertEqual([c.id for c in channels], [c.id for c in channels_from_text(original)])
+        self.assertEqual(channels[0].tvg_id, "provider-42")
+        self.assertEqual(channels[1].tvg_name, "Original News")
+        xml = b"""<tv>
+<channel id="provider-42"><display-name>Different sports label</display-name></channel>
+<channel id="news"><display-name>Original News</display-name></channel>
+<programme channel="provider-42" start="20261122080000 +0000"><title>Sport</title></programme>
+<programme channel="news" start="20261122080000 +0000"><title>News</title></programme>
+</tv>"""
+        with tempfile.TemporaryDirectory() as folder:
+            tmp = Path(folder)
+            source = tmp / "source.xml"
+            source.write_bytes(xml)
+            output = tmp / "output.xml"
+            report = build_epg(playlist, [str(source)], output)
+            self.assertEqual(report["channels_with_epg"], 2)
+            self.assertEqual({p.get("channel"): p.findtext("title") for p in ET.parse(output).findall("programme")},
+                             {channels[0].id: "Sport", channels[1].id: "News"})
+
     def test_many_listings_do_not_require_full_feed_in_memory(self):
         with tempfile.TemporaryDirectory() as folder:
             tmp = Path(folder)
