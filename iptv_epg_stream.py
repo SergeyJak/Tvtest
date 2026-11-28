@@ -86,10 +86,35 @@ def build_epg(playlist: str, sources: list[str], output: Path,
     aliases = aliases or {}
     by_name = defaultdict(list)
     by_alias = defaultdict(list)
+    by_provider_id = defaultdict(list)
+    by_provider_name = defaultdict(list)
     for channel in channels:
         by_name[normalize(channel.name)].append(channel)
         if aliases.get(channel.name):
             by_alias[aliases[channel.name]].append(channel)
+        else:
+            if channel.tvg_id:
+                by_provider_id[channel.tvg_id].append(channel)
+            if channel.tvg_name and normalize(channel.tvg_name):
+                by_provider_name[normalize(channel.tvg_name)].append(channel)
+
+    def candidates_for(source_id, display_names=()):
+        # Explicit aliases and exact provider identifiers take precedence.
+        if source_id in by_alias:
+            return by_alias[source_id]
+        if source_id in by_provider_id:
+            return by_provider_id[source_id]
+        # Preserve the existing exact normalized name fallback, adding the
+        # provider alternate name only when the visible name does not match.
+        for name in (source_id, *display_names):
+            candidates = by_name.get(normalize(name))
+            if candidates:
+                return candidates
+        for name in (source_id, *display_names):
+            candidates = by_provider_name.get(normalize(name))
+            if candidates:
+                return candidates
+        return []
 
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -137,13 +162,9 @@ def build_epg(playlist: str, sources: list[str], output: Path,
                                 if item.tag == "channel":
                                     source_id = item.get("id", "")
                                     if source_id not in source_ids:
-                                        for name in [source_id] + [
-                                            el.text or "" for el in item.findall("display-name")
-                                        ]:
-                                            candidates = by_name.get(normalize(name))
-                                            if candidates:
-                                                source_ids[source_id] = candidates
-                                                break
+                                        source_ids[source_id] = candidates_for(
+                                            source_id, [el.text or "" for el in item.findall("display-name")]
+                                        )
                                     item.clear()
                                     root.clear()
                                 elif item.tag == "programme":
@@ -151,9 +172,7 @@ def build_epg(playlist: str, sources: list[str], output: Path,
                                     source_id = item.get("channel", "")
                                     if source_id not in source_ids:
                                         # Some feeds omit a <channel> declaration.
-                                        source_ids[source_id] = by_name.get(
-                                            normalize(source_id), []
-                                        )
+                                        source_ids[source_id] = candidates_for(source_id)
                                     candidates = source_ids[source_id]
                                     start = item.get("start")
                                     if start and item.findtext("title") and candidates:
