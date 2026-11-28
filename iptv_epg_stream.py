@@ -90,45 +90,43 @@ def build_epg(playlist: str, sources: list[str], output: Path,
     by_provider_name = defaultdict(list)
     for channel in channels:
         by_name[normalize(channel.name)].append(channel)
+        alternate = normalize(channel.tvg_name)
+        if alternate:
+            by_provider_name[alternate].append(channel)
         if aliases.get(channel.name):
             by_alias[aliases[channel.name]].append(channel)
-        else:
-            if channel.tvg_id:
-                by_provider_id[channel.tvg_id].append(channel)
-            if channel.tvg_name and normalize(channel.tvg_name):
-                by_provider_name[normalize(channel.tvg_name)].append(channel)
+        elif channel.tvg_id:
+            by_provider_id[channel.tvg_id].append(channel)
+
+    alternate_match, display_match, direct_match = range(3)
 
     def candidates_for(source_id, display_names=()):
-        # Explicit aliases retain their existing override semantics.
         if source_id in by_alias:
-            return by_alias[source_id]
+            return [(channel.id, direct_match) for channel in by_alias[source_id]]
+
         exact = by_provider_id.get(source_id, [])
-        # Preserve the old name match, including HD/SD variants that do not
-        # carry provider metadata. Do not override a conflicting provider ID
-        # when this source has an exact provider-ID match.
-        legacy = []
         names = [normalize(name) for name in (source_id, *display_names)]
-        for name in names:
-            if name and by_name.get(name):
-                legacy = by_name[name]
-                break
-        candidates = {channel.id: channel for channel in exact}
-        for channel in legacy:
-            if not exact or not channel.tvg_id or channel.tvg_id == source_id:
-                candidates[channel.id] = channel
-        # Match alternate names only when the source has no exact ID and
-        # the normalized alternate name is unambiguous across feed labels.
-        if not exact:
-            alternate_keys = {name for name in names if name and by_provider_name.get(name)}
-            if len(alternate_keys) == 1:
-                for channel in by_provider_name[next(iter(alternate_keys))]:
-                    if not aliases.get(channel.name):
-                        candidates[channel.id] = channel
-        return list(candidates.values())
+        legacy = next((by_name[name] for name in names if name and name in by_name), ())
+        if exact or legacy:
+            candidates = {channel.id: direct_match for channel in exact}
+            for channel in legacy:
+                if channel.id in candidates or (exact and channel.tvg_id):
+                    continue
+                preferred_id = aliases.get(channel.name) or channel.tvg_id
+                candidates[channel.id] = display_match if preferred_id else direct_match
+            return list(candidates.items())
+
+        alternate_ids = {channel.id: channel for name in names for channel in by_provider_name.get(name, ())}
+        if len(alternate_ids) == 1:
+            channel = next(iter(alternate_ids.values()))
+            if not aliases.get(channel.name):
+                return [(channel.id, alternate_match)]
+        return []
 
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     matched: set[str] = set()
+    best_fallback: dict[str, int] = {}
     programmes = 0
     scanned = 0
 
@@ -141,6 +139,10 @@ def build_epg(playlist: str, sources: list[str], output: Path,
             db.execute("PRAGMA cache_size=-4096")
             db.execute("CREATE TABLE seen (channel TEXT NOT NULL, start TEXT NOT NULL, "
                        "PRIMARY KEY (channel, start)) WITHOUT ROWID")
+            db.execute("""CREATE TABLE fallback (
+                channel TEXT NOT NULL, priority INTEGER NOT NULL, start TEXT NOT NULL,
+                programme BLOB NOT NULL, PRIMARY KEY (channel, priority, start)
+            ) WITHOUT ROWID""")
             with (temp / "epg.tmp").open("wb") as raw:
                 if output.name.endswith(".gz"):
                     writer = gzip.GzipFile(filename="", fileobj=raw, mode="wb",
@@ -159,7 +161,7 @@ def build_epg(playlist: str, sources: list[str], output: Path,
 
                     for index, source in enumerate(sources, start=1):
                         print(f"Streaming EPG {index}/{len(sources)}...", flush=True)
-                        source_ids = dict(by_alias)
+                        source_ids = {}
                         root = None
                         with open_epg(source) as stream:
                             for event, item in ET.iterparse(stream, events=("start", "end")):
@@ -186,17 +188,25 @@ def build_epg(playlist: str, sources: list[str], output: Path,
                                     candidates = source_ids[source_id]
                                     start = item.get("start")
                                     if start and item.findtext("title") and candidates:
-                                        for channel in candidates:
-                                            row = db.execute(
-                                                "INSERT OR IGNORE INTO seen(channel,start) "
-                                                "VALUES(?,?)", (channel.id, start)
-                                            )
-                                            if row.rowcount:
-                                                item.set("channel", channel.id)
-                                                writer.write(ET.tostring(item, encoding="utf-8"))
-                                                writer.write(b"\n")
-                                                programmes += 1
-                                                matched.add(channel.id)
+                                        for channel_id, priority in candidates:
+                                            if priority == direct_match:
+                                                row = db.execute(
+                                                    "INSERT OR IGNORE INTO seen(channel,start) VALUES(?,?)",
+                                                    (channel_id, start)
+                                                )
+                                                if row.rowcount:
+                                                    item.set("channel", channel_id)
+                                                    writer.write(ET.tostring(item, encoding="utf-8") + b"\n")
+                                                    programmes += 1
+                                                    matched.add(channel_id)
+                                            elif (channel_id not in matched
+                                                  and priority >= best_fallback.get(channel_id, alternate_match)):
+                                                # A stronger match may appear later in this or another feed.
+                                                item.set("channel", channel_id)
+                                                db.execute("INSERT OR IGNORE INTO fallback VALUES(?,?,?,?)",
+                                                           (channel_id, priority, start,
+                                                            ET.tostring(item, encoding="utf-8")))
+                                                best_fallback[channel_id] = priority
                                     item.clear()
                                     root.clear()
                                     if scanned % 25000 == 0:
@@ -204,6 +214,16 @@ def build_epg(playlist: str, sources: list[str], output: Path,
                                         print(f"Scanned {scanned:,} listings; "
                                               f"matched {programmes:,}", flush=True)
                         db.commit()
+                    for channel_id, priority in best_fallback.items():
+                        if channel_id in matched:
+                            continue
+                        for (programme,) in db.execute(
+                            "SELECT programme FROM fallback WHERE channel=? AND priority=? ORDER BY start",
+                            (channel_id, priority)
+                        ):
+                            writer.write(programme + b"\n")
+                            programmes += 1
+                        matched.add(channel_id)
                     writer.write(b"</tv>\n")
                 finally:
                     if writer is not raw:
