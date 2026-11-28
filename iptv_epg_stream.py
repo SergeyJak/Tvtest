@@ -99,22 +99,32 @@ def build_epg(playlist: str, sources: list[str], output: Path,
                 by_provider_name[normalize(channel.tvg_name)].append(channel)
 
     def candidates_for(source_id, display_names=()):
-        # Explicit aliases and exact provider identifiers take precedence.
+        # Explicit aliases retain their existing override semantics.
         if source_id in by_alias:
             return by_alias[source_id]
-        if source_id in by_provider_id:
-            return by_provider_id[source_id]
-        # Preserve the existing exact normalized name fallback, adding the
-        # provider alternate name only when the visible name does not match.
-        for name in (source_id, *display_names):
-            candidates = by_name.get(normalize(name))
-            if candidates:
-                return candidates
-        for name in (source_id, *display_names):
-            candidates = by_provider_name.get(normalize(name))
-            if candidates:
-                return candidates
-        return []
+        exact = by_provider_id.get(source_id, [])
+        # Preserve the old name match, including HD/SD variants that do not
+        # carry provider metadata. Do not override a conflicting provider ID
+        # when this source has an exact provider-ID match.
+        legacy = []
+        names = [normalize(name) for name in (source_id, *display_names)]
+        for name in names:
+            if name and by_name.get(name):
+                legacy = by_name[name]
+                break
+        candidates = {channel.id: channel for channel in exact}
+        for channel in legacy:
+            if not exact or not channel.tvg_id or channel.tvg_id == source_id:
+                candidates[channel.id] = channel
+        # Match alternate names only when the source has no exact ID and
+        # the normalized alternate name is unambiguous across feed labels.
+        if not exact:
+            alternate_keys = {name for name in names if name and by_provider_name.get(name)}
+            if len(alternate_keys) == 1:
+                for channel in by_provider_name[next(iter(alternate_keys))]:
+                    if not aliases.get(channel.name):
+                        candidates[channel.id] = channel
+        return list(candidates.values())
 
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
